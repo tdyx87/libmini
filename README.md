@@ -1,0 +1,2 @@
+# libmini
+libs
