@@ -34,11 +34,16 @@
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
 #else
+#include <fcntl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
 #include <unistd.h>
 #include <poll.h>
+// macOS 没有 MSG_NOSIGNAL（用 SO_NOSIGPIPE 套接字选项替代）
+#ifndef MSG_NOSIGNAL
+#define MSG_NOSIGNAL 0
+#endif
 #endif
 
 namespace libmini {
@@ -356,6 +361,15 @@ void put_u32_le(std::string& out, std::uint32_t v)
     out.push_back(static_cast<char>((v >> 8) & 0xFF));
     out.push_back(static_cast<char>((v >> 16) & 0xFF));
     out.push_back(static_cast<char>((v >> 24) & 0xFF));
+}
+
+// 裸缓冲区重载（POSIX UDS 组帧用；4 字节长度头无需 string 开销）
+void put_u32_le(char* out, std::uint32_t v)
+{
+    out[0] = static_cast<char>(v & 0xFF);
+    out[1] = static_cast<char>((v >> 8) & 0xFF);
+    out[2] = static_cast<char>((v >> 16) & 0xFF);
+    out[3] = static_cast<char>((v >> 24) & 0xFF);
 }
 
 std::uint32_t get_u32_le(const char* p)
@@ -2188,6 +2202,8 @@ bool uds_send_frame(int fd, const std::string& payload)
 }
 
 // 接收一帧；对端关闭返回 false
+
+// 接收一帧；对端关闭返回 false
 bool uds_recv_frame(int fd, std::string& payload)
 {
     char head[4];
@@ -2238,6 +2254,11 @@ bool uds_connect(int fd, const std::string& path, int timeout_ms)
         }
     }
     ::fcntl(fd, F_SETFL, flags);  // 恢复阻塞模式
+#ifdef SO_NOSIGPIPE
+    // macOS：无 MSG_NOSIGNAL，用套接字选项抑制 SIGPIPE（写端对端已关时）
+    const int nosig = 1;
+    (void)::setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &nosig, sizeof(nosig));
+#endif
     return true;
 }
 

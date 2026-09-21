@@ -71,11 +71,12 @@ jobs:
 
 
       - name: Configure (CMake + Ninja)
+        shell: bash
         run: >
           cmake -S . -B build -G Ninja
-          -DCMAKE_TOOLCHAIN_FILE=${{ github.workspace }}/deps/conan_toolchain.cmake
+          -DCMAKE_TOOLCHAIN_FILE=deps/conan_toolchain.cmake
           -DCMAKE_BUILD_TYPE=Release
-          -DCMAKE_INSTALL_PREFIX=${{ env.PREFIX }}
+          -DCMAKE_INSTALL_PREFIX="$PREFIX"
           -DLIBMINI_BUILD_SWF_VIEWER=OFF
 
       - name: Build
@@ -92,10 +93,12 @@ jobs:
 
       - name: Smoke consumer (find_package + link + run)
         shell: bash
+        # 路径全部用相对路径：在 bash 中展开绝对路径表达式时，
+        # Windows 反斜杠会被 Git Bash 当转义序列吃掍，工具链路径全部失效
         run: |
           cmake -S ci/smoke_consumer -B smoke/build -G Ninja \
-            -DCMAKE_TOOLCHAIN_FILE=${{ github.workspace }}/deps/conan_toolchain.cmake \
+            -DCMAKE_TOOLCHAIN_FILE=deps/conan_toolchain.cmake \
             -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_PREFIX_PATH=${{ env.PREFIX }}
+            -DCMAKE_PREFIX_PATH="$PREFIX"
           cmake --build smoke/build --parallel
           ./smoke/build/consumer

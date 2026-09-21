@@ -253,20 +253,22 @@ ProcessResult run_process(const std::string& program,
     ::close(out_pipe[1]);
     ::close(err_pipe[1]);
 
-    // stdin 写入（独立线程）
+    // stdin 写入（独立线程）。
+    // 注意：lambda 不能直接捕获数组元素（C++11 限制），复制成标量
+    const int in_write_fd = in_pipe[1];
     if (!input_text.empty()) {
-        std::thread writer([in_pipe[1], &input_text]() {
+        std::thread writer([in_write_fd, &input_text]() {
             std::size_t off = 0;
             while (off < input_text.size()) {
                 const ssize_t n = ::write(
-                    in_pipe[1], input_text.data() + off,
+                    in_write_fd, input_text.data() + off,
                     input_text.size() - off);
                 if (n <= 0) {
                     break;
                 }
                 off += static_cast<std::size_t>(n);
             }
-            ::close(in_pipe[1]);
+            ::close(in_write_fd);
         });
         writer.detach();
     } else {
