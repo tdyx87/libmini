@@ -315,7 +315,7 @@ TEST(StopwatchTest, PauseResumeRestart)
 {
     using namespace libmini;
     Stopwatch sw;
-    std::this_thread::sleep_for(std::chrono::milliseconds(40));
+    std::this_thread::sleep_for(std::chrono::milliseconds(60));
     sw.pause();
     const std::int64_t first = sw.elapsed_ms();
     EXPECT_FALSE(sw.is_running());
@@ -331,7 +331,10 @@ TEST(StopwatchTest, PauseResumeRestart)
 
     sw.restart();
     EXPECT_TRUE(sw.is_running());
-    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    // 余量设计：Windows 定时器粒度 15.6ms，sleep_for 会向上取整，
+    // 第二段必须远小于 first（first ≈ 60ms + 取整）才不会在
+    // 高负载/取整叠加时与 first 打平（CI 实测 40 vs 40）
+    std::this_thread::sleep_for(std::chrono::milliseconds(15));
     EXPECT_LT(sw.elapsed_ms(), first);  // 已清零重新计时
 }
 

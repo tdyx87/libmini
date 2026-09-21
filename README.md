@@ -20,7 +20,9 @@ cmake --build --preset conan-debug
 
 - 产物：`out/conan/x86-static-debug/lib/`（libmini.lib）与 `bin/`（测试可执行文件）
 - 测试：在构建目录执行 `ctest -C Debug`，套件为 `libmini_test` / `rpc_test` / `utils_test` / `common_test` / `args_test`
-- 动态库：`-DLIBMINI_BUILD_SHARED=ON`（同时定义 `LIBMINI_EXPORTS` 导出符号）
+- 动态库：`-DLIBMINI_BUILD_SHARED=ON`（同时定义 `LIBMINI_EXPORTS` 导出符号）。
+  导出面 = 公开头里标注 `LIBMINI_API` 的符号（宏定义见 `utils/export.h`，
+  新增公开 API 必须标注，否则 DLL 不导出、消费者链接失败）
 - C++ 标准为 C++11（MSVC 2017 兼容），源码统一 `/utf-8` 编译
 - CI：`.github/workflows/ci.yml` —— 7 个变体 job：三平台 Release 基线、
   Debug、Shared（DLL/SO 导出面）、warnings-strict（`-Wall -Wextra -Werror`），
