@@ -11,6 +11,7 @@
 #else
 #include <csignal>
 #include <cstring>
+#include <pthread.h>  // pthread_sigmask（Linux 上随 libstdc++ 链 pthread）
 #endif
 
 namespace libmini {
@@ -35,6 +36,7 @@ ConsoleExit* g_console_exit = nullptr;
 
 }  // namespace
 
+#ifdef _WIN32
 BOOL WINAPI console_ctrl_handler(DWORD type)
 {
     (void)type;  // CTRL_C_EVENT / CTRL_BREAK_EVENT 等统一按退出处理
@@ -44,6 +46,7 @@ BOOL WINAPI console_ctrl_handler(DWORD type)
     }
     return FALSE;
 }
+#endif
 
 ConsoleExit::ConsoleExit()
     : impl_(new Impl)

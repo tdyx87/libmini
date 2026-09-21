@@ -64,7 +64,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.conan2/p
-          key: conan-${{ matrix.os }}-${{ hashFiles('conanfile.txt') }}
+          key: conan-${{ matrix.os }}-${{ hashFiles('conanfile.py') }}
 
       - name: Install dependencies (Conan)
         run: conan install . -of deps --build=missing -s build_type=Release
@@ -93,12 +93,16 @@ jobs:
 
       - name: Smoke consumer (find_package + link + run)
         shell: bash
-        # 路径全部用相对路径：在 bash 中展开绝对路径表达式时，
-        # Windows 反斜杠会被 Git Bash 当转义序列吃掍，工具链路径全部失效
+        # 工具链/前缀必须用绝对路径：CMAKE_TOOLCHAIN_FILE 的相对路径是相对
+        # 源目录（ci/smoke_consumer）解析的，deps/ 在源目录下不存在，直接
+        # "Could not find toolchain file" 配置失败（run #4 三平台实测）。
+        # Windows 上 GITHUB_WORKSPACE 是反斜杠路径，cygpath -m 统一成正斜杠
         run: |
+          ws="$GITHUB_WORKSPACE"
+          command -v cygpath >/dev/null 2>&1 && ws=$(cygpath -m "$ws")
           cmake -S ci/smoke_consumer -B smoke/build -G Ninja \
-            -DCMAKE_TOOLCHAIN_FILE=deps/conan_toolchain.cmake \
+            -DCMAKE_TOOLCHAIN_FILE="$ws/deps/conan_toolchain.cmake" \
             -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_PREFIX_PATH="$PREFIX"
+            -DCMAKE_PREFIX_PATH="$ws/smoke/prefix"
           cmake --build smoke/build --parallel
           ./smoke/build/consumer

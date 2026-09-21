@@ -7,13 +7,18 @@ include(CMakeFindDependencyMacro)
 set(CMAKE_FIND_PACKAGE_PREFER_CONFIG ON)
 
 # libminiTargets.cmake 引用这些 imported target，必须先找到对应包。
-# 六个依赖与 src/CMakeLists.txt 中 target_link_libraries(libmini PUBLIC ...) 一致。
+# 依赖与 src/CMakeLists.txt 中 target_link_libraries(libmini PUBLIC ...) 一致；
+# OpenSSL 仅 POSIX 分支需要（Windows 走系统 CNG），Windows 上找不到也无所谓——
+# 接受不强制（REQUIRED=OFF），目标分支不会引用它
 find_dependency(nlohmann_json)
 find_dependency(pugixml)
 find_dependency(spdlog)
 find_dependency(httplib)
 find_dependency(ZLIB)
 find_dependency(SQLite3)
+if(NOT WIN32)
+    find_dependency(OpenSSL)
+endif()
 
 include("${CMAKE_CURRENT_LIST_DIR}/libminiTargets.cmake")
 

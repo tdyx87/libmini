@@ -102,6 +102,24 @@ if(WIN32)
     # bcrypt：aes_gcm 的 CNG 实现（MSVC 由 pragma comment 自动链接，
     # MinGW 不支持该 pragma，需显式链接）
     target_link_libraries(libmini PUBLIC ws2_32 bcrypt)
+else()
+    # OpenSSL：aes_gcm 的 EVP 实现。CONFIG 优先（conan 的 CMakeDeps 只在
+    # generators 目录生成 config 文件，FindOpenSSL 模块模式搜不到包体）；
+    # 找不到 config 再回退系统模块模式（OpenSSL::Crypto）
+    find_package(OpenSSL CONFIG QUIET)
+    if(NOT TARGET openssl::openssl)
+        find_package(OpenSSL REQUIRED)
+    endif()
+    if(TARGET openssl::openssl)
+        target_link_libraries(libmini PUBLIC openssl::openssl)
+    else()
+        target_link_libraries(libmini PUBLIC OpenSSL::Crypto)
+    endif()
+
+    # console 模块的 pthread_sigmask/sigwait（多数系统 libstdc++ 已带，
+    # 显式声明保证 Linux/macOS 均链接正确）
+    find_package(Threads REQUIRED)
+    target_link_libraries(libmini PUBLIC Threads::Threads)
 endif()
 
 # ---------------- 安装规则（下游 find_package(libmini) 支持） ----------------
