@@ -97,6 +97,7 @@ std::string join_with(const std::string& dir, const std::string& name)
 #endif
 }
 
+#ifndef _WIN32  // 仅 POSIX 分支的 list_directory_detailed 使用
 EntryKind classify(const PathInfo& info)
 {
     if (info.is_symlink) {
@@ -110,6 +111,7 @@ EntryKind classify(const PathInfo& info)
     }
     return EntryKind::Other;
 }
+#endif
 
 }  // namespace
 

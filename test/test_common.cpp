@@ -46,9 +46,17 @@ TEST(OptionalTest, CopyMove)
     ASSERT_TRUE(moved.has_value());
     EXPECT_EQ(*moved, kLong);
 
-    // 自转移不崩溃（标准要求 no-op；我们的实现有 this 检查）
+    // 自转移不崩溃（标准要求 no-op；我们的实现有 this 检查）。
+    // GCC 13+ 对自转移发 -Wself-move 告警，这里自转移正是测试目标，局部关闭
     optional<std::string> self(moved);
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wself-move"
+#endif
     self = std::move(self);
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
     EXPECT_EQ(*self, kLong);
 
     // 拷贝空 optional 保持为空

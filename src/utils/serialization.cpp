@@ -136,7 +136,7 @@ void write_json_value(pugi::xml_node node, const JsonValue& value)
 
 }  // namespace
 
-std::string json_to_xml(const JsonValue& value)
+LIBMINI_API std::string json_to_xml(const JsonValue& value)
 {
     pugi::xml_document doc;
     write_json_value(doc.append_child("value"), value);
@@ -152,7 +152,7 @@ std::string json_to_xml(const JsonValue& value)
     return out;
 }
 
-JsonValue xml_to_json(const std::string& xml_str)
+LIBMINI_API JsonValue xml_to_json(const std::string& xml_str)
 {
     const XmlDocument doc = parse_xml(xml_str);
     const pugi::xml_node root = doc.root().first_child();
@@ -167,13 +167,13 @@ JsonValue xml_to_json(const std::string& xml_str)
 // 语义自文档化并阻止用户对字符串再包一层推导。
 
 template <>
-std::string serialize_to_xml<std::string>(const std::string& obj)
+LIBMINI_API std::string serialize_to_xml<std::string>(const std::string& obj)
 {
     return json_to_xml(JsonValue(obj));
 }
 
 template <>
-std::string deserialize_from_xml<std::string>(const std::string& xml_str)
+LIBMINI_API std::string deserialize_from_xml<std::string>(const std::string& xml_str)
 {
     return xml_to_json(xml_str).get<std::string>();
 }

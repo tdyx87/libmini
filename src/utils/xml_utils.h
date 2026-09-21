@@ -6,6 +6,8 @@
 #include <vector>
 #include <pugixml.hpp>
 
+#include "export.h"
+
 namespace libmini {
 
 // XML 文档类型
@@ -23,16 +25,16 @@ struct SimpleXmlNode {
 };
 
 // XML 解析
-XmlDocument parse_xml(const std::string& xml_str);
+LIBMINI_API XmlDocument parse_xml(const std::string& xml_str);
 
 // XML 序列化
-std::string to_xml_string(const XmlDocument& doc);
+LIBMINI_API std::string to_xml_string(const XmlDocument& doc);
 
 // 简单 XML 解析（基本实现，保持向后兼容）
 SimpleXmlNode parse_xml_simple(const std::string& xml_str);
 
 // 简单 XML 序列化（保持向后兼容）
-std::string to_xml_string_simple(const SimpleXmlNode& node);
+LIBMINI_API std::string to_xml_string_simple(const SimpleXmlNode& node);
 
 }  // namespace libmini
 

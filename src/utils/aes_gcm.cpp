@@ -7,7 +7,9 @@
 #endif
 #include <Windows.h>
 #include <bcrypt.h>
+#if defined(_MSC_VER)
 #pragma comment(lib, "bcrypt.lib")
+#endif
 #else
 #include <openssl/evp.h>
 #endif

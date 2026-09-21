@@ -877,7 +877,7 @@ TEST(SerializationTest, XmlNestedStructRoundTrip)
 {
     using namespace libmini;
     test_ns::Config cfg;
-    cfg.host = "db\_<primary>&";  // 含 XML 特殊字符
+    cfg.host = "db_<primary>&";  // 含 XML 特殊字符
     cfg.timeout_ms = 3000;
     test_ns::Host r1;
     r1.name = "r1";
@@ -891,7 +891,7 @@ TEST(SerializationTest, XmlNestedStructRoundTrip)
     const std::string xml = serialize_to_xml(cfg);
     // 特殊字符已实体转义，XML 仍可解析
     const test_ns::Config back = deserialize_from_xml<test_ns::Config>(xml);
-    EXPECT_EQ(back.host, "db\_<primary>&");
+    EXPECT_EQ(back.host, "db_<primary>&");
     EXPECT_EQ(back.timeout_ms, 3000);
     ASSERT_EQ(back.replicas.size(), 2u);
     EXPECT_EQ(back.replicas[0].port, 6380);
@@ -1398,7 +1398,7 @@ TEST(TcpTest, ConcurrentClientsAndBroadcast)
 {
     libmini::TcpServer server;
     std::atomic<int> echo_count{0};
-    server.set_on_message([&server, &echo_count](std::uint64_t conn, const std::string& msg) {
+    server.set_on_message([&server, &echo_count](std::uint64_t /*conn*/, const std::string& msg) {
         if (msg == "join") {
             ++echo_count;
         }

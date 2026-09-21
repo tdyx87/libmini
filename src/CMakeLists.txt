@@ -35,6 +35,10 @@ set(LIBMINI_SOURCES
 if(LIBMINI_BUILD_SHARED)
     add_library(libmini SHARED ${LIBMINI_SOURCES})
     target_compile_definitions(libmini PRIVATE LIBMINI_EXPORTS)
+    # 自动导出全部符号：公开头里仅部分声明标了 LIBMINI_API，DLL 只导出
+    # 标注符号会缺 xml_to_json/file 工具等几十个公开函数（静态链接看不出，
+    # 消费者链接才报 undefined）。导出面显式化（全头补 LIBMINI_API）另行跟进
+    set_target_properties(libmini PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
 else()
     add_library(libmini STATIC ${LIBMINI_SOURCES})
     target_compile_definitions(libmini PRIVATE LIBMINI_STATIC)

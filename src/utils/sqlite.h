@@ -61,7 +61,7 @@ enum class SqliteStatus {
 };
 
 // 单元格的带类型值（行遍历/全量读取用；Blob 与 Text 共用 bytes 字段）
-struct SqliteValue
+struct LIBMINI_API SqliteValue
 {
     enum class Type { Null, Integer, Real, Text, Blob };
 

@@ -19,19 +19,6 @@ namespace libmini {
 
 namespace {
 
-// ServiceState ↔ SCM 状态码（Windows 专属：DWORD/SERVICE_* 均来自 Windows.h）
-DWORD to_scm_state(ServiceState s)
-{
-    switch (s) {
-        case ServiceState::Stopped:      return SERVICE_STOPPED;
-        case ServiceState::StartPending: return SERVICE_START_PENDING;
-        case ServiceState::Running:      return SERVICE_RUNNING;
-        case ServiceState::StopPending:  return SERVICE_STOP_PENDING;
-        case ServiceState::Paused:       return SERVICE_PAUSED;
-        default:                         return 0;
-    }
-}
-
 ServiceState from_scm_state(DWORD s)
 {
     switch (s) {

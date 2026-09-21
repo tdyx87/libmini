@@ -27,7 +27,6 @@ struct ConsoleExit::Impl
     std::thread wait_thread;
 #endif
 };
-
 // 控制处理器桥：持有属主指针，信号到达时置位并执行回调。
 // ConsoleExit 把 Impl 声明为 friend，桥接函数通过成员指针访问
 namespace {
@@ -58,13 +57,15 @@ ConsoleExit::ConsoleExit()
     // POSIX：阻塞相关信号后开专用线程 sigwait——处理逻辑不占用
     // 信号上下文，比 async-signal-safe 回调简单可靠得多
     sigset_t set;
-    ::sigemptyset(&set);
-    ::sigaddset(&set, SIGINT);
-    ::sigaddset(&set, SIGTERM);
-    ::sigaddset(&set, SIGHUP);
+    // 注意：不用 "::sigxxx" 前缀——macOS 把 sigemptyset/sigaddset 定义成宏，
+    // 前缀展开后语法非法
+    sigemptyset(&set);
+    sigaddset(&set, SIGINT);
+    sigaddset(&set, SIGTERM);
+    sigaddset(&set, SIGHUP);
     ::pthread_sigmask(SIG_BLOCK, &set, NULL);
 
-    wait_thread = std::thread([this, set]() {
+    impl_->wait_thread = std::thread([this, set]() {
         int sig = 0;
         for (;;) {
             if (::sigwait(&set, &sig) == 0) {
@@ -85,11 +86,11 @@ ConsoleExit::~ConsoleExit()
     }
 #else
     // 等待线程退出（不发信号则 detached 掉，避免析构挂死）
-    if (wait_thread.joinable()) {
+    if (impl_->wait_thread.joinable()) {
         if (stop_requested_.load()) {
-            wait_thread.join();
+            impl_->wait_thread.join();
         } else {
-            wait_thread.detach();
+            impl_->wait_thread.detach();
         }
     }
 #endif

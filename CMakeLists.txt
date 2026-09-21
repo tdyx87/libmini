@@ -10,6 +10,21 @@ if(MSVC)
     add_compile_options(/utf-8)
 endif()
 
+# 编译器告警：默认 -Wall 级别（可见但不阻塞），LIBMINI_WARNINGS_AS_ERRORS=ON
+# 时升格为错误（CI 的 warnings-strict 变体开启）。MSVC /W4 对齐 GCC/Clang 的
+# -Wall -Wextra 覆盖面
+add_compile_options(
+    $<$<CXX_COMPILER_ID:MSVC>:/W4>
+    $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall>
+    $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wextra>
+)
+if(LIBMINI_WARNINGS_AS_ERRORS)
+    add_compile_options(
+        $<$<CXX_COMPILER_ID:MSVC>:/WX>
+        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Werror>
+    )
+endif()
+
 # Windows API 目标版本：MinGW 默认 _WIN32_WINNT 停留在 XP/7 时代，
 # cpp-httplib 0.28+ 要求 Win10 API 集（_WIN32_WINNT >= 0x0A00，检查在
 # httplib.h:36，报错文案有误导）。必须在首个 Windows.h 之前定义，
@@ -19,6 +34,7 @@ if(WIN32)
 endif()
 
 option(LIBMINI_BUILD_SHARED "Build libmini as a shared library" OFF)
+option(LIBMINI_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" OFF)
 option(BUILD_TESTING "Build tests" ON)
 
 # 库版本号（src/CMakeLists 的 set_target_properties 与下方 CPack 共用）

@@ -4,6 +4,7 @@
 #include <string>
 
 #include "json_utils.h"
+#include "export.h"
 
 namespace libmini {
 
@@ -61,10 +62,10 @@ T deserialize_from_json_or(const std::string& json_str, const T& fallback)
 //（MSVC permissive 模式会放行，不可依赖）
 
 // JSON 树 → XML 文本（根元素 <value>，无声明头）
-std::string json_to_xml(const JsonValue& value);
+LIBMINI_API std::string json_to_xml(const JsonValue& value);
 
 // XML 文本 → JSON 树；非法 XML 抛 std::runtime_error（带 pugixml 错误描述）
-JsonValue xml_to_json(const std::string& xml_str);
+LIBMINI_API JsonValue xml_to_json(const std::string& xml_str);
 
 template <typename T>
 std::string serialize_to_xml(const T& obj)
@@ -95,10 +96,10 @@ T deserialize_from_xml_or(const std::string& xml_str, const T& fallback)
 // std::string 的 XML 特化（声明在此、定义于 serialization.cpp）：
 // 字符串始终按原文读写，不做数字/布尔推断，"0089" 等内容往返不变形
 template <>
-std::string serialize_to_xml<std::string>(const std::string& obj);
+LIBMINI_API std::string serialize_to_xml<std::string>(const std::string& obj);
 
 template <>
-std::string deserialize_from_xml<std::string>(const std::string& xml_str);
+LIBMINI_API std::string deserialize_from_xml<std::string>(const std::string& xml_str);
 
 // json_to_xml / xml_to_json 的声明见上方模板段之前（两阶段查找要求）
 

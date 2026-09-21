@@ -17,7 +17,9 @@
 #include <Windows.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#if defined(_MSC_VER)
 #pragma comment(lib, "ws2_32.lib")
+#endif
 using SocketHandle = SOCKET;
 constexpr SocketHandle kInvalidSocket = INVALID_SOCKET;
 #else

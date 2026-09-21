@@ -1,4 +1,7 @@
 #define _CRT_SECURE_NO_WARNINGS
+
+// POSIX UDS 帧辅助仅非 Windows 编译单元可见；用它做条件闸门，
+// 避免 Windows 分支下出现 unused-function 告警（-Werror 档）
 #include "rpc.h"
 #include "json_utils.h"
 
@@ -44,6 +47,7 @@
 #ifndef MSG_NOSIGNAL
 #define MSG_NOSIGNAL 0
 #endif
+#define LIBMINI_BUILD_POSIX_FRAME
 #endif
 
 namespace libmini {
@@ -53,15 +57,6 @@ namespace {
 // ==================== 传输端点识别 ====================
 
 // 端点是否为本地传输：Windows 管道前缀或 UDS 路径（'/' 开头）
-bool is_local_endpoint(const std::string& endpoint)
-{
-#ifdef _WIN32
-    return endpoint.rfind("\\\\.\\pipe\\", 0) == 0;
-#else
-    return !endpoint.empty() && endpoint[0] == '/';
-#endif
-}
-
 // 规范化本地端点：补全 "\\\\.\\pipe\\" 前缀（用户可能只写 "myrpc"）
 std::string canonical_local_endpoint(const std::string& endpoint)
 {
@@ -363,7 +358,8 @@ void put_u32_le(std::string& out, std::uint32_t v)
     out.push_back(static_cast<char>((v >> 24) & 0xFF));
 }
 
-// 裸缓冲区重载（POSIX UDS 组帧用；4 字节长度头无需 string 开销）
+// 裸缓冲区重载（POSIX UDS 组帧专用，仅非 Windows 编译单元使用）
+#ifdef LIBMINI_BUILD_POSIX_FRAME
 void put_u32_le(char* out, std::uint32_t v)
 {
     out[0] = static_cast<char>(v & 0xFF);
@@ -371,6 +367,7 @@ void put_u32_le(char* out, std::uint32_t v)
     out[2] = static_cast<char>((v >> 16) & 0xFF);
     out[3] = static_cast<char>((v >> 24) & 0xFF);
 }
+#endif
 
 std::uint32_t get_u32_le(const char* p)
 {
@@ -478,8 +475,10 @@ void parse_host_port(const std::string& endpoint, std::string& host, int& port)
 #ifndef _WIN32
 // POSIX UDS 辅助函数（定义在 RpcServer 段；客户端本地传输先于此使用，
 // GCC 的单遍查找要求使用点之前有声明——MSVC permissive 模式会放行）
+#ifdef LIBMINI_BUILD_POSIX_FRAME
 bool uds_send_frame(int fd, const std::string& payload);
 bool uds_recv_frame(int fd, std::string& payload);
+#endif
 bool uds_connect(int fd, const std::string& path, int timeout_ms);
 #endif
 
@@ -667,7 +666,7 @@ struct RpcClient::Impl
         }
 
         // 传输级失败：连接不可信，直接关闭并归还并发名额
-        void discard(std::unique_ptr<PooledConn> conn)
+        void discard(std::unique_ptr<PooledConn> /*conn*/)
         {
             {
                 std::lock_guard<std::mutex> lock(m);
@@ -1355,7 +1354,7 @@ struct RpcClient::Impl
     // 流水线一次尝试：注册在途等待者 → 发帧 → 等待响应（无 id 旧服务器
     // 的响应当作自己那一份：此时每连接只有一个在途请求，不会串扰）
     AttemptResult attempt_pipelined(PooledConn& conn,
-                                    const std::string& request_body,
+                                    const std::string& /*request_body*/,
                                     std::uint64_t id,
                                     const std::string& request_with_id,
                                     int timeout_ms_)
@@ -3051,6 +3050,7 @@ struct RpcServer::Impl
         // 派发线程表：连接结束时统一 join（派发线程不会超连接生命周期）
         std::vector<std::thread> dispatch;
         bool send_failed = false;
+        (void)send_failed;  // 回发失败仅作为跳出读循环的信号，无需进一步处理
 
         for (;;) {
             std::string request;

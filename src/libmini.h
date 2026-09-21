@@ -3,16 +3,8 @@
 
 #include <string>
 
-// DLL export macro
-#ifndef LIBMINI_STATIC
-#ifdef LIBMINI_EXPORTS
-#define LIBMINI_API __declspec(dllexport)
-#else
-#define LIBMINI_API __declspec(dllimport)
-#endif
-#else
-#define LIBMINI_API
-#endif
+// DLL export macro（定义见 utils/export.h，此处引用单一来源）
+#include "utils/export.h"
 
 // Include utility modules
 #include "utils/string_utils.h"

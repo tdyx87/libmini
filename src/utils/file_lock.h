@@ -81,7 +81,7 @@ private:
 
 // RAII 风格文件锁：构造时尝试/阻塞获取，析构自动释放。
 // 阻塞策略与 FileLock 一致；未获得锁时 holds_lock() 为 false，析构安全。
-class FileLockGuard
+class LIBMINI_API FileLockGuard
 {
 public:
     // try=true：尝试获取（不阻塞）；try=false：阻塞等待 timeout_ms

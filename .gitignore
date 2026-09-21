@@ -83,4 +83,12 @@ Thumbs.db
 # CI 本地彩排产物
 /deps/
 /build/
+/build_dll/
+/build_warn/
 /smoke/
+/smoke_build/
+/smoke_dll_build/
+/install_smoke/
+/install_smoke_dll/
+/jobs*.json
+/log*.txt

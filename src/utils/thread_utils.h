@@ -9,10 +9,12 @@
 #include <vector>
 #include <future>
 
+#include "export.h"
+
 namespace libmini {
 
 // 简单线程池
-class ThreadPool {
+class LIBMINI_API ThreadPool {
 public:
     ThreadPool(size_t num_threads);
     ~ThreadPool();

@@ -12,15 +12,39 @@ concurrency:
 
 jobs:
   build-test:
-    name: ${{ matrix.os }}
+    name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        include:
+          # 三平台基线：Release 静态库
+          - name: ubuntu-release
+            os: ubuntu-latest
+          - name: windows-release
+            os: windows-latest
+          - name: macos-release
+            os: macos-latest
+          # Debug 配置：断言与 STL 调试检查生效
+          - name: ubuntu-debug
+            os: ubuntu-latest
+            build_type: Debug
+          - name: windows-debug
+            os: windows-latest
+            build_type: Debug
+          # Shared 变体：DLL/SO 导出面正确性（LIBMINI_API 标注 + 消费者链接）
+          - name: ubuntu-shared
+            os: ubuntu-latest
+            lib_type: shared
+          - name: windows-shared
+            os: windows-latest
+            lib_type: shared
+          # 告警升格为错误（当前实现代码必须在 -Wall/-Wextra 下零告警）
+          - name: ubuntu-warnings-strict
+            os: ubuntu-latest
+            warnings_as_errors: true
 
     env:
-      BUILD_TYPE: Release
       # 冒烟消费者与安装树的构建目录（路径含空格风险，统一放工作区根下）
       PREFIX: ${{ github.workspace }}/smoke/prefix
 
@@ -41,21 +65,22 @@ jobs:
           conan profile detect --force
           p="$(conan profile path default)"
           # 键必须插进已有的 [settings] 段（直接 append 会产生重复 section，
-          # conan 直接报错）。注入全部做成幂等：新版 conan detect 可能已
-          # 自带 cppstd（gnu14），重复插入会炸
-          # compiler.cppstd 必须存在：cpp-httplib/spdlog 的配方会校验
-          # 该设置（缺失直接拒装）。14 = gtest 1.15 最低要求（detect 已写
-          # gnu14 的话直接用）；库本体仍按 CMAKE_CXX_STANDARD=11 编译
+          # conan 直接报错）。注入全部做成幂等：新版 conan detect 可能已自带
+          # cppstd（gnu14），重复插入会炸
+          # compiler.cppstd 必须存在：cpp-httplib/spdlog 的配方会校验该设置
+          #（缺失直接拒装）。14 = gtest 1.15 最低要求（detect 已写 gnu14 的
+          # 话直接用）；库本体仍按 CMAKE_CXX_STANDARD=11 编译
           if ! grep -q '^compiler.cppstd=' "$p"; then
             awk '/^\\[settings\\]$/{print; print "compiler.cppstd=14"; next} {print}' "$p" > "$p.tmp" && mv "$p.tmp" "$p"
           fi
-          # Windows：静态运行库（MT），与 README「安装与分发」的消费要求一致；
-          # 并显式声明 Ninja 生成器（conan 否则会把 VS toolset/-T x64 写进
-          # toolchain，与 Ninja 生成器不兼容：CMP0091 + platform 报错）
+          # Windows：静态运行库（MT），与消费者 CMAKE_MSVC_RUNTIME_LIBRARY=
+          # MultiThreaded 一致（DLL 变体同一运行库，CMakeToolchain 按
+          # compiler.runtime 设置 CMP0091 旗标）
           if [ "${{ matrix.os }}" = "windows-latest" ]; then
-            if ! grep -q '^compiler.runtime=' "$p"; then
-              awk '/^\\[settings\\]$/{print; print "compiler.runtime=static"; next} {print}' "$p" > "$p.tmp" && mv "$p.tmp" "$p"
-            fi
+            # 逐行覆写而不是 missing 才插入：新版 detect 可能已写 dynamic
+            #（run #5 实测：守卫失效后依赖全按 MD 编，消费者 MT 链接报
+            # __imp_ 符号缺失）
+            awk 'BEGIN{d=0} /^compiler\.runtime=/{print "compiler.runtime=static"; d=1; next} {print} END{if(!d) print "compiler.runtime=static"}' "$p" > "$p.tmp" && mv "$p.tmp" "$p"
             printf '\n[conf]\ntools.cmake.cmaketoolchain:generator=Ninja\n' >> "$p"
           fi
           conan profile show
@@ -67,17 +92,18 @@ jobs:
           key: conan-${{ matrix.os }}-${{ hashFiles('conanfile.py') }}
 
       - name: Install dependencies (Conan)
-        run: conan install . -of deps --build=missing -s build_type=Release
-
+        run: conan install . -of deps --build=missing -s build_type=${{ matrix.build_type || 'Release' }}
 
       - name: Configure (CMake + Ninja)
         shell: bash
         run: >
           cmake -S . -B build -G Ninja
           -DCMAKE_TOOLCHAIN_FILE=deps/conan_toolchain.cmake
-          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_BUILD_TYPE=${{ matrix.build_type || 'Release' }}
           -DCMAKE_INSTALL_PREFIX="$PREFIX"
           -DLIBMINI_BUILD_SWF_VIEWER=OFF
+          -DLIBMINI_BUILD_SHARED=${{ matrix.lib_type == 'shared' && 'ON' || 'OFF' }}
+          -DLIBMINI_WARNINGS_AS_ERRORS=${{ matrix.warnings_as_errors && 'ON' || 'OFF' }}
 
       - name: Build
         run: cmake --build build --parallel
@@ -96,13 +122,18 @@ jobs:
         # 工具链/前缀必须用绝对路径：CMAKE_TOOLCHAIN_FILE 的相对路径是相对
         # 源目录（ci/smoke_consumer）解析的，deps/ 在源目录下不存在，直接
         # "Could not find toolchain file" 配置失败（run #4 三平台实测）。
-        # Windows 上 GITHUB_WORKSPACE 是反斜杠路径，cygpath -m 统一成正斜杠
+        # Windows 上 GITHUB_WORKSPACE 是反斜杠路径，cygpath -m 统一成正斜杠。
+        # shared 变体把 DLL 拷到可执行文件旁（保证运行期找到库，比 PATH
+        # 操作确定性高）
         run: |
           ws="$GITHUB_WORKSPACE"
           command -v cygpath >/dev/null 2>&1 && ws=$(cygpath -m "$ws")
           cmake -S ci/smoke_consumer -B smoke/build -G Ninja \
             -DCMAKE_TOOLCHAIN_FILE="$ws/deps/conan_toolchain.cmake" \
-            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_BUILD_TYPE=${{ matrix.build_type || 'Release' }} \
             -DCMAKE_PREFIX_PATH="$ws/smoke/prefix"
           cmake --build smoke/build --parallel
+          if [ -f "$ws/smoke/prefix/bin/liblibmini.dll" ]; then
+            cp "$ws/smoke/prefix/bin/liblibmini.dll" smoke/build/
+          fi
           ./smoke/build/consumer

@@ -22,9 +22,12 @@ cmake --build --preset conan-debug
 - 测试：在构建目录执行 `ctest -C Debug`，套件为 `libmini_test` / `rpc_test` / `utils_test` / `common_test` / `args_test`
 - 动态库：`-DLIBMINI_BUILD_SHARED=ON`（同时定义 `LIBMINI_EXPORTS` 导出符号）
 - C++ 标准为 C++11（MSVC 2017 兼容），源码统一 `/utf-8` 编译
-- CI：`.github/workflows/ci.yml` —— Ubuntu/Windows/macOS 三平台 conan + Ninja
-  构建、CTest 全套、安装后 `find_package` 冒烟（`ci/smoke_consumer`）；
-  push/PR 到 main 时自动运行
+- CI：`.github/workflows/ci.yml` —— 7 个变体 job：三平台 Release 基线、
+  Debug、Shared（DLL/SO 导出面）、warnings-strict（`-Wall -Wextra -Werror`），
+  全部走 conan + Ninja 构建、CTest 全套、安装后 `find_package` 冒烟
+  （`ci/smoke_consumer`）；push/PR 到 main 时自动运行
+- 编译器告警默认 `-Wall`/`-Wextra`（MSVC `/W4`）可见；
+  `-DLIBMINI_WARNINGS_AS_ERRORS=ON` 升格为错误
 
 ## 接入方式
 

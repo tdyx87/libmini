@@ -333,7 +333,6 @@ TEST(RpcServerTest, StopIsIdempotent)
 TEST(RpcServerTest, RestartAfterStop)
 {
     TestServer ts;
-    const int first_port = ts.port();
     ts.server().stop();
 
     ts.server().start_background();
