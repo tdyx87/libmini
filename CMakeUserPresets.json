@@ -1,0 +1,24 @@
+{
+    "version": 4,
+    "vendor": {
+        "conan": {}
+    },
+    "include": [
+        "out/conan/x86-static-debug/CMakePresets.json",
+        "deps/CMakePresets.json"
+    ],
+    "configurePresets": [
+        {
+            "name": "\u4f7f\u7528\u5de5\u5177\u94fe\u6587\u4ef6\u914d\u7f6e\u9884\u8bbe",
+            "displayName": "\u4f7f\u7528\u5de5\u5177\u94fe\u6587\u4ef6\u914d\u7f6e\u9884\u8bbe",
+            "description": "\u8bbe\u7f6e Ninja \u751f\u6210\u5668\u3001\u7248\u672c\u548c\u5b89\u88c5\u76ee\u5f55",
+            "generator": "Ninja",
+            "binaryDir": "${sourceDir}/out/build/${presetName}",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Debug",
+                "CMAKE_TOOLCHAIN_FILE": "",
+                "CMAKE_INSTALL_PREFIX": "${sourceDir}/out/install/${presetName}"
+            }
+        }
+    ]
+}

@@ -1,0 +1,88 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+
+    env:
+      BUILD_TYPE: Release
+      # 冒烟消费者与安装树的构建目录（路径含空格风险，统一放工作区根下）
+      PREFIX: ${{ github.workspace }}/smoke/prefix
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Conan
+        run: pip install "conan>=2.0"
+
+      - name: Configure Conan profile
+        shell: bash
+        run: |
+          conan profile detect --force
+          p="$(conan profile path default)"
+          # 键必须插进已有的 [settings] 段（直接 append 会产生重复 section，
+          # conan 直接报错）。awk 插入保证跨平台（Git Bash/BSD sed 差异规避）
+          # compiler.cppstd 必须显式设置：cpp-httplib/spdlog 的配方会校验
+          # 该设置（缺失直接拒装）。取 14 = gtest 1.15 的最低要求；
+          # 库本体仍按 CMAKE_CXX_STANDARD=11 编译（CMake 侧覆盖）
+          awk '/^\\[settings\\]$/{print; print "compiler.cppstd=14"; next} {print}' "$p" > "$p.tmp" && mv "$p.tmp" "$p"
+          # Windows：静态运行库（MT），与 README「安装与分发」的消费要求一致
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            awk '/^\\[settings\\]$/{print; print "compiler.runtime=static"; next} {print}' "$p" > "$p.tmp" && mv "$p.tmp" "$p"
+          fi
+          conan profile show
+
+      - name: Cache Conan packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.conan2/p
+          key: conan-${{ matrix.os }}-${{ hashFiles('conanfile.txt') }}
+
+      - name: Install dependencies (Conan)
+        run: conan install . -of deps --build=missing -s build_type=Release
+
+
+      - name: Configure (CMake + Ninja)
+        run: >
+          cmake -S . -B build -G Ninja
+          -DCMAKE_TOOLCHAIN_FILE=${{ github.workspace }}/deps/conan_toolchain.cmake
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_INSTALL_PREFIX=${{ env.PREFIX }}
+          -DLIBMINI_BUILD_SWF_VIEWER=OFF
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: CTest
+        shell: bash
+        run: >
+          ctest --test-dir build --output-on-failure
+          --timeout 600
+
+      - name: Install to prefix
+        run: cmake --install build
+
+      - name: Smoke consumer (find_package + link + run)
+        shell: bash
+        run: |
+          cmake -S ci/smoke_consumer -B smoke/build -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE=${{ github.workspace }}/deps/conan_toolchain.cmake \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_PREFIX_PATH=${{ env.PREFIX }}
+          cmake --build smoke/build --parallel
+          ./smoke/build/consumer
