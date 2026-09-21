@@ -27,6 +27,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Windows：激活 MSVC 开发环境（Ninja 生成器下 CMake 找不到 cl.exe，
+      # 必须 vcvars 提供 INCLUDE/LIB/PATH）
+      - uses: ilammy/msvc-dev-cmd@v1
+        if: matrix.os == 'windows-latest'
+
       - name: Install Conan
         run: pip install "conan>=2.0"
 
@@ -36,14 +41,22 @@ jobs:
           conan profile detect --force
           p="$(conan profile path default)"
           # 键必须插进已有的 [settings] 段（直接 append 会产生重复 section，
-          # conan 直接报错）。awk 插入保证跨平台（Git Bash/BSD sed 差异规避）
-          # compiler.cppstd 必须显式设置：cpp-httplib/spdlog 的配方会校验
-          # 该设置（缺失直接拒装）。取 14 = gtest 1.15 的最低要求；
-          # 库本体仍按 CMAKE_CXX_STANDARD=11 编译（CMake 侧覆盖）
-          awk '/^\\[settings\\]$/{print; print "compiler.cppstd=14"; next} {print}' "$p" > "$p.tmp" && mv "$p.tmp" "$p"
-          # Windows：静态运行库（MT），与 README「安装与分发」的消费要求一致
+          # conan 直接报错）。注入全部做成幂等：新版 conan detect 可能已
+          # 自带 cppstd（gnu14），重复插入会炸
+          # compiler.cppstd 必须存在：cpp-httplib/spdlog 的配方会校验
+          # 该设置（缺失直接拒装）。14 = gtest 1.15 最低要求（detect 已写
+          # gnu14 的话直接用）；库本体仍按 CMAKE_CXX_STANDARD=11 编译
+          if ! grep -q '^compiler.cppstd=' "$p"; then
+            awk '/^\\[settings\\]$/{print; print "compiler.cppstd=14"; next} {print}' "$p" > "$p.tmp" && mv "$p.tmp" "$p"
+          fi
+          # Windows：静态运行库（MT），与 README「安装与分发」的消费要求一致；
+          # 并显式声明 Ninja 生成器（conan 否则会把 VS toolset/-T x64 写进
+          # toolchain，与 Ninja 生成器不兼容：CMP0091 + platform 报错）
           if [ "${{ matrix.os }}" = "windows-latest" ]; then
-            awk '/^\\[settings\\]$/{print; print "compiler.runtime=static"; next} {print}' "$p" > "$p.tmp" && mv "$p.tmp" "$p"
+            if ! grep -q '^compiler.runtime=' "$p"; then
+              awk '/^\\[settings\\]$/{print; print "compiler.runtime=static"; next} {print}' "$p" > "$p.tmp" && mv "$p.tmp" "$p"
+            fi
+            printf '\n[conf]\ntools.cmake.cmaketoolchain:generator=Ninja\n' >> "$p"
           fi
           conan profile show
 

@@ -562,11 +562,20 @@ std::string temp_directory_path()
 
 std::string unique_temp_path(const std::string& prefix, const std::string& dir)
 {
-    // 进程级递增计数 + 周期计数，避免同进程内名字碰撞
+    // 进程级递增计数 + 周期计数，避免同进程内名字碰撞。
+    // 计时源按平台取：Windows GetTickCount；POSIX 用 CLOCK_MONOTONIC
+    //（它无 Windows 依赖，必须放在平台分支之外编译）
     static unsigned long long counter = 0;
-    const unsigned long long id =
-        (++counter << 12) ^ (static_cast<unsigned long long>(
-                                 ::GetTickCount()) & 0xFFFULL);
+#ifdef _WIN32
+    const unsigned long long tick =
+        static_cast<unsigned long long>(::GetTickCount()) & 0xFFFULL;
+#else
+    struct ::timespec ts;
+    ::clock_gettime(CLOCK_MONOTONIC, &ts);
+    const unsigned long long tick =
+        static_cast<unsigned long long>(ts.tv_nsec / 1000000) & 0xFFFULL;
+#endif
+    const unsigned long long id = (++counter << 12) ^ tick;
     char buf[32];
     std::snprintf(buf, sizeof(buf), "%llx", static_cast<unsigned long long>(id));
     std::string base = dir.empty() ? temp_directory_path() : dir;
