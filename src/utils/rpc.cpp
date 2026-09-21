@@ -461,6 +461,14 @@ void parse_host_port(const std::string& endpoint, std::string& host, int& port)
 
 // ==================== RpcClient ====================
 
+#ifndef _WIN32
+// POSIX UDS 辅助函数（定义在 RpcServer 段；客户端本地传输先于此使用，
+// GCC 的单遍查找要求使用点之前有声明——MSVC permissive 模式会放行）
+bool uds_send_frame(int fd, const std::string& payload);
+bool uds_recv_frame(int fd, std::string& payload);
+bool uds_connect(int fd, const std::string& path, int timeout_ms);
+#endif
+
 // 一次 RPC 尝试的结果（传输无关）
 struct AttemptResult
 {

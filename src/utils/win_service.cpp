@@ -15,9 +15,11 @@
 
 namespace libmini {
 
+#ifdef _WIN32
+
 namespace {
 
-// ServiceState ↔ SCM 状态码
+// ServiceState ↔ SCM 状态码（Windows 专属：DWORD/SERVICE_* 均来自 Windows.h）
 DWORD to_scm_state(ServiceState s)
 {
     switch (s) {
@@ -52,8 +54,6 @@ DWORD to_start_type(ServiceStartType t)
 }
 
 }  // namespace
-
-#ifdef _WIN32
 
 // ------------------ ServiceControl ------------------
 
