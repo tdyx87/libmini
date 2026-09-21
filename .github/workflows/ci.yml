@@ -124,7 +124,8 @@ jobs:
         # "Could not find toolchain file" 配置失败（run #4 三平台实测）。
         # Windows 上 GITHUB_WORKSPACE 是反斜杠路径，cygpath -m 统一成正斜杠。
         # shared 变体把 DLL 拷到可执行文件旁（保证运行期找到库，比 PATH
-        # 操作确定性高）
+        # 操作确定性高）。DLL 名因工具链而异：MinGW liblibmini.dll、
+        # MSVC libmini.dll，通配拷贝两者兼容
         run: |
           ws="$GITHUB_WORKSPACE"
           command -v cygpath >/dev/null 2>&1 && ws=$(cygpath -m "$ws")
@@ -133,7 +134,7 @@ jobs:
             -DCMAKE_BUILD_TYPE=${{ matrix.build_type || 'Release' }} \
             -DCMAKE_PREFIX_PATH="$ws/smoke/prefix"
           cmake --build smoke/build --parallel
-          if [ -f "$ws/smoke/prefix/bin/liblibmini.dll" ]; then
-            cp "$ws/smoke/prefix/bin/liblibmini.dll" smoke/build/
-          fi
+          for dll in "$ws"/smoke/prefix/bin/*libmini*.dll; do
+            [ -f "$dll" ] && cp "$dll" smoke/build/
+          done
           ./smoke/build/consumer

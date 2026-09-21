@@ -42,11 +42,11 @@ std::int64_t SqliteValue::to_int64() const
         case Type::Real:    return static_cast<std::int64_t>(real);
         case Type::Text:
         case Type::Blob: {
-            // 宽松转换：取前缀数字（"42abc" → 42），失败返回 0
-            std::int64_t v = 0;
-            if (std::sscanf(bytes.c_str(), "%lld",
-                            static_cast<long long*>(&v)) == 1) {
-                return v;
+            // 宽松转换：取前缀数字（"42abc" → 42），失败返回 0。
+            // %lld 要求 long long*（Linux 上 int64_t 是 long，不能直接传）
+            long long ll = 0;
+            if (std::sscanf(bytes.c_str(), "%lld", &ll) == 1) {
+                return static_cast<std::int64_t>(ll);
             }
             return 0;
         }

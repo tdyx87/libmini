@@ -25,6 +25,12 @@ class LibminiConan(ConanFile):
         if self.settings.os != "Windows":
             self.requires("openssl/3.0.17")
 
+    def configure(self):
+        # 只需要 sqlite 库本体：shell.c 在中文 locale 的 MSVC 下按 GBK 读
+        # UTF-8 源码直接编译失败（C2001），与旧 conanfile.txt 的 [options]
+        # 约定一致
+        self.options["sqlite3/*"].build_executable = False
+
     # 不用 cmake_layout：生成器直接落在 -of 目录（deps/conan_toolchain.cmake），
     # 与 CI/文档里既有的工具链路径约定一致
     def generate(self):

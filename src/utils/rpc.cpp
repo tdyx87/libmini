@@ -350,6 +350,9 @@ const double LatencyHistogram::kInfMs = 1e30;
 //   "ok" / "bad_request" / "not_found" / "overloaded" / "handler_error"
 // 过载时另有 retry_after_s 字段（整数秒），与 HTTP Retry-After 头对应。
 
+// u32 长度头（小端）追加到 string。调用点全部在 Windows 管道分支
+//（POSIX UDS 走裸缓冲区重载），非 Windows 编译单元不编译本函数
+#ifdef _WIN32
 void put_u32_le(std::string& out, std::uint32_t v)
 {
     out.push_back(static_cast<char>(v & 0xFF));
@@ -357,6 +360,7 @@ void put_u32_le(std::string& out, std::uint32_t v)
     out.push_back(static_cast<char>((v >> 16) & 0xFF));
     out.push_back(static_cast<char>((v >> 24) & 0xFF));
 }
+#endif
 
 // 裸缓冲区重载（POSIX UDS 组帧专用，仅非 Windows 编译单元使用）
 #ifdef LIBMINI_BUILD_POSIX_FRAME
