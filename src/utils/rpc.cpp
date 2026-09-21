@@ -37,6 +37,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
 #else
+#include <cerrno>
 #include <fcntl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -961,6 +962,12 @@ struct RpcClient::Impl
         const std::wstring wname = internal::utf8_to_wide(endpoint);
         const DWORD timeout = static_cast<DWORD>(timeout_ms_);
         HANDLE pipe = INVALID_HANDLE_VALUE;
+        // 服务器补齐监听实例的间隙（accept 循环收割连接后重建实例前）
+        // 会短暂返回 ERROR_FILE_NOT_FOUND；给一个不超过 min(250ms, 超时)
+        // 的重试宽限，避免高负载下的偶发连接失败（CI 实测）
+        const auto not_found_deadline =
+            std::chrono::steady_clock::now() +
+            std::chrono::milliseconds(timeout < 250 ? timeout : 250);
         for (int busy_retry = 0; busy_retry < 40; ++busy_retry) {
             // FILE_FLAG_OVERLAPPED：流水线会话要求同一句柄读写并发
             //（读线程阻塞收帧 + 调用线程写请求）。非重叠句柄的同步
@@ -973,6 +980,14 @@ struct RpcClient::Impl
                 break;
             }
             const DWORD last_err = ::GetLastError();
+            if (last_err == ERROR_FILE_NOT_FOUND ||
+                last_err == ERROR_PATH_NOT_FOUND) {
+                if (std::chrono::steady_clock::now() < not_found_deadline) {
+                    ::Sleep(10);
+                    continue;
+                }
+                break;
+            }
             if (last_err != ERROR_PIPE_BUSY) {
                 break;
             }
@@ -1047,18 +1062,34 @@ struct RpcClient::Impl
     // 新建 UDS 连接
     bool local_open_conn(int& out_fd, int timeout_ms_, std::string& err)
     {
-        const int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
-        if (fd < 0) {
-            err = "connection failed: socket() error";
-            return false;
-        }
-        if (!uds_connect(fd, endpoint, timeout_ms_)) {
+        // 服务器补齐监听（重启或 accept 间隙）时短暂 ENOENT/ECONNREFUSED：
+        // 给不超过 min(250ms, 超时) 的重试宽限（与 Windows 客户端的
+        // ERROR_FILE_NOT_FOUND 宽限对称）
+        const auto not_found_deadline =
+            std::chrono::steady_clock::now() +
+            std::chrono::milliseconds(timeout_ms_ < 250 ? timeout_ms_ : 250);
+        for (;;) {
+            const int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+            if (fd < 0) {
+                err = "connection failed: socket() error";
+                return false;
+            }
+            if (uds_connect(fd, endpoint, timeout_ms_)) {
+                out_fd = fd;
+                return true;
+            }
+            // errno 在 uds_connect 返回后立即可读（connect 失败同步返回）
+            const int conn_err = errno;
             ::close(fd);
-            err = "connection failed: endpoint not reachable";
-            return false;
+            const bool transient =
+                (conn_err == ENOENT || conn_err == ECONNREFUSED);
+            if (!transient ||
+                std::chrono::steady_clock::now() >= not_found_deadline) {
+                err = "connection failed: endpoint not reachable";
+                return false;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
-        out_fd = fd;
-        return true;
     }
 
     // 在既有 UDS 连接上执行一次帧交换
@@ -3295,13 +3326,6 @@ struct RpcServer::Impl
             }
             ::CloseHandle(probe);
         }
-        {
-            std::lock_guard<std::mutex> lock(ready_mutex);
-            bind_done = true;
-            bind_ok = true;
-        }
-        ready_cv.notify_all();
-
         // 服务循环：创建实例 → 异步等待连接 → 就绪后交给处理线程。
         // 每个实例用独立的 OVERLAPPED 事件（不能用共享的 stop_event：
         // ConnectNamedPipe 完成也会将其置为 signaled，污染后续等待）。
@@ -3328,6 +3352,45 @@ struct RpcServer::Impl
             std::lock_guard<std::mutex> lock(local_worker_mutex);
             worker_threads_runtime.push_back(std::move(w));
         };
+        // 预填充监听实例池并投递异步 ConnectNamedPipe。必须在 bind_ok
+        // 置位之前完成：否则 wait_until_ready 返回后、首批实例就绪前的
+        // 窗口里，客户端 CreateFileW 会拿到 ERROR_FILE_NOT_FOUND
+        //（CI 高负载下偶发：WaitInQueueModeServesBurst）
+        while (pending.size() < 8 &&
+               !stopping.load(std::memory_order_relaxed)) {
+            HANDLE pipe = create_pipe_instance();
+            if (pipe == INVALID_HANDLE_VALUE) {
+                break;
+            }
+            OVERLAPPED* ov = new OVERLAPPED{};
+            ov->hEvent = ::CreateEventW(NULL, TRUE, FALSE, NULL);
+            if (ov->hEvent == nullptr) {
+                delete ov;
+                ::CloseHandle(pipe);
+                break;
+            }
+            const BOOL connected = ::ConnectNamedPipe(pipe, ov);
+            if (!connected) {
+                const DWORD err = ::GetLastError();
+                if (err == ERROR_IO_PENDING) {
+                    pending.push_back({pipe, ov->hEvent, ov});
+                    continue;
+                }
+                if (err == ERROR_PIPE_CONNECTED) {
+                    spawn_pipe_worker(pipe);
+                }
+            } else {
+                spawn_pipe_worker(pipe);
+            }
+            ::CloseHandle(ov->hEvent);
+            delete ov;
+        }
+        {
+            std::lock_guard<std::mutex> lock(ready_mutex);
+            bind_done = true;
+            bind_ok = true;
+        }
+        ready_cv.notify_all();
         while (!stopping.load(std::memory_order_relaxed)) {
             // 维持一批可连接实例（先建后等，全部处于监听状态）
             while (pending.size() < 8 &&

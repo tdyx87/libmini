@@ -1758,6 +1758,44 @@ TEST(RpcLocalTransportTest, WaitInQueueModeServesBurst)
     EXPECT_EQ(server.stats().completed_total, 3u);
 }
 
+// 启动竞态回归：wait_until_ready 返回的瞬间并发发起首连。修复前服务端
+// 在 bind_ok 置位之后才预填充监听实例，CI 高负载下客户端会拿到
+// ERROR_FILE_NOT_FOUND（WaitInQueueModeServesBurst 偶发失败的根因）
+TEST(RpcLocalTransportTest, ConnectImmediatelyAfterReady)
+{
+#ifdef _WIN32
+    const std::string endpoint = "libmini_rpc_test_ready.pipe";
+#else
+    const std::string endpoint =
+        libmini::temp_directory_path() + "/libmini_rpc_test_ready.sock";
+#endif
+    libmini::RpcServer server(libmini::RpcTransport::LocalPipe, endpoint);
+    server.register_method("add", [](const std::string& params) {
+        const json p = json::parse(params);
+        return json{{"sum", p.at("a").get<int>() + p.at("b").get<int>()}}
+            .dump();
+    });
+    server.start_background();
+    ASSERT_TRUE(server.wait_until_ready(5000));
+
+    // ready 后立即 8 线程并发首连（连接池零预热）：全部应成功
+    std::vector<std::future<std::string>> results;
+    for (int i = 0; i < 8; ++i) {
+        results.push_back(
+            std::async(std::launch::async, [&endpoint, i]() {
+                libmini::RpcClient client(libmini::RpcTransport::LocalPipe,
+                                          endpoint);
+                client.set_max_retries(0);
+                return client.call("add", json{{"a", i}, {"b", 1}}.dump());
+            }));
+    }
+    for (int i = 0; i < 8; ++i) {
+        EXPECT_EQ(results[i].get(),
+                  "{\"sum\":" + std::to_string(i + 1) + "}");
+    }
+    server.stop();
+}
+
 TEST(RpcLocalTransportTest, ConnectionFailureReported)
 {
     // 不存在的端点
