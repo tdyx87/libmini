@@ -45,7 +45,7 @@ public:
 
         server_.register_method("slow", [](const std::string&) {
             std::this_thread::sleep_for(std::chrono::milliseconds(600));
-            return "slow_done";
+            return json{{"done", true}}.dump();  // handler 输出必须是合法 JSON
         });
 
         server_.register_method("sleep_ms", [](const std::string& params) {
@@ -69,6 +69,178 @@ private:
 };
 
 }  // namespace
+
+// ==================== 异步调用测试 ====================
+
+TEST(RpcAsyncTest, FutureFormMatchesSyncSemantics)
+{
+    TestServer ts;
+    libmini::RpcClient client("127.0.0.1", ts.port());
+
+    auto f = client.call_async("add", R"({"a":2,"b":3})");
+    f.wait();
+    const std::string reply = f.get();
+    ASSERT_FALSE(reply.empty());
+    EXPECT_EQ(json::parse(reply).at("sum").get<int>(), 5);
+    EXPECT_EQ(client.last_error(), libmini::RpcError::OK);
+}
+
+TEST(RpcAsyncTest, FutureCarriesErrorsWithoutRetryStorm)
+{
+    TestServer ts;
+    libmini::RpcClient client("127.0.0.1", ts.port());
+    client.set_max_retries(0);
+
+    auto f = client.call_async("fail", "null");
+    EXPECT_TRUE(f.get().empty());
+    EXPECT_EQ(client.last_error(), libmini::RpcError::SERVER_ERROR);
+    EXPECT_NE(client.last_error_message().find("boom"), std::string::npos);
+
+    auto nf = client.call_async("no_such_method", "null");
+    EXPECT_TRUE(nf.get().empty());
+    EXPECT_EQ(client.last_error(), libmini::RpcError::SERVER_ERROR);
+}
+
+TEST(RpcAsyncTest, ConcurrentAsyncCallsAllComplete)
+{
+    TestServer ts;
+    libmini::RpcClient client("127.0.0.1", ts.port());
+    client.set_max_retries(0);
+
+    constexpr int kCalls = 16;
+    std::vector<std::future<std::string>> futures;
+    for (int i = 0; i < kCalls; ++i) {
+        // sleep_ms 让部分请求真正在服务器上并发处理（而非队列化）
+        futures.push_back(client.call_async(
+            "sleep_ms", json{{"ms", 20}}.dump()));
+    }
+    for (auto& f : futures) {
+        const std::string reply = f.get();
+        ASSERT_FALSE(reply.empty());
+        EXPECT_EQ(json::parse(reply).at("slept").get<int>(), 20);
+    }
+}
+
+TEST(RpcAsyncTest, CallbackFormReceivesResultAndError)
+{
+    TestServer ts;
+    libmini::RpcClient client("127.0.0.1", ts.port());
+    client.set_max_retries(0);
+
+    std::mutex m;
+    std::condition_variable cv;
+    std::string result;
+    libmini::RpcError err = libmini::RpcError::UNKNOWN;
+    std::string msg = "not called";
+    bool done = false;
+
+    client.call_async("add", R"({"a":10,"b":5})",
+                      [&](const std::string& r, libmini::RpcError e,
+                          const std::string& em) {
+                          std::lock_guard<std::mutex> lk(m);
+                          result = r;
+                          err = e;
+                          msg = em;
+                          done = true;
+                          cv.notify_all();
+                      });
+
+    std::unique_lock<std::mutex> lk(m);
+    ASSERT_TRUE(cv.wait_for(lk, std::chrono::seconds(5), [&] { return done; }));
+    EXPECT_EQ(json::parse(result).at("sum").get<int>(), 15);
+    EXPECT_EQ(err, libmini::RpcError::OK);
+    EXPECT_TRUE(msg.empty());
+
+    // 失败路径：错误码与文本经回调专属副本送达
+    done = false;
+    client.call_async("fail", "null",
+                      [&](const std::string& r, libmini::RpcError e,
+                          const std::string& em) {
+                          std::lock_guard<std::mutex> lk2(m);
+                          result = r;
+                          err = e;
+                          msg = em;
+                          done = true;
+                          cv.notify_all();
+                      });
+    ASSERT_TRUE(cv.wait_for(lk, std::chrono::seconds(5), [&] { return done; }));
+    EXPECT_TRUE(result.empty());
+    EXPECT_EQ(err, libmini::RpcError::SERVER_ERROR);
+    EXPECT_NE(msg.find("boom"), std::string::npos);
+}
+
+TEST(RpcAsyncTest, CallbackErrorStateIndependentAcrossCalls)
+{
+    // 回调形态的错误状态是每次调用的专属副本：并发一成功一失败时
+    // 两个回调各自看到自己的结果（同步 last_error 会互相覆盖）
+    TestServer ts;
+    libmini::RpcClient client("127.0.0.1", ts.port());
+    client.set_max_retries(0);
+
+    std::mutex m;
+    std::condition_variable cv;
+    int done = 0;
+    libmini::RpcError err_ok = libmini::RpcError::UNKNOWN;
+    libmini::RpcError err_bad = libmini::RpcError::OK;
+
+    client.call_async("add", R"({"a":1,"b":1})",
+                      [&](const std::string&, libmini::RpcError e,
+                          const std::string&) {
+                          std::lock_guard<std::mutex> lk(m);
+                          err_ok = e;
+                          if (++done == 2) cv.notify_all();
+                      });
+    client.call_async("fail", "null",
+                      [&](const std::string&, libmini::RpcError e,
+                          const std::string&) {
+                          std::lock_guard<std::mutex> lk(m);
+                          err_bad = e;
+                          if (++done == 2) cv.notify_all();
+                      });
+
+    std::unique_lock<std::mutex> lk(m);
+    ASSERT_TRUE(cv.wait_for(lk, std::chrono::seconds(5),
+                            [&] { return done == 2; }));
+    EXPECT_EQ(err_ok, libmini::RpcError::OK);
+    EXPECT_EQ(err_bad, libmini::RpcError::SERVER_ERROR);
+}
+
+TEST(RpcAsyncTest, DestructWaitsForPendingCallbacks)
+{
+    // 析构安全：客户端在异步调用在途时销毁，回调捕获裸指针。
+    // 若析构不等待在途任务，这里将是 use-after-free
+    std::mutex m;
+    std::condition_variable cv;
+    bool called = false;
+    {
+        TestServer ts;
+        libmini::RpcClient client("127.0.0.1", ts.port());
+        client.set_max_retries(0);
+        client.call_async("sleep_ms", json{{"ms", 100}}.dump(),
+                          [&](const std::string&, libmini::RpcError,
+                              const std::string&) {
+                              std::lock_guard<std::mutex> lk(m);
+                              called = true;
+                              cv.notify_all();
+                          });
+    }  // client 在请求可能仍在途时析构
+
+    std::unique_lock<std::mutex> lk(m);
+    EXPECT_TRUE(cv.wait_for(lk, std::chrono::seconds(5),
+                            [&] { return called; }));
+}
+
+TEST(RpcAsyncTest, AsyncAndSyncInterleave)
+{
+    TestServer ts;
+    libmini::RpcClient client("127.0.0.1", ts.port());
+    client.set_max_retries(0);
+
+    auto f1 = client.call_async("add", R"({"a":1,"b":2})");
+    const std::string sync_reply = client.call("add", R"({"a":3,"b":4})");
+    ASSERT_EQ(json::parse(sync_reply).at("sum").get<int>(), 7);
+    EXPECT_EQ(json::parse(f1.get()).at("sum").get<int>(), 3);
+}
 
 // ==================== 请求日志测试 ====================
 
@@ -1989,6 +2161,216 @@ TEST(RpcClientPoolTest, LocalPipeTransport)
     ASSERT_TRUE(server.wait_until_ready(5000));
 
     run_pool_tests(libmini::RpcTransport::LocalPipe, server.endpoint());
+}
+
+// ==================== 单次调用级超时测试 ====================
+
+// 语义基线：timeout_ms <= 0 与双参版本完全等价；全局 set_timeout_ms
+// 不被单次超时污染
+TEST(RpcCallTimeoutTest, NonPositiveTimeoutEqualsDefaultCall)
+{
+    TestServer ts;
+    libmini::RpcClient client("127.0.0.1", ts.port());
+
+    EXPECT_FALSE(client.call("add", R"({"a":1,"b":2})", 0).empty());
+    EXPECT_FALSE(client.call("add", R"({"a":2,"b":3})", -500).empty());
+    // 全局配置仍生效（未被改动）
+    client.set_timeout_ms(3000);
+    EXPECT_FALSE(client.call("add", R"({"a":3,"b":4})").empty());
+    EXPECT_EQ(client.last_error(), libmini::RpcError::OK);
+}
+
+// 同步路径：单次超时不足时返回 TIMEOUT，且不污染全局配置——
+// 随后的默认调用仍能成功
+TEST(RpcCallTimeoutTest, PerCallTimeoutFailsIndependentlyHttp)
+{
+    TestServer ts;
+    libmini::RpcClient client("127.0.0.1", ts.port());
+    client.set_max_retries(0);
+    client.set_timeout_ms(5000);  // 全局给足
+
+    const auto t0 = std::chrono::steady_clock::now();
+    EXPECT_TRUE(client.call("slow", "null", 150).empty());
+    const auto elapsed = std::chrono::steady_clock::now() - t0;
+    EXPECT_EQ(client.last_error(), libmini::RpcError::TIMEOUT);
+    EXPECT_LT(elapsed, std::chrono::seconds(3));
+
+    // 全局配置未被污染：默认调用（5000ms）正常完成（handler 600ms）。
+    // 无论 httplib 复用还是重建连接，两次都是 slow，响应内容一致
+    const std::string expected_slow = json{{"done", true}}.dump();
+    EXPECT_EQ(client.call("slow", "null"), expected_slow);
+    EXPECT_EQ(client.last_error(), libmini::RpcError::OK);
+}
+
+// Tcp 传输：单次超时穿透到帧交换等待（流水线与连接池两路）
+TEST(RpcCallTimeoutTest, PerCallTimeoutAppliesToTcpPath)
+{
+    libmini::RpcServer server = make_tcp_server();
+
+    // 池路径（默认池开，串行）
+    {
+        libmini::RpcClient client(libmini::RpcTransport::Tcp,
+                                  server.endpoint());
+        client.set_max_retries(0);
+        client.set_timeout_ms(5000);
+        const auto t0 = std::chrono::steady_clock::now();
+        EXPECT_TRUE(client.call("slow", "null", 150).empty());
+        EXPECT_LT(std::chrono::steady_clock::now() - t0,
+                  std::chrono::seconds(3));
+        EXPECT_EQ(client.last_error(), libmini::RpcError::TIMEOUT);
+        // 全局超时不被污染
+        EXPECT_EQ(client.call("add", R"({"a":1,"b":2})"),
+                  R"({"sum":3})");
+    }
+    // 流水线路径
+    {
+        libmini::RpcClient client(libmini::RpcTransport::Tcp,
+                                  server.endpoint());
+        client.set_max_retries(0);
+        client.set_timeout_ms(5000);
+        client.set_pipeline_max_in_flight(8);
+        EXPECT_TRUE(client.call("slow", "null", 150).empty());
+        EXPECT_EQ(client.last_error(), libmini::RpcError::TIMEOUT);
+        EXPECT_FALSE(client.call("add", R"({"a":2,"b":2})").empty());
+    }
+}
+
+// 本地传输（Windows 命名管道 / POSIX UDS）：同一语义
+TEST(RpcCallTimeoutTest, PerCallTimeoutAppliesToLocalPath)
+{
+    libmini::RpcServer server = make_local_server();
+    libmini::RpcClient client(libmini::RpcTransport::LocalPipe,
+                              server.endpoint());
+    client.set_max_retries(0);
+    client.set_timeout_ms(5000);
+
+    const auto t0 = std::chrono::steady_clock::now();
+    EXPECT_TRUE(client.call("slow", "null", 150).empty());
+    EXPECT_LT(std::chrono::steady_clock::now() - t0,
+              std::chrono::seconds(3));
+    EXPECT_EQ(client.last_error(), libmini::RpcError::TIMEOUT);
+    EXPECT_FALSE(client.call("add", R"({"a":4,"b":4})").empty());
+}
+
+// 异步 future：单次超时在任务内生效，结果经 future 送达
+TEST(RpcCallTimeoutTest, AsyncFutureFormHonorsPerCallTimeout)
+{
+    TestServer ts;
+    libmini::RpcClient client("127.0.0.1", ts.port());
+    client.set_max_retries(0);
+    client.set_timeout_ms(5000);
+
+    auto f = client.call_async("slow", "null", 150);
+    ASSERT_EQ(f.wait_for(std::chrono::seconds(3)),
+              std::future_status::ready);
+    EXPECT_TRUE(f.get().empty());
+    EXPECT_EQ(client.last_error(), libmini::RpcError::TIMEOUT);
+
+    // 成功路径：单次超时给足时正常返回
+    auto ok = client.call_async("add", R"({"a":5,"b":6})", 3000);
+    ASSERT_EQ(ok.wait_for(std::chrono::seconds(5)),
+              std::future_status::ready);
+    EXPECT_EQ(json::parse(ok.get()).at("sum").get<int>(), 11);
+}
+
+// 异步回调：单次超时生效，错误经回调专属副本送达
+TEST(RpcCallTimeoutTest, AsyncCallbackFormHonorsPerCallTimeout)
+{
+    TestServer ts;
+    libmini::RpcClient client("127.0.0.1", ts.port());
+    client.set_max_retries(0);
+    client.set_timeout_ms(5000);
+
+    std::mutex m;
+    std::condition_variable cv;
+    bool done = false;
+    libmini::RpcError err = libmini::RpcError::UNKNOWN;
+    std::string msg;
+
+    client.call_async("slow", "null", 150,
+                      [&](const std::string& r, libmini::RpcError e,
+                          const std::string& em) {
+                          std::lock_guard<std::mutex> lk(m);
+                          EXPECT_TRUE(r.empty());
+                          err = e;
+                          msg = em;
+                          done = true;
+                          cv.notify_all();
+                      });
+    std::unique_lock<std::mutex> lk(m);
+    ASSERT_TRUE(cv.wait_for(lk, std::chrono::seconds(3),
+                            [&] { return done; }));
+    EXPECT_EQ(err, libmini::RpcError::TIMEOUT);
+    EXPECT_NE(msg.find("timeout"), std::string::npos);
+}
+
+// 同一客户端并发：一者用单次超时快速失败，另一者用全局配置正常完成。
+// 用 Tcp 传输：单次超时完全按调用传参（HTTP 的超时是连接级配置，
+// 并发不同单次超时存在文档声明的配置竞窗，本测试不覆盖该口）
+TEST(RpcCallTimeoutTest, ConcurrentCallsWithDifferentTimeouts)
+{
+    libmini::RpcServer server = make_tcp_server();
+    libmini::RpcClient client(libmini::RpcTransport::Tcp, server.endpoint());
+    client.set_max_retries(0);
+    client.set_timeout_ms(5000);
+
+    auto short_f = client.call_async("slow", "null", 150);
+    auto normal_f = client.call_async("slow", "null");
+
+    ASSERT_EQ(short_f.wait_for(std::chrono::seconds(3)),
+              std::future_status::ready);
+    EXPECT_TRUE(short_f.get().empty());
+
+    // slow handler 300ms：全局超时 5000 足以完成（与短超时调用各自
+    // 独占池连接，互不干扰）
+    const std::string expected_slow = json{{"done", true}}.dump();
+    ASSERT_EQ(normal_f.wait_for(std::chrono::seconds(5)),
+              std::future_status::ready);
+    EXPECT_EQ(normal_f.get(), expected_slow);
+}
+
+// 池排队等待受单次超时约束（Tcp 传输）：同一客户端、池 max=1 被慢调用
+// 占住后，后继者带极短单次超时应在该预算内报 pool busy（而非等满全局
+// 超时）。slow 用 800ms：给轮询检测留足余量，确保探测时连接仍被占住
+TEST(RpcCallTimeoutTest, PoolWaitBudgetUsesPerCallTimeout)
+{
+    libmini::RpcServer server(libmini::RpcTransport::Tcp, "127.0.0.1:0");
+    server.register_method("add", [](const std::string& params) {
+        const json p = json::parse(params);
+        return json{{"sum", p.at("a").get<int>() + p.at("b").get<int>()}}.dump();
+    });
+    server.register_method("slow", [](const std::string&) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(800));
+        return json{{"done", true}}.dump();
+    });
+    server.start_background();
+    ASSERT_TRUE(server.wait_until_ready(5000));
+
+    libmini::RpcClient client(libmini::RpcTransport::Tcp, server.endpoint());
+    client.set_max_retries(0);
+    client.set_timeout_ms(5000);
+    client.set_connection_pool_max(1);
+
+    // 线程 A：占住唯一的池连接
+    auto hold = std::async(std::launch::async,
+                           [&] { return client.call("slow", "null"); });
+    for (int i = 0; i < 200 && server.stats().active_requests < 1; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    // 线程 B：单次超时 50ms << 剩余占用时间 → 在池等待处按预算超时
+    const auto t0 = std::chrono::steady_clock::now();
+    EXPECT_TRUE(client.call("add", R"({"a":1,"b":1})", 50).empty());
+    EXPECT_LT(std::chrono::steady_clock::now() - t0,
+              std::chrono::seconds(2));
+    EXPECT_EQ(client.last_error(), libmini::RpcError::TIMEOUT);
+    EXPECT_NE(client.last_error_message().find("pool busy"),
+              std::string::npos);
+
+    // holder 正常完成；单次超时未污染全局配置
+    const std::string expected_slow = json{{"done", true}}.dump();
+    EXPECT_EQ(hold.get(), expected_slow);
+    EXPECT_FALSE(client.call("add", R"({"a":2,"b":2})").empty());
 }
 
 // ==================== 请求流水线测试（LocalPipe/Tcp）====================

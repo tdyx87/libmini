@@ -1394,6 +1394,47 @@ TEST(TcpTest, EchoRoundTrip)
     server.stop();
 }
 
+TEST(TcpTest, AsyncConnectResolvesAndCompletes)
+{
+    libmini::TcpServer server;
+    server.set_on_message([&server](std::uint64_t, const std::string& msg) {
+        server.send(1, "echo:" + msg);
+    });
+    ASSERT_TRUE(server.start("127.0.0.1", 0));
+
+    libmini::TcpClient client;
+    auto f = client.async_connect("127.0.0.1", server.port());
+    ASSERT_EQ(f.get(), true);
+    EXPECT_TRUE(client.is_connected());
+
+    // 连接后收发与同步 connect 语义一致（回显路径）
+    std::string got;
+    client.set_on_message([&](const std::string& msg) { got = msg; });
+    ASSERT_TRUE(client.send("ping"));
+    for (int i = 0; i < 200 && got.empty(); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    EXPECT_EQ(got, "echo:ping");
+
+    client.close();
+    server.stop();
+}
+
+TEST(TcpTest, AsyncConnectToDeadPortFailsFast)
+{
+    libmini::TcpClient client;
+    libmini::TcpConfig cfg;
+    cfg.connect_timeout_ms = 1500;
+    libmini::TcpClient timed(cfg);
+
+    // 未监听端口：连接被拒或超时，future 都必须置 false（不悬挂）
+    auto f = timed.async_connect("127.0.0.1", 1);
+    ASSERT_EQ(f.wait_for(std::chrono::seconds(5)),
+              std::future_status::ready);
+    EXPECT_FALSE(f.get());
+    EXPECT_FALSE(timed.is_connected());
+}
+
 TEST(TcpTest, ConcurrentClientsAndBroadcast)
 {
     libmini::TcpServer server;

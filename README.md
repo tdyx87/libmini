@@ -328,6 +328,32 @@ const RpcClientPoolStats ps = tcp_client.pool_stats();
 // 池模式 514 QPS（并发=8 条连接）→ 流水线 2003 QPS（单连接在途 64）
 tcp_client.set_pipeline_max_in_flight(64);  // 0 = 关闭（默认），走连接池
 
+// 异步调用：在客户端内部线程池（8 线程）上执行，与 call() 完全相同的
+// 请求路径（重试/退避/连接池/流水线/超时全部生效），不阻塞调用线程。
+// future 形态：
+std::future<std::string> f = client.call_async("add", R"({"a":1,"b":2})");
+// ... 做其他事 ...
+std::string r3 = f.get();  // 与 call() 相同语义（失败为空串）
+
+// 回调形态：完成时在内部线程执行，错误码/文本是本次调用专属副本
+//（并发调用互不覆盖，弥补同步 last_error() 共享状态的局限）
+client.call_async("add", params, [](const std::string& result,
+                                     RpcError err, const std::string& msg) {
+    if (err != RpcError::OK) { handle_error(err, msg); }
+});
+// 线程安全：多线程并发 call_async、与 call() 混用均安全；
+// 客户端析构会等所有在途异步调用结束，回调中捕获 this/引用不会悬空
+//
+// 形态选型（example 实测，Tcp handler 5ms、1600 请求）：两种形态
+// 吞吐与同步多线程同档（~1.0x），提交开销都在 1µs 以内——需要结果
+// 对象或集中收口选 future，轻量通知/流式处理选回调，直白易调试
+// 选同步。三形态对比数据：example --only rpc
+
+// Tcp 客户端异步连接（DNS/握手在内部线程，受 connect_timeout_ms 约束）
+TcpClient tc;
+auto cf = tc.async_connect("10.0.0.5", 9000);
+if (cf.get()) { tc.send("hello"); }
+
 // 流水线通道统计（pool_stats() 的 pipeline_* 字段，未开启时恒 0）
 const RpcClientPoolStats pls = tcp_client.pool_stats();
 // pls.pipeline_in_flight / pipeline_in_flight_peak   实时在途数与峰值

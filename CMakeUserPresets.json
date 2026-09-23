@@ -6,7 +6,9 @@
     "include": [
         "out/conan/x86-static-debug/CMakePresets.json",
         "deps/CMakePresets.json",
-        "deps/build/Release/generators/CMakePresets.json"
+        "deps/build/Release/generators/CMakePresets.json",
+        "deps_msvc/CMakePresets.json",
+        "deps_msvc_dbg/CMakePresets.json"
     ],
     "configurePresets": [
         {

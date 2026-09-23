@@ -530,7 +530,7 @@ LIBMINI_DEMO(rpc)
                     Stopwatch sw;
                     const std::string r =
                         client.call("add", R"({"a":1,"b":2})");
-                    const double ms = sw.elapsed_ms();
+                    const double ms = static_cast<double>(sw.elapsed_ms());
                     if (!r.empty()) {
                         std::lock_guard<std::mutex> lock(lat_mu);
                         latencies.push_back(ms);
@@ -762,7 +762,8 @@ LIBMINI_DEMO(rpc)
                             Stopwatch sw;
                             const std::string r =
                                 client->call("add", R"({"a":1,"b":2})");
-                            const double ms = sw.elapsed_ms();
+                            const double ms =
+                                static_cast<double>(sw.elapsed_ms());
                             if (!r.empty()) {
                                 std::lock_guard<std::mutex> lock(lat_mu);
                                 lat.push_back(ms);
@@ -883,7 +884,8 @@ LIBMINI_DEMO(rpc)
                                 Stopwatch sw;
                                 const std::string r = shared->call(
                                     "slow_add", R"({"a":1,"b":2})");
-                                const double ms = sw.elapsed_ms();
+                                const double ms =
+                                    static_cast<double>(sw.elapsed_ms());
                                 if (!r.empty()) {
                                     std::lock_guard<std::mutex> lock(lat_mu);
                                     lat.push_back(ms);
@@ -907,25 +909,25 @@ LIBMINI_DEMO(rpc)
                     return r;
                 };
                 const BenchResult pool_r = run_shape(false);
-                const BenchResult pipe_r = run_shape(true);
+                const BenchResult pipe_on_r = run_shape(true);
                 std::cout << "rpc 流水线关    : QPS="
                           << fmt_num(pool_r.qps, 0)
                           << "  P50=" << fmt_num(pool_r.p50, 3)
                           << "ms  P99=" << fmt_num(pool_r.p99, 3)
                           << "ms（每并发一条池连接）\n";
                 std::cout << "rpc 流水线开    : QPS="
-                          << fmt_num(pipe_r.qps, 0)
-                          << "  P50=" << fmt_num(pipe_r.p50, 3)
-                          << "ms  P99=" << fmt_num(pipe_r.p99, 3)
+                          << fmt_num(pipe_on_r.qps, 0)
+                          << "  P50=" << fmt_num(pipe_on_r.p50, 3)
+                          << "ms  P99=" << fmt_num(pipe_on_r.p99, 3)
                           << "ms（单连接，在途上限 64）";
-                if (pipe_r.failed != 0 || pool_r.failed != 0) {
-                    std::cout << "（失败 pipe=" << pipe_r.failed
+                if (pipe_on_r.failed != 0 || pool_r.failed != 0) {
+                    std::cout << "（失败 pipe=" << pipe_on_r.failed
                               << " pool=" << pool_r.failed << "）";
                 }
                 std::cout << "\n";
-                if (pipe_r.failed == 0 && pool_r.failed == 0 &&
+                if (pipe_on_r.failed == 0 && pool_r.failed == 0 &&
                     pool_r.qps > 0) {
-                    const double speedup = pipe_r.qps / pool_r.qps;
+                    const double speedup = pipe_on_r.qps / pool_r.qps;
                     if (speedup >= 1.3) {
                         std::cout << "rpc 流水线结论  : 开启后吞吐提升 "
                                   << fmt_num(speedup, 1)
@@ -937,6 +939,233 @@ LIBMINI_DEMO(rpc)
                                   << "x）——本场景连接池已够用，短连接成本"
                                      "敏感时再考虑开启\n";
                     }
+                }
+            }
+
+            // ---- call_async vs 同步多线程：同请求总量的三种并发形态对比
+            // 同步 = 8 个业务线程各自阻塞 call()（线程数 = 并发上限，
+            // 每线程压满一条池连接）；异步 = 业务线程只做提交，并发由
+            // 客户端内部执行器（8 线程）承担。回调/future 两种异步形态
+            // 再对比提交开销：回调直接投任务，future 多一次 promise 堆
+            // 分配与收口成本。handler 有耗时 5ms：各形态服务端侧并发
+            // 相当，差异在业务线程占用——异步把「等回包」的线程开销
+            // 转移进库，业务线程 8:1。
+            {
+                const int k_th = 8;                // 同步形态的线程数
+                const int k_per = 200;             // 每线程请求数
+                const int k_total = k_th * k_per;  // 两形态同总量 1600
+                std::cout << "rpc 异步对比   : Tcp handler 耗时 5ms，同步 "
+                          << k_th << " 线程 vs 回调/future 各 1 个提交线程，"
+                          << "各 " << k_total << " 请求\n";
+
+                struct AsyncBench
+                {
+                    double qps = 0;
+                    double p50 = 0;
+                    double p99 = 0;
+                    int ok = 0;
+                    int failed = 0;
+                    double submit_ms = 0;  // 提交阶段耗时（两种异步形态）
+                    double collect_ms = 0;  // future 收口耗时（仅 future 形态）
+                };
+                enum class Form
+                {
+                    Sync,
+                    Callback,
+                    Future
+                };
+                auto run_bench = [&](Form form) -> AsyncBench {
+                    std::vector<double> lat;
+                    lat.reserve(static_cast<std::size_t>(k_total));
+                    std::mutex lat_mu;
+                    std::atomic<int> ok{0};
+                    std::atomic<int> failed{0};
+                    int done_count = 0;          // （异步形态）完成计数
+                    std::mutex done_mu;
+                    std::condition_variable done_cv;
+                    double submit_ms = 0;
+                    double collect_ms = 0;  // future 收口总耗时（仅 future 形态）
+                    Stopwatch wall;
+
+                    // 结果记账（同步与异步共用；ms<0 表示失败）
+                    auto record = [&](double ms) {
+                        if (ms >= 0) {
+                            std::lock_guard<std::mutex> lk(lat_mu);
+                            lat.push_back(ms);
+                            ok.fetch_add(1);
+                        } else {
+                            failed.fetch_add(1);
+                        }
+                        if (form != Form::Sync) {
+                            std::lock_guard<std::mutex> lk(done_mu);
+                            if (++done_count == k_total) {
+                                done_cv.notify_one();
+                            }
+                        }
+                    };
+
+                    if (form == Form::Sync) {
+                        // 同步基线：k_th 个业务线程各自阻塞调用
+                        std::vector<std::thread> workers;
+                        workers.reserve(static_cast<std::size_t>(k_th));
+                        for (int t = 0; t < k_th; ++t) {
+                            (void)t;
+                            workers.emplace_back([&] {
+                                RpcClient c(RpcTransport::Tcp,
+                                            tcp_bench.endpoint());
+                                c.set_max_retries(0);
+                                c.set_timeout_ms(5000);
+                                for (int i = 0; i < k_per; ++i) {
+                                    Stopwatch sw;
+                                    const std::string r = c.call(
+                                        "slow_add", R"({"a":1,"b":2})");
+                                    record(r.empty() ? -1.0
+                                                     : sw.elapsed_ms());
+                                }
+                            });
+                        }
+                        for (std::thread& w : workers) {
+                            w.join();
+                        }
+                    } else if (form == Form::Callback) {
+                        // 异步形态（回调）：1 个业务线程提交 call_async，回调收结果。
+                        // 延迟口径 = 提交到回调完成，与同步 call 的阻塞窗
+                        // 一致（每调用独立 Stopwatch 捕入回调）
+                        RpcClient c(RpcTransport::Tcp, tcp_bench.endpoint());
+                        c.set_max_retries(0);
+                        c.set_timeout_ms(5000);
+                        Stopwatch submit_sw;  // 提交循环耗时（提交开销口径）
+                        for (int i = 0; i < k_total; ++i) {
+                            Stopwatch sw;
+                            c.call_async(
+                                "slow_add", R"({"a":1,"b":2})",
+                                [&record, sw](const std::string& r, RpcError,
+                                              const std::string&) {
+                                    record(r.empty() ? -1.0 : sw.elapsed_ms());
+                                });
+                        }
+                        submit_ms =
+                            static_cast<double>(submit_sw.elapsed_ms());
+                        Stopwatch wait_sw;  // 等待窗与 future 的收口等价
+                        std::unique_lock<std::mutex> lk(done_mu);
+                        done_cv.wait_for(lk, std::chrono::seconds(30),
+                                         [&] { return done_count == k_total; });
+                        collect_ms =
+                            static_cast<double>(wait_sw.elapsed_ms());
+                    } else {
+                        // 异步形态（future）：1 个提交线程批量 call_async，
+                        // 逐 future 收口。延迟口径 = 提交到该 future 就绪
+                        //（与回调一致）；提交开销 = 批量提交循环耗时
+                        //（promise 堆分配 + 共享状态）；收口窗 = 完成等待
+                        // + 逐 future 检查（与回调的 CV 等待窗等价）
+                        RpcClient c(RpcTransport::Tcp, tcp_bench.endpoint());
+                        c.set_max_retries(0);
+                        c.set_timeout_ms(5000);
+                        struct Pending
+                        {
+                            Stopwatch sw;
+                            std::future<std::string> f;
+                        };
+                        std::vector<Pending> pending;
+                        pending.reserve(static_cast<std::size_t>(k_total));
+                        Stopwatch submit_sw;
+                        for (int i = 0; i < k_total; ++i) {
+                            Pending p;
+                            p.f = c.call_async("slow_add",
+                                               R"({"a":1,"b":2})");
+                            pending.push_back(std::move(p));
+                        }
+                        submit_ms =
+                            static_cast<double>(submit_sw.elapsed_ms());
+                        Stopwatch collect_sw;
+                        while (!pending.empty()) {
+                            for (std::size_t i = 0; i < pending.size();) {
+                                if (pending[i].f.wait_for(
+                                        std::chrono::milliseconds(0))
+                                    == std::future_status::ready) {
+                                    const std::string r =
+                                        pending[i].f.get();
+                                    record(r.empty()
+                                               ? -1.0
+                                               : pending[i].sw.elapsed_ms());
+                                    pending[i] = std::move(pending.back());
+                                    pending.pop_back();
+                                } else {
+                                    ++i;
+                                }
+                            }
+                            if (!pending.empty()) {
+                                std::this_thread::sleep_for(
+                                    std::chrono::milliseconds(1));
+                            }
+                        }
+                        collect_ms =
+                            static_cast<double>(collect_sw.elapsed_ms());
+                    }
+
+                    const double wall_ms = wall.elapsed_ms();
+                    std::sort(lat.begin(), lat.end());
+                    AsyncBench r;
+                    r.qps = static_cast<double>(ok.load() + failed.load()) /
+                            (wall_ms / 1000.0);
+                    r.p50 = percentile_of(lat, 500);
+                    r.p99 = percentile_of(lat, 990);
+                    r.ok = ok.load();
+                    r.failed = failed.load();
+                    r.submit_ms = submit_ms;
+                    r.collect_ms = collect_ms;
+                    return r;
+                };
+                const AsyncBench sync_r = run_bench(Form::Sync);
+                const AsyncBench cb_r = run_bench(Form::Callback);
+                const AsyncBench fut_r = run_bench(Form::Future);
+                auto fail_tag = [](const AsyncBench& r) {
+                    return r.failed == 0
+                               ? std::string()
+                               : "（失败 " + std::to_string(r.failed) + "）";
+                };
+                std::cout << "rpc 同步形态    : QPS=" << fmt_num(sync_r.qps, 0)
+                          << "  P50=" << fmt_num(sync_r.p50, 2)
+                          << "ms  P99=" << fmt_num(sync_r.p99, 2)
+                          << "ms（8 个业务线程阻塞等回包）" << fail_tag(sync_r)
+                          << "\n";
+                std::cout << "rpc 异步回调    : QPS=" << fmt_num(cb_r.qps, 0)
+                          << "  P50=" << fmt_num(cb_r.p50, 2)
+                          << "ms  P99=" << fmt_num(cb_r.p99, 2)
+                          << "ms（业务线程 1，等回包在库内执行器）"
+                          << fail_tag(cb_r) << "\n";
+                std::cout << "rpc 异步future : QPS=" << fmt_num(fut_r.qps, 0)
+                          << "  P50=" << fmt_num(fut_r.p50, 2)
+                          << "ms  P99=" << fmt_num(fut_r.p99, 2)
+                          << "ms（业务线程 1，结果需逐 future 收口）"
+                          << fail_tag(fut_r) << "\n";
+                std::cout << "rpc 提交开销    : 回调 "
+                          << fmt_num(cb_r.submit_ms * 1000.0 / k_total, 1)
+                          << "µs/次 vs future "
+                          << fmt_num(fut_r.submit_ms * 1000.0 / k_total, 1)
+                          << "µs/次（promise 堆分配 + 共享状态）；完成"
+                             "等待窗 回调 " << fmt_num(cb_r.collect_ms, 1)
+                          << "ms vs future "
+                          << fmt_num(fut_r.collect_ms, 1)
+                          << "ms（后者含逐 future 轮询收口）\n";
+                if (sync_r.ok + sync_r.failed == k_total &&
+                    cb_r.ok + cb_r.failed == k_total &&
+                    fut_r.ok + fut_r.failed == k_total && sync_r.qps > 0) {
+                    const double cb_ratio = cb_r.qps / sync_r.qps;
+                    const double fut_ratio = fut_r.qps / sync_r.qps;
+                    std::cout << "rpc 异步结论    : 吞吐比 回调 "
+                              << fmt_num(cb_ratio, 2) << "x / future "
+                              << fmt_num(fut_ratio, 2)
+                              << "x——同档吞吐下业务线程占用 8:1";
+                    if (cb_r.p50 > sync_r.p50 * 3.0) {
+                        std::cout << "；异步 P50（"
+                                  << fmt_num(cb_r.p50 / 1000.0, 2)
+                                  << "s）含执行器排队与槽位等待——提交线程"
+                                     "零阻塞的代价是等待不可见，同步 P50 才是"
+                                     "单请求真实耗时";
+                    }
+                    std::cout << "；需要结果对象/集中收口选 future，轻量"
+                                 "通知选回调，直白易调试选同步\n";
                 }
             }
         } else {

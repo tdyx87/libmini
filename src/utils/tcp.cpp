@@ -425,6 +425,27 @@ void TcpClient::session_loop(std::uint64_t /*conn_id*/, std::intptr_t fd_handle)
 
 bool TcpClient::connect(const std::string& host, std::uint16_t port)
 {
+    return connect_impl(host, port);
+}
+
+std::future<bool> TcpClient::async_connect(const std::string& host,
+                                           std::uint16_t port)
+{
+    // shared_ptr 持 promise：连接尝试在内部线程进行，调用方可能
+    // 不保存 future（promise 必须与尝试同生命周期）；future 侧
+    // 析构不影响结果置值，不会 broken_promise
+    std::shared_ptr<std::promise<bool>> p(new std::promise<bool>());
+    std::future<bool> f = p->get_future();
+    std::thread([this, p, host, port]() {
+        p->set_value(connect_impl(host, port));
+    }).detach();
+    return f;
+}
+
+// connect() 的共用实现：同步路径直接调用；async_connect 在独立
+// 线程上调用（解析 + 握手最多阻塞 connect_timeout_ms）
+bool TcpClient::connect_impl(const std::string& host, std::uint16_t port)
+{
     close();  // 重复 connect：停旧线程（若在跑，close 内部 join）
 
     const std::uint32_t net_addr = resolve_ipv4(host);

@@ -498,6 +498,90 @@ struct AttemptResult
     std::string body;            // 响应 JSON 文本
 };
 
+// ------------------ 异步调用执行器 ------------------
+//
+// 固定线程池 + 在途计数。客户端析构时先等在途任务清零再释放 Impl——
+// call_async 返回后、析构完成前的所有回调/future 置值都在这段时间内
+// 完成，回调捕获 this/引用不会遭遇悬空。
+// 定义在 RpcClient::Impl 之前：Impl 以 unique_ptr 成员持有它，
+// 隐式析构函数实例化要求完整类型。
+struct RpcAsyncExecutor
+{
+    std::mutex m;
+    std::condition_variable cv;
+    std::deque<std::function<void()>> tasks;
+    std::vector<std::thread> workers;
+    std::size_t in_flight = 0;   // 已提交未完成的任务数（含排队）
+    bool stopping = false;
+
+    explicit RpcAsyncExecutor(std::size_t threads)
+    {
+        // 与 RpcServer 默认 worker 数一致：负载下异步请求与同步调用
+        // 混用时，等待容量不至于明显小于服务器处理容量
+        if (threads == 0) {
+            threads = 8;
+        }
+        workers.reserve(threads);
+        for (std::size_t i = 0; i < threads; ++i) {
+            workers.emplace_back([this] { worker_loop(); });
+        }
+    }
+
+    ~RpcAsyncExecutor()
+    {
+        {
+            std::lock_guard<std::mutex> lock(m);
+            stopping = true;
+        }
+        cv.notify_all();
+        for (std::thread& w : workers) {
+            w.join();  // worker 会先取尽剩余任务再退出
+        }
+    }
+
+    void worker_loop()
+    {
+        for (;;) {
+            std::function<void()> task;
+            {
+                std::unique_lock<std::mutex> lock(m);
+                cv.wait(lock, [this] { return stopping || !tasks.empty(); });
+                if (tasks.empty()) {
+                    return;  // stopping 且已取尽
+                }
+                task = std::move(tasks.front());
+                tasks.pop_front();
+            }
+            task();
+            {
+                std::lock_guard<std::mutex> lock(m);
+                --in_flight;
+            }
+            cv.notify_all();  // 唤醒析构方的 wait_idle
+        }
+    }
+
+    // 提交任务。析构路径保证 stop 之后不再有提交（wait_idle 先于成员析构），
+    // 因此提交无需拒绝分支
+    void post(std::function<void()> task)
+    {
+        {
+            std::lock_guard<std::mutex> lock(m);
+            ++in_flight;
+            tasks.push_back(std::move(task));
+        }
+        cv.notify_one();
+    }
+
+    // 析构方等待：所有已提交任务执行完毕（含排队未开始的）。
+    // 调用后到析构完成前不再允许新的 post（由调用方保证）
+    void wait_idle()
+    {
+        std::unique_lock<std::mutex> lock(m);
+        cv.wait(lock, [this] { return in_flight == 0; });
+    }
+};
+
 struct RpcClient::Impl
 {
     RpcTransport transport = RpcTransport::Http;
@@ -532,6 +616,12 @@ struct RpcClient::Impl
 
     // HTTP 客户端懒构造（本地传输用不到，避免无谓开销）
     std::unique_ptr<httplib::Client> http;
+
+    // 异步调用执行器（首个 call_async 惰性创建；客户端析构时等待在途
+    // 任务清零后才释放 Impl，保证回调与 future 状态不悬空）。
+    // 惰性创建需互斥：并发首个异步调用不能各自 new 一份执行器
+    std::unique_ptr<RpcAsyncExecutor> async_exec;
+    std::mutex async_exec_mutex;
 
     // ------------------ 连接池（LocalPipe/Tcp 传输）------------------
 
@@ -938,12 +1028,41 @@ struct RpcClient::Impl
         if (!http) {
             http.reset(new httplib::Client(host, port));
         }
-        const time_t sec = timeout_ms / 1000;
-        const time_t usec = (timeout_ms % 1000) * 1000;
+        // 记录已应用的值：全局 set_timeout_ms 只在值变化时写（避免无谓
+        // 配置重设），按调用超时也在同一把锁下切换，两个入口互不覆盖
+        std::lock_guard<std::mutex> lock(http_timeout_mutex);
+        apply_http_timeout_locked(timeout_ms);
+    }
+
+    // 须持 http_timeout_mutex。把 HTTP 客户端的连接级超时配置设为 ms
+    void apply_http_timeout_locked(int ms)
+    {
+        const time_t sec = ms / 1000;
+        const time_t usec = (ms % 1000) * 1000;
         http->set_connection_timeout(sec, usec);
         http->set_read_timeout(sec, usec);
         http->set_write_timeout(sec, usec);
+        http_timeout_applied_ms = ms;
     }
+
+    // 按调用超时（HTTP 路径用）：值与已应用配置相同则无操作；否则在锁下
+    // 临时切换。返回调用应使用的超时值（ms <= 0 = 客户端默认）
+    int effective_timeout_for_call(int ms)
+    {
+        return ms > 0 ? ms : timeout_ms;
+    }
+
+    // HTTP 路径调用前调用：确保 httplib 客户端超时配置与 effective 一致
+    void ensure_http_timeout(int effective)
+    {
+        std::lock_guard<std::mutex> lock(http_timeout_mutex);
+        if (http_timeout_applied_ms != effective) {
+            apply_http_timeout_locked(effective);
+        }
+    }
+
+    mutable std::mutex http_timeout_mutex;
+    int http_timeout_applied_ms = 0;  // httplib 客户端当前生效的超时配置
 
     std::string describe_endpoint() const
     {
@@ -1592,13 +1711,12 @@ struct RpcClient::Impl
     }
 
     // ------------------ 池化请求路径 ------------------
-    // 取连接（复用或新建）→ 交换 → 归还。复用连接失败时丢弃并换新连接
+    // 池化请求路径：取连接（复用或新建）→ 交换 → 归还。复用连接失败时丢弃并换新连接
     // 立即重试一次（免退避），对调用方屏蔽「池中连接已被服务器关闭」的竞态。
     // 流水线开启时请求体注入自增 id 并走 attempt_pipelined（快路径：
     // 复用连接直接挂到会话，响应按 id 匹配）
-    AttemptResult attempt_pooled(const std::string& request_body)
+    AttemptResult attempt_pooled(const std::string& request_body, int tmo)
     {
-        const int tmo = timeout_ms;
         for (int stale_retry = 0; stale_retry < 2; ++stale_retry) {
             std::unique_ptr<PooledConn> conn;
             const ConnPool::Lease lease = pool->acquire(
@@ -1647,21 +1765,22 @@ struct RpcClient::Impl
     }
 
     // 池禁用路径：一调用一连接，用完即断（旧行为）
-    AttemptResult attempt_one_shot(const std::string& request_body)
+    AttemptResult attempt_one_shot(const std::string& request_body, int tmo)
     {
         PooledConn conn;
         std::string err;
-        if (!open_conn(conn, timeout_ms, err)) {
+        if (!open_conn(conn, tmo, err)) {
             AttemptResult r;
             r.error = RpcError::CONNECTION_FAILED;
             r.error_detail = err;
             return r;
         }
-        return exchange_on(conn, request_body, timeout_ms);
+        return exchange_on(conn, request_body, tmo);
     }
 
     // ------------------ HTTP 单次尝试 ------------------
-    AttemptResult attempt_http(const std::string& request_body)
+    AttemptResult attempt_http(const std::string& request_body,
+                               int effective_timeout)
     {
         AttemptResult r;
         if (!http) {
@@ -1670,6 +1789,9 @@ struct RpcClient::Impl
             r.error_detail = "connection failed: http endpoint not configured";
             return r;
         }
+        // HTTP 客户端的超时是连接级配置：本调用需要的效果超时与当前
+        // 生效值不同时临时切换（全局 set_timeout_ms 与本调用共用一把锁）
+        ensure_http_timeout(effective_timeout);
         const httplib::Result result =
             http->Post("/rpc", request_body, "application/json");
         if (!result) {
@@ -1752,6 +1874,13 @@ RpcClient::RpcClient(RpcTransport transport, const std::string& endpoint)
 
 RpcClient::~RpcClient()
 {
+    if (impl_) {
+        // 异步在途请求先收尾：停收新任务并等正在执行的调用结束。
+        // 必须先于 Impl 其他成员析构——call_core 还在访问 pool/pipeline/http
+        if (impl_->async_exec) {
+            impl_->async_exec->wait_idle();
+        }
+    }
     delete impl_;
 }
 
@@ -1764,6 +1893,9 @@ RpcClient::RpcClient(RpcClient&& other) noexcept
 RpcClient& RpcClient::operator=(RpcClient&& other) noexcept
 {
     if (this != &other) {
+        if (impl_ && impl_->async_exec) {
+            impl_->async_exec->wait_idle();  // 等在途异步调用结束再析构成员
+        }
         delete impl_;
         impl_ = other.impl_;
         other.impl_ = nullptr;
@@ -1879,8 +2011,14 @@ std::string RpcClient::endpoint() const
     return impl_ ? impl_->describe_endpoint() : std::string();
 }
 
-std::string RpcClient::call(const std::string& method, const std::string& params)
+std::string RpcClient::call_core(const std::string& method,
+                                 const std::string& params,
+                                 RpcError* async_error,
+                                 std::string* async_message,
+                                 int call_timeout_ms)
 {
+    // 单次调用级超时：>0 时本次调用的连接/收发/池等待全部用它，
+    // 不触碰全局配置；<=0 用客户端默认（set_timeout_ms）
     Impl* impl = impl_;
     if (!impl) {
         return std::string();
@@ -1900,10 +2038,19 @@ std::string RpcClient::call(const std::string& method, const std::string& params
         }
     } call_timer{impl, call_start};
 
-    // 失败时记录原因并返回空字符串
-    auto fail = [impl](RpcError err, const std::string& msg) {
+    // 失败时记录原因并返回空字符串。同步路径写客户端共享的
+    // last_error/last_message；异步路径写本次调用专属的状态副本
+    //（避免并发调用相互覆盖）
+    auto fail = [impl, async_error, async_message](
+                    RpcError err, const std::string& msg) {
         impl->last_error = err;
         impl->last_message = msg;
+        if (async_error != NULL) {
+            *async_error = err;
+        }
+        if (async_message != NULL) {
+            *async_message = msg;
+        }
         return std::string();
     };
 
@@ -1951,15 +2098,21 @@ std::string RpcClient::call(const std::string& method, const std::string& params
         // 开流水线时走专用通道（单连接多在途）；否则走连接池（池禁用时
         // 一调用一连接）。所有路径都归一为 AttemptResult（http_status
         // 语义对齐），重试/退避/错误处理对传输无感知
+        // 传输分发：所有路径统一使用本次生效超时（HTTP 在其内部
+        // 确保连接级超时配置与本值一致）
+        const int effective_timeout =
+            impl->effective_timeout_for_call(call_timeout_ms);
         const AttemptResult r =
             (impl->transport == RpcTransport::Http)
-                ? impl->attempt_http(request_body)
+                ? impl->attempt_http(request_body, effective_timeout)
                 : (impl->pipeline_max_in_flight > 0)
                       ? impl->attempt_pipelined_channel(request_body,
-                                                        impl->timeout_ms)
+                                                        effective_timeout)
                       : (impl->pool_max_conns > 0)
-                            ? impl->attempt_pooled(request_body)
-                            : impl->attempt_one_shot(request_body);
+                            ? impl->attempt_pooled(request_body,
+                                                   effective_timeout)
+                            : impl->attempt_one_shot(request_body,
+                                                     effective_timeout);
 
         if (!r.transport_ok) {
             last_fail_error = r.error;
@@ -2020,6 +2173,12 @@ std::string RpcClient::call(const std::string& method, const std::string& params
 
         impl->last_error = RpcError::OK;
         impl->last_message.clear();
+        if (async_error != NULL) {
+            *async_error = RpcError::OK;
+        }
+        if (async_message != NULL) {
+            async_message->clear();
+        }
 
         if (response.contains("result") && !response["result"].is_null()) {
             return response["result"].dump();
@@ -2029,6 +2188,133 @@ std::string RpcClient::call(const std::string& method, const std::string& params
 
     // 重试次数或等待预算用尽，返回最后一次的错误
     return fail(last_fail_error, last_fail_msg);
+}
+
+std::string RpcClient::call(const std::string& method, const std::string& params)
+{
+    return call_core(method, params, NULL, NULL);
+}
+
+std::string RpcClient::call(const std::string& method,
+                            const std::string& params, int timeout_ms)
+{
+    return call_core(method, params, NULL, NULL, timeout_ms);
+}
+
+// ------------------ 异步调用 ------------------
+
+std::future<std::string> RpcClient::call_async(const std::string& method,
+                                               const std::string& params)
+{
+    // promise 在堆上持有：任务与 future 各一份所有权，客户端析构
+    //（等任务清零）前两者都存活，不会出现 promise 析构导致 broken_promise
+    std::shared_ptr<std::promise<std::string>> p(
+        new std::promise<std::string>());
+    std::future<std::string> f = p->get_future();
+    Impl* impl = impl_;
+    if (!impl) {
+        p->set_value(std::string());
+        return f;
+    }
+    // 执行器惰性创建（与连接池/流水线通道同模式）：并发首个异步调用
+    // 只能创建一份，避免任务分接到两个执行器、其中一个随 Impl 析构丢失
+    if (!impl->async_exec) {
+        std::lock_guard<std::mutex> init_lock(impl->async_exec_mutex);
+        if (!impl->async_exec) {
+            impl->async_exec.reset(new RpcAsyncExecutor(8));
+        }
+    }
+    RpcAsyncExecutor& exec = *impl->async_exec;
+    const std::string m = method;
+    const std::string par = params;
+    exec.post([this, p, m, par]() {
+        RpcError err = RpcError::UNKNOWN;
+        std::string msg;
+        p->set_value(call_core(m, par, &err, &msg));
+    });
+    return f;
+}
+
+std::future<std::string> RpcClient::call_async(const std::string& method,
+                                               const std::string& params,
+                                               int timeout_ms)
+{
+    std::shared_ptr<std::promise<std::string>> p(
+        new std::promise<std::string>());
+    std::future<std::string> f = p->get_future();
+    Impl* impl = impl_;
+    if (!impl) {
+        p->set_value(std::string());
+        return f;
+    }
+    if (!impl->async_exec) {
+        std::lock_guard<std::mutex> init_lock(impl->async_exec_mutex);
+        if (!impl->async_exec) {
+            impl->async_exec.reset(new RpcAsyncExecutor(8));
+        }
+    }
+    RpcAsyncExecutor& exec = *impl->async_exec;
+    const std::string m = method;
+    const std::string par = params;
+    exec.post([this, p, m, par, timeout_ms]() {
+        RpcError err = RpcError::UNKNOWN;
+        std::string msg;
+        p->set_value(call_core(m, par, &err, &msg, timeout_ms));
+    });
+    return f;
+}
+
+void RpcClient::call_async(const std::string& method, const std::string& params,
+                           RpcAsyncCallback callback)
+{
+    Impl* impl = impl_;
+    if (!impl) {
+        return;
+    }
+    if (!impl->async_exec) {
+        std::lock_guard<std::mutex> init_lock(impl->async_exec_mutex);
+        if (!impl->async_exec) {
+            impl->async_exec.reset(new RpcAsyncExecutor(8));
+        }
+    }
+    RpcAsyncExecutor& exec = *impl->async_exec;
+    const std::string m = method;
+    const std::string par = params;
+    exec.post([this, m, par, callback]() {
+        RpcError err = RpcError::UNKNOWN;
+        std::string msg;
+        const std::string result = call_core(m, par, &err, &msg);
+        if (callback) {
+            callback(result, err, msg);
+        }
+    });
+}
+
+void RpcClient::call_async(const std::string& method, const std::string& params,
+                           int timeout_ms, RpcAsyncCallback callback)
+{
+    Impl* impl = impl_;
+    if (!impl) {
+        return;
+    }
+    if (!impl->async_exec) {
+        std::lock_guard<std::mutex> init_lock(impl->async_exec_mutex);
+        if (!impl->async_exec) {
+            impl->async_exec.reset(new RpcAsyncExecutor(8));
+        }
+    }
+    RpcAsyncExecutor& exec = *impl->async_exec;
+    const std::string m = method;
+    const std::string par = params;
+    exec.post([this, m, par, timeout_ms, callback]() {
+        RpcError err = RpcError::UNKNOWN;
+        std::string msg;
+        const std::string result =
+            call_core(m, par, &err, &msg, timeout_ms);
+        if (callback) {
+            callback(result, err, msg);
+        }
+    });
 }
 
 // ==================== RpcServer ====================
@@ -2562,7 +2848,7 @@ struct RpcServer::Impl
         stopping = true;
         int drain = 3000;
         {
-            std::lock_guard<std::mutex> lock(stats_mutex);
+            std::lock_guard<std::mutex> drain_lock(stats_mutex);
             drain = drain_timeout_ms;
         }
         if (drain > 0 && gate.wait_until_idle(drain)) {

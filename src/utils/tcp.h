@@ -4,6 +4,7 @@
 #include <atomic>
 #include <cstdint>
 #include <functional>
+#include <future>
 #include <string>
 
 #include "libmini.h"
@@ -62,6 +63,14 @@ public:
     // 同步连接（受 connect_timeout_ms 约束）。重复 connect 会先关闭旧连接
     bool connect(const std::string& host, std::uint16_t port);
 
+    // 异步连接：在内部线程上执行与 connect() 相同的流程（解析/DNS/
+    // 握手受 connect_timeout_ms 约束），不阻塞调用线程。返回的 future
+    // 就绪即连接完成（true）或失败（false）；连接成功后 on_connect
+    // 回调照常触发。与 connect() 一样会先关闭旧连接。
+    // 线程安全：析构前未完成的连接尝试会正常结束（析构等待内部线程），
+    // future 不会悬空
+    std::future<bool> async_connect(const std::string& host, std::uint16_t port);
+
     // 主动关闭（幂等）。断连回调会触发
     void close();
 
@@ -82,6 +91,7 @@ public:
 
 private:
     void session_loop(std::uint64_t conn_id, std::intptr_t fd_handle);
+    bool connect_impl(const std::string& host, std::uint16_t port);
 
     struct Impl;
     Impl* impl_;

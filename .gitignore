@@ -90,5 +90,13 @@ Thumbs.db
 /smoke_dll_build/
 /install_smoke/
 /install_smoke_dll/
+# MSVC 本地构建与依赖（CI 同款工具链彩排）
+/deps_msvc/
+/deps_msvc_dbg/
+/build_msvc/
+/build_msvc_dbg/
+/build_msvc_dll/
+/install_msvc_dll/
+/smoke_msvc_build/
 /jobs*.json
 /log*.txt

@@ -5,6 +5,8 @@
 #include <cstdint>
 #include <string>
 #include <functional>
+#include <future>
+#include <memory>
 #include <vector>
 
 #include "libmini.h"
@@ -172,6 +174,52 @@ public:
     // 失败时返回空字符串，可通过 last_error() / last_error_message() 获取原因
     std::string call(const std::string& method, const std::string& params);
 
+    // 单次调用级超时版本：本调用的连接建立、请求收发与池排队等待均
+    // 受 timeout_ms 约束，不改全局 set_timeout_ms 配置（并发安全）。
+    // timeout_ms <= 0 时与双参 call() 等价（使用客户端默认超时）。
+    // 说明：
+    //   - Tcp/本地/流水线路径完全按本次超时执行；
+    //   - 重试的每一次尝试都使用本次超时（重试次数/退避仍走全局配置）；
+    //   - HTTP 传输的超时是客户端连接级配置，本调用前会临时切换；
+    //     并发调用若使用互不相同的单次超时存在极小配置竞窗，
+    //     需要严格隔离时请使用独立 RpcClient 实例。
+    std::string call(const std::string& method, const std::string& params,
+                     int timeout_ms);
+
+    // ------------------ 异步调用 ------------------
+    //
+    // call_async 在内部线程池上执行与 call() 完全相同的请求路径
+    //（重试/退避/连接池/流水线/超时全部生效），不阻塞调用线程。
+    // 线程安全：可在多线程并发调用，与 call() 混用也安全。
+
+    // 异步调用：返回 future，get() 时得到与 call() 相同语义的结果
+    //（失败为空字符串；错误原因在回调/future 就绪后经 last_error()
+    //  读取——多线程混用时建议改用回调形态携带独立错误信息）
+    std::future<std::string> call_async(const std::string& method,
+                                        const std::string& params);
+
+    // 单次调用级超时版本（语义同三参 call；timeout_ms <= 0 用默认）
+    std::future<std::string> call_async(const std::string& method,
+                                        const std::string& params,
+                                        int timeout_ms);
+
+    // 回调形态：完成时在内部线程上执行 callback，参数为
+    //   result  ：与 call() 返回值相同（失败为空字符串）
+    //   error   ：本次调用的错误码（回调专属副本，不受其他调用影响）
+    //   message ：错误文本描述（成功为空）
+    // 回调里不要再调用本客户端的阻塞方法（可调用 call_async）。
+    // 客户端析构语义：析构等待所有在途异步调用结束后才完成——回调中
+    // 捕获了 this 或引用时不会遭遇悬空（析构会 join 工作线程）。
+    using RpcAsyncCallback = std::function<void(const std::string& result,
+                                                RpcError error,
+                                                const std::string& message)>;
+    void call_async(const std::string& method, const std::string& params,
+                    RpcAsyncCallback callback);
+
+    // 单次调用级超时版本（语义同三参 call；timeout_ms <= 0 用默认）
+    void call_async(const std::string& method, const std::string& params,
+                    int timeout_ms, RpcAsyncCallback callback);
+
     // 设置单次请求超时（毫秒），默认 5000
     void set_timeout_ms(int timeout_ms);
 
@@ -254,9 +302,15 @@ public:
 private:
     struct Impl;
     Impl* impl_;
-};
 
-// 简单 RPC 服务器
+    // 同步/异步共用的执行核心：构建请求 → 重试循环 → 结果与错误记录。
+    // async 状态指针非空时（异步路径）错误写入专属副本，
+    // 为空时（同步路径）写入 last_error()/last_message()
+    // call_timeout_ms <= 0 = 用客户端默认超时（set_timeout_ms）
+    std::string call_core(const std::string& method, const std::string& params,
+                          RpcError* async_error, std::string* async_message,
+                          int call_timeout_ms = 0);
+};
 //
 // 端点与传输（三选一，构造时确定）：
 //   RpcServer(8080)                        → HTTP over TCP（0 = 自动分配端口）
