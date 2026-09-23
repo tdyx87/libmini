@@ -505,6 +505,13 @@ struct AttemptResult
 // 完成，回调捕获 this/引用不会遭遇悬空。
 // 定义在 RpcClient::Impl 之前：Impl 以 unique_ptr 成员持有它，
 // 隐式析构函数实例化要求完整类型。
+
+// 当前线程正在服务哪个执行器（工作线程启动时设置）。
+// 用途：set_async_workers 从回调内被调用时，识别出调用者运行在
+// 待排水的旧池上——直接 wait_idle 会等「自己」这个任务，自锁死
+struct RpcAsyncExecutor;
+thread_local RpcAsyncExecutor* t_current_async_executor = nullptr;
+
 struct RpcAsyncExecutor
 {
     std::mutex m;
@@ -529,6 +536,10 @@ struct RpcAsyncExecutor
 
     ~RpcAsyncExecutor()
     {
+        // 自排水：等所有已提交任务（含排队未开始的）执行完毕再停机。
+        // 客户端析构与 set_async_workers 换池路径都会先显式 wait_idle，
+        // 这里兜底保证执行器析构本身不丢已提交的回调/future
+        wait_idle();
         {
             std::lock_guard<std::mutex> lock(m);
             stopping = true;
@@ -539,8 +550,12 @@ struct RpcAsyncExecutor
         }
     }
 
+    // 工作线程数（构造时归一化，恒非 0）
+    std::size_t size() const { return workers.size(); }
+
     void worker_loop()
     {
+        t_current_async_executor = this;
         for (;;) {
             std::function<void()> task;
             {
@@ -619,9 +634,26 @@ struct RpcClient::Impl
 
     // 异步调用执行器（首个 call_async 惰性创建；客户端析构时等待在途
     // 任务清零后才释放 Impl，保证回调与 future 状态不悬空）。
-    // 惰性创建需互斥：并发首个异步调用不能各自 new 一份执行器
-    std::unique_ptr<RpcAsyncExecutor> async_exec;
+    // 惰性创建需互斥：并发首个异步调用不能各自 new 一份执行器。
+    // shared_ptr：set_async_workers 换池期间，并发提交者持有旧池引用
+    // 安全提交到旧池（旧池析构会取尽剩余任务再退出），不丢任务不悬空
+    std::shared_ptr<RpcAsyncExecutor> async_exec;
     std::mutex async_exec_mutex;
+    std::size_t async_workers = 8;  // 异步执行器线程数（set_async_workers 归一化 0→8）
+
+    // 取得（按需创建）异步执行器。与连接池/流水线通道同模式：并发首个
+    // 异步调用只能创建一份，避免任务分接到两个执行器、其中一个随
+    // Impl 析构丢失。线程数取 async_workers 配置
+    RpcAsyncExecutor& ensure_async_exec()
+    {
+        if (!async_exec) {
+            std::lock_guard<std::mutex> init_lock(async_exec_mutex);
+            if (!async_exec) {
+                async_exec = std::make_shared<RpcAsyncExecutor>(async_workers);
+            }
+        }
+        return *async_exec;
+    }
 
     // ------------------ 连接池（LocalPipe/Tcp 传输）------------------
 
@@ -1903,6 +1935,58 @@ RpcClient& RpcClient::operator=(RpcClient&& other) noexcept
     return *this;
 }
 
+// 异步执行器线程数。执行器已创建时需要换池：摘下旧池 → 排水（等在途
+// 任务清零，含已排队未开始的）→ 释放引用触发析构（join 全部工作线程）。
+// 排水不持锁：等待可能持续数百毫秒，持锁会让回调内的 call_async 死锁。
+// 排水窗口内并发提交者持有旧池 shared_ptr，任务照常执行；此后
+// ensure_async_exec 按新配置创建新池，提交无缝切到新池。
+// 注意：排水只能保证「已提交」的调用完成——与并发 call_async 竞态调用
+// 本接口时，后到的提交可能落到旧池或新池，由调用方约定时序
+void RpcClient::set_async_workers(std::size_t workers)
+{
+    Impl* impl = impl_;
+    if (!impl) {
+        return;
+    }
+    if (workers == 0) {
+        workers = 8;  // 与 RpcServer 默认 worker 数对齐的默认值
+    }
+    impl->async_workers = workers;
+
+    impl->async_workers = workers;
+
+    std::shared_ptr<RpcAsyncExecutor> old;
+    {
+        std::lock_guard<std::mutex> init_lock(impl->async_exec_mutex);
+        old = impl->async_exec;
+        impl->async_exec.reset();  // 下次 ensure_async_exec 按新值创建
+    }
+    if (!old) {
+        return;
+    }
+    if (t_current_async_executor == old.get()) {
+        // 调用者就在待排水的旧池 worker 上（在回调里调用本接口）：
+        // 直接 wait_idle 会等「自己」这个任务返回，自锁死。转交独立的
+        // 退休线程异步排水，本调用立即返回；退休线程等在途（含本回调）
+        // 清零后再 join，不丢任务
+        std::thread([old] {}).detach();
+        return;
+    }
+    old->wait_idle();  // 不持锁等待：见函数头注释
+    // old 在此析构：旧池工作线程 join，已提交的回调/future 全部完成
+}
+
+std::size_t RpcClient::async_workers() const
+{
+    Impl* impl = impl_;
+    if (!impl) {
+        return 0;
+    }
+    std::lock_guard<std::mutex> init_lock(impl->async_exec_mutex);
+    // 已创建：实际线程数（构造时归一化，恒非 0）；未创建：配置值（可能为 0）
+    return impl->async_exec ? impl->async_exec->size() : impl->async_workers;
+}
+
 void RpcClient::set_timeout_ms(int timeout_ms)
 {
     impl_->timeout_ms = timeout_ms;
@@ -2216,15 +2300,7 @@ std::future<std::string> RpcClient::call_async(const std::string& method,
         p->set_value(std::string());
         return f;
     }
-    // 执行器惰性创建（与连接池/流水线通道同模式）：并发首个异步调用
-    // 只能创建一份，避免任务分接到两个执行器、其中一个随 Impl 析构丢失
-    if (!impl->async_exec) {
-        std::lock_guard<std::mutex> init_lock(impl->async_exec_mutex);
-        if (!impl->async_exec) {
-            impl->async_exec.reset(new RpcAsyncExecutor(8));
-        }
-    }
-    RpcAsyncExecutor& exec = *impl->async_exec;
+    RpcAsyncExecutor& exec = impl->ensure_async_exec();
     const std::string m = method;
     const std::string par = params;
     exec.post([this, p, m, par]() {
@@ -2247,13 +2323,7 @@ std::future<std::string> RpcClient::call_async(const std::string& method,
         p->set_value(std::string());
         return f;
     }
-    if (!impl->async_exec) {
-        std::lock_guard<std::mutex> init_lock(impl->async_exec_mutex);
-        if (!impl->async_exec) {
-            impl->async_exec.reset(new RpcAsyncExecutor(8));
-        }
-    }
-    RpcAsyncExecutor& exec = *impl->async_exec;
+    RpcAsyncExecutor& exec = impl->ensure_async_exec();
     const std::string m = method;
     const std::string par = params;
     exec.post([this, p, m, par, timeout_ms]() {
@@ -2271,13 +2341,7 @@ void RpcClient::call_async(const std::string& method, const std::string& params,
     if (!impl) {
         return;
     }
-    if (!impl->async_exec) {
-        std::lock_guard<std::mutex> init_lock(impl->async_exec_mutex);
-        if (!impl->async_exec) {
-            impl->async_exec.reset(new RpcAsyncExecutor(8));
-        }
-    }
-    RpcAsyncExecutor& exec = *impl->async_exec;
+    RpcAsyncExecutor& exec = impl->ensure_async_exec();
     const std::string m = method;
     const std::string par = params;
     exec.post([this, m, par, callback]() {
@@ -2297,13 +2361,7 @@ void RpcClient::call_async(const std::string& method, const std::string& params,
     if (!impl) {
         return;
     }
-    if (!impl->async_exec) {
-        std::lock_guard<std::mutex> init_lock(impl->async_exec_mutex);
-        if (!impl->async_exec) {
-            impl->async_exec.reset(new RpcAsyncExecutor(8));
-        }
-    }
-    RpcAsyncExecutor& exec = *impl->async_exec;
+    RpcAsyncExecutor& exec = impl->ensure_async_exec();
     const std::string m = method;
     const std::string par = params;
     exec.post([this, m, par, timeout_ms, callback]() {

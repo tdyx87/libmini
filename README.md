@@ -241,8 +241,9 @@ std::string lit = to_json_string_simple("say \"hi\"");       // "say \"hi\""，�
 std::string manual = std::string("{\"msg\":\"") + escape_json_string(user_input) + "\"}";
 ```### RPC
 
-> 传输选型与并发模型（三传输 QPS 数据、连接池 vs 流水线、决策树）
-> 见 [docs/rpc_transport_guide.md](docs/rpc_transport_guide.md)。
+> RPC 选型文档两份：
+> - [docs/rpc_transport_guide.md](docs/rpc_transport_guide.md)——传输选型与连接复用（三传输 QPS、连接池 vs 流水线、决策树）
+> - [docs/rpc_concurrency_guide.md](docs/rpc_concurrency_guide.md)——并发模型选型（同步 / 异步回调 / 异步 future / 流水线，example 实测数据）
 
 ```cpp
 // 服务端：四种传输任选（构造时确定，其余 API 完全一致）
@@ -328,8 +329,8 @@ const RpcClientPoolStats ps = tcp_client.pool_stats();
 // 池模式 514 QPS（并发=8 条连接）→ 流水线 2003 QPS（单连接在途 64）
 tcp_client.set_pipeline_max_in_flight(64);  // 0 = 关闭（默认），走连接池
 
-// 异步调用：在客户端内部线程池（8 线程）上执行，与 call() 完全相同的
-// 请求路径（重试/退避/连接池/流水线/超时全部生效），不阻塞调用线程。
+// 异步调用：在客户端内部线程池（默认 8 线程，即并发上限）上执行，与 call()
+// 完全相同的请求路径（重试/退避/连接池/流水线/超时全部生效），不阻塞调用线程。
 // future 形态：
 std::future<std::string> f = client.call_async("add", R"({"a":1,"b":2})");
 // ... 做其他事 ...
@@ -343,6 +344,11 @@ client.call_async("add", params, [](const std::string& result,
 });
 // 线程安全：多线程并发 call_async、与 call() 混用均安全；
 // 客户端析构会等所有在途异步调用结束，回调中捕获 this/引用不会悬空
+//
+// 异步执行器线程数可配置（默认 8，0 = 恢复默认；并发上限 = 执行器线程数）。
+// 建议在首个 call_async 前设置；执行器已存在时设置会排空在途调用后换新池：
+client.set_async_workers(16);   // 排水语义见 rpc.h；回调内调用不会自锁死
+const std::size_t aw = client.async_workers();  // 读取当前线程数
 //
 // 形态选型（example 实测，Tcp handler 5ms、1600 请求）：两种形态
 // 吞吐与同步多线程同档（~1.0x），提交开销都在 1µs 以内——需要结果

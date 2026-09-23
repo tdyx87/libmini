@@ -2,6 +2,9 @@
 
 > 数据来源：`example --only rpc` 实测（Windows x86、本机回环），复现命令见文末。
 > 换机器/构建配置时绝对值会变，**结论的相对关系是稳定的设计事实**。
+>
+> 本文档谈传输与连接复用；客户端并发模型（同步 / 异步 / 流水线）另见
+> [rpc_concurrency_guide.md](rpc_concurrency_guide.md)。
 
 ## TL;DR
 

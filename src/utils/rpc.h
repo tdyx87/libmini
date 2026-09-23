@@ -220,6 +220,19 @@ public:
     void call_async(const std::string& method, const std::string& params,
                     int timeout_ms, RpcAsyncCallback callback);
 
+    // 异步执行器线程数，默认 8，0 = 恢复默认。控制 call_async 的并发
+    // 上限（并发 = 同时处于请求路径的执行器线程数）。
+    //   - 首个 call_async 前设置：执行器按新值创建；
+    //   - 执行器已存在时设置：排空在途调用后替换为新线程池，返回时
+    //     已提交的回调/future 全部完成；等待期间不阻塞同步 call()，
+    //     回调里提交的 call_async 会落到新池。
+    // 请在发起异步调用前配置：与并发 call_async 竞态调用的行为未定义
+    void set_async_workers(std::size_t workers);
+
+    // 当前异步执行器线程数：尚未创建执行器（还没有异步调用）时返回
+    // 配置值，已创建时返回实际线程数
+    std::size_t async_workers() const;
+
     // 设置单次请求超时（毫秒），默认 5000
     void set_timeout_ms(int timeout_ms);
 

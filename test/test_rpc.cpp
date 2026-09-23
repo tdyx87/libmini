@@ -242,6 +242,137 @@ TEST(RpcAsyncTest, AsyncAndSyncInterleave)
     EXPECT_EQ(json::parse(f1.get()).at("sum").get<int>(), 3);
 }
 
+// ==================== 异步执行器线程数配置 ====================
+
+TEST(RpcAsyncWorkersTest, DefaultIsEightAndConfigurableBeforeFirstAsyncCall)
+{
+    TestServer ts;
+    libmini::RpcClient client("127.0.0.1", ts.port());
+    client.set_max_retries(0);
+
+    EXPECT_EQ(client.async_workers(), 8u);  // 默认值
+
+    client.set_async_workers(2);
+    EXPECT_EQ(client.async_workers(), 2u);  // 未创建执行器时读配置值
+
+    // 首个异步调用按配置值创建执行器
+    auto f = client.call_async("add", R"({"a":1,"b":1})");
+    ASSERT_EQ(json::parse(f.get()).at("sum").get<int>(), 2);
+    EXPECT_EQ(client.async_workers(), 2u);
+}
+
+TEST(RpcAsyncWorkersTest, ResizeReplacesPoolAndDrainsInFlight)
+{
+    TestServer ts;
+    libmini::RpcClient client("127.0.0.1", ts.port());
+    client.set_max_retries(0);
+    client.set_async_workers(4);
+
+    // 提交进行中换池：已提交调用必须全部完成（不丢回调、结果正确）
+    constexpr int kCalls = 24;
+    std::atomic<int> completed{0};
+    std::mutex m;
+    std::condition_variable cv;
+    for (int i = 0; i < kCalls; ++i) {
+        client.call_async(
+            "sleep_ms", json{{"ms", 20}}.dump(),
+            [&](const std::string&, libmini::RpcError e, const std::string&) {
+                EXPECT_EQ(e, libmini::RpcError::OK);
+                completed.fetch_add(1);
+                cv.notify_all();
+            });
+        if (i == 12) {
+            client.set_async_workers(2);  // 排空已提交的 13 个，后续落新池
+        }
+    }
+    std::unique_lock<std::mutex> lk(m);
+    ASSERT_TRUE(cv.wait_for(lk, std::chrono::seconds(20),
+                            [&] { return completed.load() == kCalls; }));
+    EXPECT_EQ(client.async_workers(), 2u);
+
+    // 换池后新提交走新池，照常可用
+    auto f = client.call_async("add", R"({"a":5,"b":6})");
+    ASSERT_EQ(json::parse(f.get()).at("sum").get<int>(), 11);
+}
+
+TEST(RpcAsyncWorkersTest, DestroyAfterResizeStillWaitsForCallbacks)
+{
+    TestServer ts;
+    std::atomic<int> called{0};
+
+    {
+        libmini::RpcClient client("127.0.0.1", ts.port());
+        client.set_max_retries(0);
+        client.set_async_workers(1);
+
+        std::thread submitter([&client, &called] {
+            for (int i = 0; i < 4; ++i) {
+                client.call_async(
+                    "sleep_ms", json{{"ms", 10}}.dump(),
+                    [&](const std::string&, libmini::RpcError,
+                        const std::string&) {
+                        std::this_thread::sleep_for(
+                            std::chrono::milliseconds(5));
+                        called.fetch_add(1);
+                    });
+            }
+        });
+
+        // 提交进行中换池（排水等已提交回调完成）+ 随即析构：
+        // 析构必须等所有在途回调结束后才返回
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        client.set_async_workers(3);
+        submitter.join();
+    }
+
+    EXPECT_EQ(called.load(), 4);  // 析构完成后回调全部执行完毕
+}
+
+TEST(RpcAsyncWorkersTest, ResizeFromInsideCallbackDoesNotDeadlock)
+{
+    TestServer ts;
+    libmini::RpcClient client("127.0.0.1", ts.port());
+    client.set_max_retries(0);
+
+    std::mutex m;
+    std::condition_variable cv;
+    bool done = false;
+
+    client.set_async_workers(1);
+    client.call_async(
+        "add", R"({"a":1,"b":2})",
+        [&](const std::string&, libmini::RpcError, const std::string&) {
+            // 回调内调整线程数：旧池正在服务本回调，不能自排水死锁。
+            // 修复前：wait_idle 等本回调返回 → 永久挂死
+            client.set_async_workers(4);
+            std::lock_guard<std::mutex> lk(m);
+            done = true;
+            cv.notify_all();
+        });
+
+    std::unique_lock<std::mutex> lk(m);
+    ASSERT_TRUE(cv.wait_for(lk, std::chrono::seconds(10),
+                            [&] { return done; }));
+
+    // 换池后客户端可继续异步调用
+    auto f = client.call_async("add", R"({"a":9,"b":9})");
+    ASSERT_EQ(json::parse(f.get()).at("sum").get<int>(), 18);
+}
+
+TEST(RpcAsyncWorkersTest, ZeroRestoresDefault)
+{
+    TestServer ts;
+    libmini::RpcClient client("127.0.0.1", ts.port());
+    client.set_max_retries(0);
+
+    client.set_async_workers(2);
+    client.set_async_workers(0);  // 0 = 恢复默认
+    EXPECT_EQ(client.async_workers(), 8u);
+
+    client.call_async("add", R"({"a":1,"b":2})").wait();
+    EXPECT_EQ(client.async_workers(), 8u);  // 实际创建 8 线程
+}
+
 // ==================== 请求日志测试 ====================
 
 namespace {
