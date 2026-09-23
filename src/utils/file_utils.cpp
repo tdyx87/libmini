@@ -6,6 +6,8 @@
 #include <ctime>
 #include <fstream>
 
+#include "digest.h"
+#include "encoding.h"
 #include "path_utils.h"
 #include "win_utf.h"
 
@@ -14,6 +16,7 @@
 #include <Windows.h>
 #else
 #include <dirent.h>
+#include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -582,6 +585,122 @@ std::string unique_temp_path(const std::string& prefix, const std::string& dir)
     std::snprintf(buf, sizeof(buf), "%llx", static_cast<unsigned long long>(id));
     std::string base = dir.empty() ? temp_directory_path() : dir;
     return join_with(base, prefix + buf + ".tmp");
+}
+
+bool write_file_atomic(const std::string& path, const std::string& content)
+{
+    // 临时文件放目标同目录：保证与目标同卷，替换才是原子的
+    const std::size_t sep = path.find_last_of("/\\");
+    const std::string dir = (sep == std::string::npos) ? std::string(".")
+                                                       : path.substr(0, sep);
+    const std::string tmp = unique_temp_path(std::string(".libmini_atomic_"), dir);
+#ifdef _WIN32
+    const std::wstring wtmp = internal::utf8_to_wide(tmp);
+    HANDLE hFile = CreateFileW(wtmp.c_str(), GENERIC_WRITE, 0, NULL,
+                               CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hFile == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+    DWORD written = 0;
+    BOOL ok = content.empty()
+                  ? TRUE
+                  : WriteFile(hFile, content.data(),
+                              static_cast<DWORD>(content.size()), &written, NULL);
+    if (ok && !FlushFileBuffers(hFile)) {
+        ok = FALSE;  // 数据落盘失败：绝不进入替换步骤
+    }
+    CloseHandle(hFile);
+    if (!ok || (!content.empty() && written != content.size())) {
+        DeleteFileW(wtmp.c_str());
+        return false;
+    }
+    // 原子替换已有目标；WRITE_THROUGH 让替换本身也尽量落盘
+    if (!MoveFileExW(wtmp.c_str(), internal::utf8_to_wide(path).c_str(),
+                     MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        DeleteFileW(wtmp.c_str());
+        return false;
+    }
+    return true;
+#else
+    const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) {
+        return false;
+    }
+    bool ok = true;
+    const char* p = content.data();
+    std::size_t left = content.size();
+    while (ok && left > 0) {
+        const ssize_t n = ::write(fd, p, left);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            ok = false;
+        } else if (n == 0) {
+            ok = false;
+        } else {
+            p += n;
+            left -= static_cast<std::size_t>(n);
+        }
+    }
+    if (ok && ::fsync(fd) != 0) {
+        ok = false;
+    }
+    ::close(fd);
+    if (!ok) {
+        ::unlink(tmp.c_str());
+        return false;
+    }
+    if (::rename(tmp.c_str(), path.c_str()) != 0) {
+        ::unlink(tmp.c_str());
+        return false;
+    }
+    return true;
+#endif
+}
+
+namespace {
+
+// 流式文件摘要的共用骨架：64KB 分块喂给更新器，内存占用恒定
+std::string digest_file_hex(const std::string& path,
+                            bool want_sha256)
+{
+#ifdef _WIN32
+    FILE* f = ::_wfopen(internal::utf8_to_wide(path).c_str(), L"rb");
+#else
+    FILE* f = std::fopen(path.c_str(), "rb");
+#endif
+    if (!f) {
+        return std::string();
+    }
+    Sha256 sha;
+    Md5 md5;
+    char buf[65536];
+    std::size_t n;
+    while ((n = std::fread(buf, 1, sizeof(buf), f)) > 0) {
+        if (want_sha256) {
+            sha.update(buf, n);
+        } else {
+            md5.update(buf, n);
+        }
+    }
+    const bool err = std::ferror(f) != 0;
+    std::fclose(f);
+    if (err) {
+        return std::string();
+    }
+    return want_sha256 ? Hex::encode(sha.finish(), true)
+                       : Hex::encode(md5.finish(), true);
+}
+
+}  // namespace
+
+std::string sha256_file_hex(const std::string& path)
+{
+    return digest_file_hex(path, true);
+}
+
+std::string md5_file_hex(const std::string& path)
+{
+    return digest_file_hex(path, false);
 }
 
 }  // namespace libmini

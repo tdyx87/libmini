@@ -23,6 +23,12 @@ LIBMINI_API bool write_file(const std::string& path, const std::string& content)
 // 向文件末尾追加内容（文件不存在则创建）
 LIBMINI_API bool append_file(const std::string& path, const std::string& content);
 
+// 原子写文件：先写同目录临时文件并强制落盘（FlushFileBuffers/fsync），
+// 再原子替换目标（MoveFileExW/rename，同目录保证同卷）。进程在任意时刻
+// 崩溃，目标文件要么是完整旧内容、要么是完整新内容，不会截断或半截。
+// 目标所在目录必须已存在；失败时目标保持原样（临时文件会被清理）
+LIBMINI_API bool write_file_atomic(const std::string& path, const std::string& content);
+
 // 获取文件大小；失败返回 0
 LIBMINI_API size_t file_size(const std::string& path);
 
@@ -97,6 +103,15 @@ LIBMINI_API std::string temp_directory_path();
 // prefix 缺省为 "libmini_"；dir 为空则使用系统临时目录
 LIBMINI_API std::string unique_temp_path(const std::string& prefix = std::string("libmini_"),
                              const std::string& dir = std::string());
+
+// ------------------ 流式文件摘要 ------------------
+// 64KB 分块读取，内存占用恒定，适用于大文件；文件打不开返回空串
+
+// 文件 SHA-256（64 字符小写十六进制）
+LIBMINI_API std::string sha256_file_hex(const std::string& path);
+
+// 文件 MD5（32 字符小写十六进制）
+LIBMINI_API std::string md5_file_hex(const std::string& path);
 
 }  // namespace libmini
 

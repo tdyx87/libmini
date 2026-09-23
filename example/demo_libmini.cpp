@@ -13,6 +13,8 @@
 #include <chrono>
 #include <cstdio>
 #include <future>
+
+#include <spdlog/spdlog.h>  // LogFacade::logger() 返回指针，调用方法需完整类型
 #include <iomanip>
 #include <iostream>
 #include <mutex>
@@ -1303,6 +1305,83 @@ LIBMINI_DEMO(sqlite)
               << "\n";
 
     remove_file(db_path);
+}
+
+// 整合演示：系统信息 + 格式化 + 原子写 + 文件摘要 + HTTP 客户端 + 日志门面
+// + 阻塞队列/门闩（一节串起本轮新模块的典型配合用法）
+LIBMINI_DEMO(sysinfo_http_log)
+{
+    // ---- 系统信息 + 人类可读格式化 ----
+    std::cout << "hostname       : " << hostname() << "\n";
+    std::cout << "pid / cpu      : " << current_pid() << " / " << cpu_count()
+              << " 核\n";
+    std::cout << "内存 总量/可用 : "
+              << format_bytes(static_cast<std::int64_t>(total_physical_memory()))
+              << " / "
+              << format_bytes(static_cast<std::int64_t>(available_physical_memory()))
+              << "\n";
+    std::cout << "磁盘 可用      : "
+              << format_bytes(static_cast<std::int64_t>(disk_free_bytes(".")))
+              << "\n";
+
+    // ---- 原子写配置 + 流式摘要（崩溃安全落盘 + 完整性校验的常见组合）----
+    const std::string cfg = "demo_config.json";
+    write_file_atomic(cfg, "{\"mode\":\"fast\",\"retries\":3}");
+    std::cout << "原子写         : " << cfg << " sha256="
+              << sha256_file_hex(cfg).substr(0, 16) << "...\n";
+
+    // ---- 日志门面：控制台 + 滚动文件，级别过滤 ----
+    LogFacade::Options o;
+    o.file_path = "logs_demo/facade.log";   // 自动建目录，10MB×5 滚动
+    o.console = false;
+    o.level = LogLevel::Debug;
+    if (LogFacade::init(o)) {
+        LogFacade::logger()->info("demo 启动 host={} pid={}", hostname(),
+                                  current_pid());
+        LogFacade::logger()->debug("debug 行可见（级别=Debug）");
+        LogFacade::set_level(LogLevel::Warn);
+        LogFacade::logger()->info("调级后这行不输出");
+        LogFacade::logger()->warn("warn 行输出");
+        LogFacade::shutdown();
+        std::cout << "日志门面       : logs_demo/facade.log 写入+调级+关闭 ✓\n";
+    } else {
+        std::cout << "日志门面       : 初始化失败\n";
+    }
+
+    // ---- HTTP 客户端：请求一个公共回显端点（失败不致命，演示 API 用法）----
+    HttpClient hc("127.0.0.1", 9);   // 死端口：演示传输层错误形态
+    hc.set_timeout_ms(300);
+    const HttpResponse dead = hc.get("/");
+    std::cout << "HTTP 错误形态  : status=" << dead.status
+              << " error=\"" << dead.error << "\"\n";
+
+    // ---- BlockingQueue + CountdownLatch：流水线生产消费 ----
+    BlockingQueue<int> queue(16);
+    CountdownLatch done_latch(2);
+    std::atomic<long long> stage_sum{0};
+    std::thread consumer([&] {
+        int v = 0;
+        while (queue.pop(v)) {
+            stage_sum += v;
+            sleep_for_ms(1);   // 模拟消费耗时
+        }
+        done_latch.count_down();
+    });
+    std::thread producer([&] {
+        for (int i = 1; i <= 50; ++i) {
+            queue.push(i);
+        }
+        queue.close();
+        done_latch.count_down();
+    });
+    done_latch.wait();
+    producer.join();
+    consumer.join();
+    std::cout << "队列+门闩      : 生产 1..50 消费求和=" << stage_sum.load()
+              << "（期望 1275）\n";
+
+    remove_file(cfg);
+    remove_tree("logs_demo");
 }
 
 }  // namespace

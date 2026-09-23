@@ -82,9 +82,9 @@ target_link_libraries(app PRIVATE libmini::libmini)
 | lexical_cast | `utils/lexical_cast.h` | 字符串↔数值转换（严格模式，失败抛 bad_lexical_cast） |
 | time_utils | `utils/time_utils.h` | 时间戳、格式化 + 日历运算（月份加减/星期/月末/日期串互转） |
 | stopwatch | `utils/stopwatch.h` | 高精度计时（pause/resume/restart） |
-| file_utils | `utils/file_utils.h` | 读/写/追加文件、目录创建（单级/递归）、文件与目录树复制/移动、递归删除、目录详单（类型/大小/mtime）、时间戳、临时路径（W 版 API，UTF-8 中文路径无码页问题） |
+| file_utils | `utils/file_utils.h` | 读/写/追加文件、原子写（write_file_atomic：temp+fsync+rename，崩溃不截断）、流式文件摘要 sha256_file_hex/md5_file_hex、目录创建（单级/递归）、文件与目录树复制/移动、递归删除、目录详单（类型/大小/mtime）、时间戳、临时路径（W 版 API，UTF-8 中文路径无码页问题） |
 | path_utils | `utils/path_utils.h` | path_join（多段）/dirname/basename/extension/stem、normalize（解析 ./.. 与盘符/UNC）、绝对化、parent_path、分隔符转换、路径等价比较 |
-| thread_utils | `utils/thread_utils.h` | 线程池（submit 返回 future） |
+| thread_utils | `utils/thread_utils.h` | 线程池（submit 返回 future、wait_idle 排空、pending_tasks 队列深度）+ BlockingQueue 多生产者多消费者阻塞队列（容量上限/close 语义）+ CountdownLatch 倒计时门闩 |
 | json_utils | `utils/json_utils.h` | 基于 nlohmann 的解析/序列化与转义 |
 | xml_utils | `utils/xml_utils.h` | 基于 pugixml 的 XML 解析/序列化 + SimpleXmlNode 轻量结构 |
 | serialization | `utils/serialization.h` | 基于 nlohmann 的通用 JSON 序列化 + XML 树映射序列化 |
@@ -115,6 +115,9 @@ target_link_libraries(app PRIVATE libmini::libmini)
 | zip | `utils/zip.h` | ZIP 包读写（zlib deflate/store，UTF-8 文件名，CRC 校验），零新增依赖 |
 | aes_gcm | `utils/aes_gcm.h` | AES-256-GCM 认证加密（Windows CNG / OpenSSL EVP），seal/open 落盘格式 |
 | sqlite | `utils/sqlite.h` | SQLite 封装：参数绑定（索引/命名）、事务 RAII、行遍历、带类型值读取，错误不抛异常 |
+| system_info | `utils/system_info.h` | 主机名/PID/可执行文件路径/CPU 数/物理内存/磁盘容量与剩余 |
+| http_client | `utils/http_client.h` | HttpClient：GET/POST/PUT/DELETE/通用方法、query 编码拼装、默认头、超时、重定向；headers 键统一小写；status=0 表示传输层错误 |
+| log_facade | `utils/log_facade.h` | LogFacade：一行初始化 spdlog（控制台+滚动文件、级别、格式、可选异步），运行期调级，幂等 init/shutdown |
 
 ## 用法示例
 
@@ -603,6 +606,73 @@ int main(int argc, char** argv)
 ```
 
 支持 `--key=value`、`--key value`、`-k value`、`-kvalue`、`-k=value`；`--` 之后全部视为位置参数；内置 `-h/--help` 自动打印 usage。Windows 下用 `wmain` + `libmini::args_from_wmain(argc, argv)` 可避免中文参数乱码。
+
+### 格式化辅助
+
+```cpp
+using namespace libmini;
+format_bytes(1536);        // "1.5 KB"（1024 进制，自动去尾零）
+format_duration_ms(65500); // "1m 05.5 s"
+format_duration_ms(15);    // "15 ms"
+```
+
+### 线程原语
+
+```cpp
+using namespace libmini;
+ThreadPool pool(4);
+pool.submit([] { return 1 + 1; });
+pool.wait_idle();          // 等全部已提交任务完成（不停止线程池）
+
+BlockingQueue<Task> q(64); // 有界阻塞队列：满时 push 阻塞、空时 pop 阻塞
+q.push(task);
+Task t;
+if (q.try_pop(t, 100)) { process(t); }
+q.close();                 // 关闭：消费端取尽后 pop 返回 false 自然退出
+
+CountdownLatch latch(3);   // 三件事都完成后放行所有等待者
+latch.count_down();
+latch.wait();
+```
+
+### HTTP 客户端
+
+```cpp
+using namespace libmini;
+HttpClient c("http://api.example.com");
+c.set_timeout_ms(3000);
+c.set_default_header("Authorization", "Bearer ...");
+
+HttpResponse r = c.get("/items", {{"page", "1"}});   // query 自动编码拼装
+if (r.ok()) { use(r.body); }                          // 2xx；r.headers 键统一小写
+
+HttpResponse p = c.post_json("/items", R"({"name":"x"})");
+```
+
+### 统一日志门面
+
+```cpp
+using namespace libmini;
+LogFacade::Options o;
+o.file_path = "logs/app.log";   // 自动建目录、10MB×5 滚动
+o.level = LogLevel::Debug;
+o.async_mode = true;            // 后台线程写，退出前须 LogFacade::shutdown()
+LogFacade::init(o);
+
+LogFacade::logger()->info("service started, pid={}", current_pid());
+LogFacade::set_level(LogLevel::Warn);   // 运行期动态调级
+LogFacade::shutdown();
+```
+
+### 系统信息
+
+```cpp
+using namespace libmini;
+LOG_FMT("host={} pid={} cpu={} mem={}", hostname(), current_pid(),
+        cpu_count(), format_bytes(total_physical_memory()));
+sha256_file_hex("download.zip");   // 大文件流式摘要，校验下载完整性
+write_file_atomic("config.json", new_json);  // 崩溃安全的配置落盘
+```
 
 ## 注意事项与已知限制
 

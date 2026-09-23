@@ -30,6 +30,9 @@ set(LIBMINI_SOURCES
     utils/async.cpp
     utils/args.cpp
     utils/sqlite.cpp
+    utils/system_info.cpp
+    utils/http_client.cpp
+    utils/log_facade.cpp
 )
 
 if(LIBMINI_BUILD_SHARED)
