@@ -481,6 +481,63 @@ LIBMINI_DEMO(args_self)
 }
 
 // RPC 回环演示：多客户端并发压测（QPS / 延迟分位 / 过载拒绝率）
+// 服务启动配置化演示：RpcServer::apply_config 接入分层配置门面。
+// 配置优先级：环境变量 DEMO_RPC_* > demo_rpc_cfg.json > 代码内默认值
+LIBMINI_DEMO(config_server)
+{
+    // ---- ① 默认值层：代码里的服务基线配置 ----
+    ConfigFacade cfg;
+    cfg.set_default("rpc.overload_mode", "wait");
+    cfg.set_default("rpc.max_in_flight", "2");
+    cfg.set_default("rpc.drain_timeout_ms", "500");
+    cfg.set_default("rpc.overload_message", "server busy (from defaults)");
+
+    // ---- ② 文件层：配置文件覆盖（模拟部署环境）----
+    const std::string cfg_path = "demo_rpc_cfg.json";
+    write_file(cfg_path,
+               "{\"rpc\": {\"max_in_flight\": 3, "
+               "\"overload_message\": \"server busy (from file)\"}}");
+    cfg.load_file(cfg_path);
+
+    // ---- ③ 环境变量层：运行时覆盖（模拟运维不改文件直接调整）----
+    env_set("DEMO_RPC_RPC_OVERLOAD_MESSAGE", "server busy (from env)");
+    env_set("DEMO_RPC_RPC_DRAIN_TIMEOUT_MS", "300");
+    cfg.set_env_prefix("DEMO_RPC_");
+    cfg.refresh_env();
+
+    // ---- 应用到服务器并启动 ----
+    RpcServer server(RpcTransport::Tcp, "127.0.0.1:0");
+    server.apply_config(cfg, "rpc.");
+    server.register_method("add", [](const std::string& params) {
+        const JsonValue p = parse_json(params);
+        return to_json_string(
+            JsonValue{{"sum", p["a"].get<int>() + p["b"].get<int>()}});
+    });
+    server.start_background();
+    if (!server.wait_until_ready(5000)) {
+        std::cout << "config_server : 服务端启动失败\n";
+        return;
+    }
+
+    std::cout << "max_in_flight : "
+              << "3（文件层覆盖默认的 2）\n";
+    std::cout << "drain_timeout : 300ms（环境变量覆盖默认的 500）\n";
+    std::cout << "overload_mode : wait（排队等待而非立即 429）\n";
+
+    // 冒烟：配置后的服务正常工作
+    {
+        RpcClient c(RpcTransport::Tcp, server.endpoint());
+        c.set_max_retries(0);
+        std::cout << "smoke add     : " << c.call("add", R"({"a":7,"b":35})")
+                  << "\n";
+    }
+
+    server.stop();
+    env_remove("DEMO_RPC_RPC_OVERLOAD_MESSAGE");
+    env_remove("DEMO_RPC_RPC_DRAIN_TIMEOUT_MS");
+    remove_file(cfg_path);
+}
+
 LIBMINI_DEMO(rpc)
 {
     RpcServer server(0);   // 端口 0 = 自动分配
@@ -1305,6 +1362,66 @@ LIBMINI_DEMO(sqlite)
               << "\n";
 
     remove_file(db_path);
+}
+
+// 整合演示：分层配置 + 地址解析 + 时间轮（配置门面驱动、端点解析、定时任务）
+LIBMINI_DEMO(config_net_timer)
+{
+    // ---- 分层配置门面：默认值 → 文件 → 环境变量 ----
+    const std::string cfg_path = "demo_facade_cfg.json";
+    write_file(cfg_path,
+               "{\"demo\": {\"port\": 9527, \"verbose\": true, \"rate\": 0.5}}");
+
+    ConfigFacade cfg;
+    cfg.set_default("demo.port", "8080");       // 默认层
+    cfg.set_default("demo.name", "libmini-demo");
+    cfg.load_file(cfg_path);                     // 文件层覆盖
+    env_set("DEMO_DEMO_PORT", "9100");           // 环境层最高优先
+    cfg.set_env_prefix("DEMO_");
+    cfg.refresh_env();
+
+    std::cout << "cfg port       : " << cfg.get_int("demo.port")
+              << "（来自 " << cfg.source_of("demo.port") << "，期望 9100）\n";
+    std::cout << "cfg verbose    : " << (cfg.get_bool("demo.verbose") ? "是" : "否")
+              << "（来自 " << cfg.source_of("demo.verbose") << "）\n";
+    std::cout << "cfg rate       : " << cfg.get_double("demo.rate") << "\n";
+    std::cout << "cfg name       : " << cfg.get("demo.name")
+              << "（来自 " << cfg.source_of("demo.name") << "，默认层）\n";
+
+    env_remove("DEMO_DEMO_PORT");
+    remove_file(cfg_path);
+
+    // ---- socket 地址工具 ----
+    std::string host;
+    int port = 0;
+    parse_endpoint("[::1]:8080", host, port);
+    std::cout << "endpoint       : [::1]:8080 → host=" << host << " port=" << port << "\n";
+    parse_endpoint_or_default("9527", host, port);
+    std::cout << "endpoint       : 9527 → host=" << host << " port=" << port << "\n";
+    std::cout << "ipv4 roundtrip : 10.0.0.7 → "
+              << ipv4_to_string(ipv4_from_string("10.0.0.7"))
+              << "（往返一致）\n";
+
+    // ---- 时间轮：单次 + 周期 + O(1) 取消 ----
+    Stopwatch wheel_clock;
+    TimerWheel wheel(std::chrono::milliseconds(10));
+    int periodic_count = 0;
+
+    wheel.add_ms(50, [] {
+        std::cout << "wheel once     : 50ms 单次任务触发\n";
+    });
+    wheel.add_periodic_ms(30, [&periodic_count]() -> bool {
+        ++periodic_count;
+        return periodic_count < 3;   // 跑 3 次后自停
+    });   // 自停型周期任务无需保存句柄（fn 返回 false 即停）
+    TimerWheel::Handle cancelled = wheel.add_ms(500, [] {
+        std::cout << "wheel cancel   : 不应出现这行\n";
+    });
+    cancelled.cancel();              // O(1) 取消，不触发
+    wheel.wait_idle();
+    std::cout << "wheel idle     : 周期任务自停（" << periodic_count
+              << " 次），总耗时 " << static_cast<long long>(wheel_clock.elapsed_ms())
+              << "ms\n";
 }
 
 // 整合演示：系统信息 + 格式化 + 原子写 + 文件摘要 + HTTP 客户端 + 日志门面

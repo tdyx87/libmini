@@ -44,6 +44,9 @@
 #include "utils/system_info.h"
 #include "utils/http_client.h"
 #include "utils/log_facade.h"
+#include "utils/config_facade.h"
+#include "utils/net_addr.h"
+#include "utils/timer_wheel.h"
 // 注意：hmac.h 依赖 digest.h 的完整类型定义，而 digest.h 与 libmini.h 存在
 // 互 include（既有模式），把它放进本伞头文件会因 include guard 循环而拿不到
 // Sha256/Md5 定义，故不在此引入。使用时请直接 #include "utils/hmac.h"

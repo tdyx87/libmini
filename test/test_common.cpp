@@ -1193,6 +1193,241 @@ TEST(LogFacadeTest, InvalidConfigFailsCleanly)
     LogFacade::shutdown();   // 恢复无 logger 状态，不影响其他测试
 }
 
+// ------------------------------- config_facade -------------------------------
+
+TEST(ConfigFacadeTest, LayeredPriorityDefaultFileEnv)
+{
+    using namespace libmini;
+    const std::string cfg_path = "test_facade_cfg.json";
+    write_file(cfg_path, "{\"server\": {\"port\": 9090, \"host\": \"0.0.0.0\"}, \"retries\": 3}");
+
+    ConfigFacade cfg;
+    cfg.set_default("server.port", "8080");
+    cfg.set_default("server.timeout_ms", "5000");
+    cfg.set_default("log.level", "info");
+
+    // 文件加载前：默认层生效
+    EXPECT_EQ(cfg.get_int("server.port"), 8080);
+    EXPECT_EQ(cfg.source_of("server.port"), "default");
+
+    // 文件加载后：覆盖默认值
+    EXPECT_TRUE(cfg.load_file(cfg_path));
+    EXPECT_EQ(cfg.get_int("server.port"), 9090);
+    EXPECT_EQ(cfg.get_int("retries"), 3);
+    EXPECT_EQ(cfg.get("server.host"), "0.0.0.0");
+    EXPECT_EQ(cfg.source_of("server.port"), "file");
+    // 未被文件覆盖的默认值仍然生效
+    EXPECT_EQ(cfg.get_int("server.timeout_ms"), 5000);
+
+    // 环境变量覆盖文件层：MYAPP_SERVER_PORT
+    env_set("MYAPP_SERVER_PORT", "7070");
+    cfg.set_env_prefix("MYAPP_");
+    cfg.refresh_env();
+    EXPECT_EQ(cfg.get_int("server.port"), 7070);
+    EXPECT_EQ(cfg.source_of("server.port"), "env");
+    // 环境变量没覆盖的键不受影响
+    EXPECT_EQ(cfg.get_int("retries"), 3);
+
+    env_remove("MYAPP_SERVER_PORT");
+    remove_file(cfg_path);
+}
+
+TEST(ConfigFacadeTest, IniAndMissingFile)
+{
+    using namespace libmini;
+    const std::string ini_path = "test_facade_cfg.ini";
+    write_file(ini_path, "[db]\r\nhost = 127.0.0.1\r\nport = 5432\r\n");
+
+    ConfigFacade cfg;
+    EXPECT_FALSE(cfg.load_file("no_such_file_facade.json"));   // 不存在
+    EXPECT_FALSE(cfg.load_file("test_facade_cfg.txt"));        // 不支持的扩展名
+
+    EXPECT_TRUE(cfg.load_file(ini_path));
+    EXPECT_EQ(cfg.get("db.host"), "127.0.0.1");
+    EXPECT_EQ(cfg.get_int("db.port"), 5432);
+    EXPECT_TRUE(cfg.has("db.host"));
+    EXPECT_FALSE(cfg.has("db.missing"));
+
+    remove_file(ini_path);
+}
+
+TEST(ConfigFacadeTest, NestedJsonAndDefaults)
+{
+    using namespace libmini;
+    const std::string p = "test_facade_nested.json";
+    write_file(p, "{\"a\": {\"b\": {\"c\": true, \"d\": 1.5}}}");
+
+    ConfigFacade cfg;
+    cfg.set_default("fallback.key", "hello");
+    EXPECT_TRUE(cfg.load_file(p));
+    EXPECT_TRUE(cfg.get_bool("a.b.c"));
+    EXPECT_DOUBLE_EQ(cfg.get_double("a.b.d"), 1.5);
+    EXPECT_EQ(cfg.get("fallback.key"), "hello");
+
+    // 类型转换失败回落默认值
+    EXPECT_EQ(cfg.get_int("fallback.key", 42), 42);
+    EXPECT_EQ(cfg.get_int("a.b.d", 7), 7);   // 1.5 不是 int
+
+    remove_file(p);
+}
+
+// ------------------------------- net_addr -------------------------------
+
+TEST(NetAddrTest, ParseEndpointForms)
+{
+    using namespace libmini;
+    std::string host;
+    int port = 0;
+
+    EXPECT_TRUE(parse_endpoint("192.168.1.5:8080", host, port));
+    EXPECT_EQ(host, "192.168.1.5");
+    EXPECT_EQ(port, 8080);
+
+    // IPv6 括号形式
+    EXPECT_TRUE(parse_endpoint("[::1]:8080", host, port));
+    EXPECT_EQ(host, "::1");
+    EXPECT_EQ(port, 8080);
+    EXPECT_TRUE(parse_endpoint("[::1]", host, port));
+    EXPECT_EQ(host, "::1");
+    EXPECT_EQ(port, 0);
+
+    // 纯端口 / 主机名 / 带空端口
+    EXPECT_TRUE(parse_endpoint("8080", host, port));
+    EXPECT_EQ(port, 8080);
+    EXPECT_TRUE(parse_endpoint("myhost", host, port));
+    EXPECT_EQ(host, "myhost");
+    EXPECT_EQ(port, 0);
+    EXPECT_TRUE(parse_endpoint("localhost:", host, port));
+    EXPECT_EQ(host, "localhost");
+    EXPECT_EQ(port, 0);
+
+    // 非法端口
+    std::string h2;
+    int p2 = 0;
+    EXPECT_FALSE(parse_endpoint("host:99999", h2, p2));
+    EXPECT_FALSE(parse_endpoint("host:abc", h2, p2));
+    EXPECT_FALSE(parse_endpoint("[::1", h2, p2));
+
+    // 缺省封装：失败回落 0.0.0.0:0
+    parse_endpoint_or_default("host:abc", host, port);
+    EXPECT_EQ(host, "0.0.0.0");
+    EXPECT_EQ(port, 0);
+}
+
+TEST(NetAddrTest, Ipv4RoundTrip)
+{
+    using namespace libmini;
+    const std::uint32_t net = ipv4_from_string("192.168.1.5");
+    EXPECT_NE(net, 0u);
+    EXPECT_EQ(ipv4_to_string(net), "192.168.1.5");
+
+    EXPECT_EQ(ipv4_from_string("0.0.0.0"), 0u);
+    EXPECT_EQ(ipv4_to_string(0), "0.0.0.0");
+    EXPECT_EQ(ipv4_from_string("256.1.1.1"), 0u);     // 越界
+    EXPECT_EQ(ipv4_from_string("1.2.3"), 0u);          // 段数不足
+    EXPECT_EQ(ipv4_from_string("01.2.3.4"), 0u);       // 前导零
+    EXPECT_EQ(ipv4_from_string("1.2.3.x"), 0u);        // 非数字
+
+    // 回环地址往返
+    const std::uint32_t lo = ipv4_from_string("127.0.0.1");
+    EXPECT_EQ(ipv4_to_string(lo), "127.0.0.1");
+}
+
+TEST(NetAddrTest, ResolveLocalhost)
+{
+    using namespace libmini;
+    // localhost 一定可解析；IPv4 应排在最前（约定）
+    const std::vector<NetAddrEntry> entries = resolve_host("localhost", "");
+    ASSERT_FALSE(entries.empty());
+    EXPECT_FALSE(entries[0].is_ipv6);
+    EXPECT_EQ(entries[0].ip, "127.0.0.1");
+
+    // IPv4 字面量快速路径（不依赖 DNS）
+    const std::uint32_t net = resolve_ipv4_net("10.0.0.7");
+    EXPECT_NE(net, 0u);
+    EXPECT_EQ(ipv4_to_string(net), "10.0.0.7");
+}
+
+// ------------------------------- timer_wheel -------------------------------
+
+TEST(TimerWheelTest, SingleShotFiresOnce)
+{
+    using namespace libmini;
+    TimerWheel wheel(std::chrono::milliseconds(10));
+    std::atomic<int> fired(0);
+    wheel.add_ms(50, [&fired] { ++fired; });
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    EXPECT_EQ(fired.load(), 1);
+    EXPECT_TRUE(wheel.idle());
+}
+
+TEST(TimerWheelTest, PeriodicAndCancel)
+{
+    using namespace libmini;
+    TimerWheel wheel(std::chrono::milliseconds(10));
+    std::atomic<int> fired(0);
+
+    // 周期任务：跑 3 次后自停（fn 返回 false）
+    wheel.add_periodic_ms(30, [&fired]() -> bool {
+        return ++fired < 3;
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(400));
+    EXPECT_EQ(fired.load(), 3);
+    EXPECT_TRUE(wheel.idle());
+
+    // 句柄取消：未触发的任务不再执行
+    std::atomic<int> cnt(0);
+    TimerWheel::Handle h = wheel.add_ms(100, [&cnt] { ++cnt; });
+    EXPECT_TRUE(h.cancel());
+    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+    EXPECT_EQ(cnt.load(), 0);
+    EXPECT_TRUE(wheel.idle());
+
+    // 重复取消无效
+    EXPECT_FALSE(h.cancel());
+}
+
+TEST(TimerWheelTest, BulkTimersO1Add)
+{
+    using namespace libmini;
+    TimerWheel wheel(std::chrono::milliseconds(10));
+    std::atomic<int> fired(0);
+
+    // 海量定时器：10k 添加 + 9k 取消，验证 O(1) 路径不退化
+    std::vector<TimerWheel::Handle> handles;
+    handles.reserve(10000);
+    for (int i = 0; i < 10000; ++i) {
+        handles.push_back(wheel.add_ms(200 + (i % 500), [&fired] { ++fired; }));
+    }
+    for (int i = 0; i < 9000; ++i) {
+        EXPECT_TRUE(handles[static_cast<std::size_t>(i)].cancel());
+    }
+    EXPECT_EQ(wheel.pending_count(),
+              static_cast<std::size_t>(1000));
+
+    // 剩余 1000 个最终全部触发
+    wheel.wait_idle();
+    EXPECT_EQ(fired.load(), 1000);
+}
+
+TEST(TimerWheelTest, WaitIdleBlocksUntilDone)
+{
+    using namespace libmini;
+    TimerWheel wheel(std::chrono::milliseconds(10));
+    std::atomic<int> fired(0);
+    wheel.add_ms(60, [&fired] { ++fired; });
+    wheel.add_ms(120, [&fired] { ++fired; });
+
+    // wait_idle 应阻塞到两个任务都触发
+    const auto t0 = std::chrono::steady_clock::now();
+    wheel.wait_idle();
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                             std::chrono::steady_clock::now() - t0).count();
+    EXPECT_EQ(fired.load(), 2);
+    EXPECT_GE(elapsed, 60);   // 至少等到第一个任务到期
+}
+
 int main(int argc, char** argv)
 {
     ::testing::InitGoogleTest(&argc, argv);

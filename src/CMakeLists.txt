@@ -33,6 +33,9 @@ set(LIBMINI_SOURCES
     utils/system_info.cpp
     utils/http_client.cpp
     utils/log_facade.cpp
+    utils/config_facade.cpp
+    utils/net_addr.cpp
+    utils/timer_wheel.cpp
 )
 
 if(LIBMINI_BUILD_SHARED)

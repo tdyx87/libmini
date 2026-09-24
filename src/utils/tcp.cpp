@@ -1,4 +1,5 @@
 #include "tcp.h"
+#include "net_addr.h"
 
 #include <algorithm>
 #include <chrono>
@@ -111,22 +112,11 @@ void shutdown_socket(SocketHandle fd)
 #endif
 }
 
-// 域名解析（IPv4 字面量与主机名），失败返回 0
+// 域名解析（IPv4 字面量与主机名），失败返回 0。
+// 统一走 net_addr 模块（支持 IPv6 与主机名，IPv4 语义一致）
 std::uint32_t resolve_ipv4(const std::string& host)
 {
-    ::in_addr addr{};
-    if (::inet_pton(AF_INET, host.c_str(), &addr) == 1) {
-        return addr.s_addr;  // 网络序
-    }
-    ::addrinfo hints{};
-    hints.ai_family = AF_INET;
-    ::addrinfo* result = nullptr;
-    if (::getaddrinfo(host.c_str(), nullptr, &hints, &result) != 0 || result == nullptr) {
-        return 0;
-    }
-    const std::uint32_t net = reinterpret_cast<::sockaddr_in*>(result->ai_addr)->sin_addr.s_addr;
-    ::freeaddrinfo(result);
-    return net;
+    return resolve_ipv4_net(host);
 }
 
 // 带超时的非阻塞 connect。返回：1=成功 0=超时 -1=错误

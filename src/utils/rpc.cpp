@@ -26,6 +26,7 @@
 #include <httplib.h>
 
 #include "tcp.h"
+#include "net_addr.h"
 
 // 注意：必须在 httplib.h 之后引入——它包含 Windows.h，
 // 若先于 httplib 会把 _WIN32_WINNT 锁在旧值导致其静态断言失败
@@ -459,20 +460,11 @@ bool pipe_ov_read(HANDLE h, char* data, std::uint32_t len,
 }  // namespace
 
 // ==================== Tcp 传输端点解析 ====================
-// "host:port" → host + port；无冒号视为纯端口号（host 默认 0.0.0.0）
+// 统一走 net_addr："host:port"/纯端口/IPv6 括号形式；无冒号纯数字视为端口
+//（host 默认 0.0.0.0）。失败回落 0.0.0.0:0（与既有语义一致）。
 void parse_host_port(const std::string& endpoint, std::string& host, int& port)
 {
-    const std::size_t colon = endpoint.rfind(':');
-    if (colon == std::string::npos) {
-        host = "0.0.0.0";
-        port = std::atoi(endpoint.c_str());
-        return;
-    }
-    host = endpoint.substr(0, colon);
-    port = std::atoi(endpoint.substr(colon + 1).c_str());
-    if (host.empty()) {
-        host = "0.0.0.0";
-    }
+    parse_endpoint_or_default(endpoint, host, port);
 }
 
 // ==================== RpcClient ====================
@@ -2644,7 +2636,9 @@ bool uds_connect(int fd, const std::string& path, int timeout_ms)
 
 struct RpcServer::Impl
 {
-    const int port;  // HTTP/Tcp 端口（0 = 自动分配）；本地传输为 -1
+    // HTTP/Tcp 监听端口（0 = 自动分配）；本地传输为 -1。
+    // 非 const：apply_config 允许在启动前改端口；启动后不应再改
+    int port;
     int bound_port = -1;
     const RpcTransport transport;   // Http / LocalPipe / Tcp
     const std::string endpoint;     // 本地传输端点（已规范化）；Tcp 原样保存
@@ -2787,8 +2781,7 @@ struct RpcServer::Impl
     {
         if (transport_ == RpcTransport::Tcp) {
             // 默认端点：端口 0 自动分配；parse_host_port 同时规范化 host
-            parse_host_port(endpoint_.empty() ? "0" : endpoint_, tcp_host,
-                            const_cast<int&>(port));
+            parse_host_port(endpoint_.empty() ? "0" : endpoint_, tcp_host, port);
         }
     }
 
@@ -4207,6 +4200,119 @@ bool RpcServer::wait_until_ready(int timeout_ms)
         [impl]() { return impl->bind_done; });
 
     return done && impl->bind_ok;
+}
+
+// ==================== 分层配置接入 ====================
+
+void RpcServer::apply_config(const ConfigFacade& config,
+                             const std::string& key_prefix)
+{
+    Impl* impl = impl_;
+
+    // 便捷取值：拼前缀（"rpc." → "rpc.port"；空前缀 → 裸键名）。
+    // 用 has() 判存在（而非用默认值语义），未提供的键保持当前值。
+    #define LIBMINI_RPC_CFG_KEY(name) \
+        (key_prefix.empty() ? std::string(name) : key_prefix + name)
+
+    // 监听端口（Tcp/HTTP；0 = 自动分配）
+    {
+        const std::string k = LIBMINI_RPC_CFG_KEY("port");
+        if (config.has(k)) {
+            const int v = config.get_int(k, 0);
+            if (v >= 0 && v <= 65535) {
+                std::lock_guard<std::mutex> lock(impl->stats_mutex);
+                impl->port = v;
+            }
+        }
+    }
+    // 监听地址
+    {
+        const std::string k = LIBMINI_RPC_CFG_KEY("host");
+        if (config.has(k)) {
+            set_tcp_host(config.get(k));
+        }
+    }
+    // 工作线程数（须在启动前）
+    {
+        const std::string k = LIBMINI_RPC_CFG_KEY("worker_threads");
+        if (config.has(k)) {
+            const int v = config.get_int(k, 0);
+            if (v >= 0) {
+                set_worker_threads(static_cast<std::size_t>(v));
+            }
+        }
+    }
+    // 最大在途请求数（须在启动前；0 = 不限制）
+    {
+        const std::string k = LIBMINI_RPC_CFG_KEY("max_in_flight");
+        if (config.has(k)) {
+            const int v = config.get_int(k, 0);
+            if (v >= 0) {
+                set_max_in_flight(static_cast<std::size_t>(v));
+            }
+        }
+    }
+    // WaitInQueue 排队等待上限
+    {
+        const std::string k = LIBMINI_RPC_CFG_KEY("queue_wait_ms");
+        if (config.has(k)) {
+            const int v = config.get_int(k, 0);
+            if (v > 0) {
+                set_queue_wait_ms(v);
+            }
+    }
+    }
+    // 优雅停机排空窗口
+    {
+        const std::string k = LIBMINI_RPC_CFG_KEY("drain_timeout_ms");
+        if (config.has(k)) {
+            const int v = config.get_int(k, 0);
+            if (v >= 0) {
+                set_drain_timeout_ms(v);
+            }
+        }
+    }
+    // 429 Retry-After 秒数
+    {
+        const std::string k = LIBMINI_RPC_CFG_KEY("retry_after_seconds");
+        if (config.has(k)) {
+            const int v = config.get_int(k, 0);
+        if (v >= 0) {
+                set_retry_after_seconds(v);
+            }
+        }
+    }
+    // 队列积压告警阈值
+    {
+        const std::string k = LIBMINI_RPC_CFG_KEY("queue_warn_threshold");
+        if (config.has(k)) {
+            const int v = config.get_int(k, 0);
+            if (v >= 0) {
+                set_queue_warn_threshold(static_cast<std::size_t>(v));
+            }
+        }
+    }
+    // 过载拒绝文本
+    {
+        const std::string k = LIBMINI_RPC_CFG_KEY("overload_message");
+        if (config.has(k)) {
+            set_overload_message(config.get(k));
+        }
+    }
+    // 过载模式："reject" / "wait"
+    {
+        const std::string k = LIBMINI_RPC_CFG_KEY("overload_mode");
+        if (config.has(k)) {
+            const std::string v = config.get(k);
+            if (v == "wait") {
+                set_overload_mode(RpcOverloadMode::WaitInQueue);
+            } else if (v == "reject") {
+                set_overload_mode(RpcOverloadMode::RejectImmediate);
+            }
+        }
+    }
+
+    #undef LIBMINI_RPC_CFG_KEY
 }
 
 }  // namespace libmini

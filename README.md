@@ -118,6 +118,9 @@ target_link_libraries(app PRIVATE libmini::libmini)
 | system_info | `utils/system_info.h` | 主机名/PID/可执行文件路径/CPU 数/物理内存/磁盘容量与剩余 |
 | http_client | `utils/http_client.h` | HttpClient：GET/POST/PUT/DELETE/通用方法、query 编码拼装、默认头、超时、重定向；headers 键统一小写；status=0 表示传输层错误 |
 | log_facade | `utils/log_facade.h` | LogFacade：一行初始化 spdlog（控制台+滚动文件、级别、格式、可选异步），运行期调级，幂等 init/shutdown |
+| config_facade | `utils/config_facade.h` | 分层配置门面：默认值 → 文件（JSON/INI 按扩展名）→ 环境变量三层合并，键路径取值（get_int/get_bool/...），source_of 查来源 |
+| net_addr | `utils/net_addr.h` | socket 地址工具：端点解析（host:port / 纯端口 / IPv6 括号）、域名解析（IPv4 优先）、IPv4 格式化往返；RPC/TCP 统一使用 |
+| timer_wheel | `utils/timer_wheel.h` | 层级时间轮：海量定时器 O(1) 添加/取消（单次/周期），固定节拍，适合万级连接超时管理；少量精准任务用 async 的 AsyncScheduler |
 
 ## 用法示例
 
@@ -270,6 +273,17 @@ server.run();                            // 或 start_background() + wait_until_
 server.set_overload_mode(RpcOverloadMode::WaitInQueue);
 server.set_queue_wait_ms(5000);          // 排队等待上限
 server.set_retry_after_seconds(2);       // 429 响应的 Retry-After（0 = 不发送）
+
+// 从分层配置门面批量应用启动配置（环境变量 > 文件 > 代码默认值）：
+//   ConfigFacade cfg;
+//   cfg.set_default("rpc.max_in_flight", "2");
+//   cfg.load_file("svc.json");            // {"rpc": {"max_in_flight": 3}}
+//   cfg.set_env_prefix("SVC_");           // SVC_RPC_MAX_IN_FLIGHT=4
+//   cfg.refresh_env();
+//   server.apply_config(cfg, "rpc.");     // 未出现的键保持当前值，未知键忽略
+// 可配键：port / host / worker_threads / max_in_flight / queue_wait_ms /
+//         drain_timeout_ms / retry_after_seconds / queue_warn_threshold /
+//         overload_message / overload_mode（"reject"|"wait"）
 
 // 服务端延迟分位（对数分桶直方图，处理耗时 O(log) 记录、内存恒定）
 RpcLatencyStats ls = server.latency_stats({99.9});   // 可追加自定义分位
@@ -672,6 +686,43 @@ LOG_FMT("host={} pid={} cpu={} mem={}", hostname(), current_pid(),
         cpu_count(), format_bytes(total_physical_memory()));
 sha256_file_hex("download.zip");   // 大文件流式摘要，校验下载完整性
 write_file_atomic("config.json", new_json);  // 崩溃安全的配置落盘
+```
+
+### 分层配置门面
+
+```cpp
+using namespace libmini;
+ConfigFacade cfg;
+cfg.set_default("server.port", "8080");          // ① 默认值层
+cfg.load_file("config.json");                    // ② 文件层（.json/.ini 按扩展名）
+cfg.set_env_prefix("MYAPP_");                    // ③ 环境变量层：MYAPP_SERVER_PORT
+cfg.refresh_env();                               //    （'.'/'_' 归一化匹配）
+
+const int port = cfg.get_int("server.port");     // env > file > default
+cfg.source_of("server.port");                    // "env"/"file"/"default"
+```
+
+### socket 地址工具
+
+```cpp
+using namespace libmini;
+std::string host; int port;
+parse_endpoint("[::1]:8080", host, port);   // host="::1", port=8080
+parse_endpoint_or_default("9000", host, port);  // host="0.0.0.0", port=9000
+
+resolve_host("localhost", "");               // 地址列表（IPv4 优先）
+ipv4_to_string(ipv4_from_string("10.0.0.7")); // 点分往返
+```
+
+### 时间轮
+
+```cpp
+using namespace libmini;
+TimerWheel wheel(std::chrono::milliseconds(10));  // 10ms 节拍
+TimerWheel::Handle h = wheel.add_ms(5000, on_conn_timeout);   // O(1) 添加
+h.cancel();                                                    // O(1) 取消
+wheel.add_periodic_ms(100, [&] -> bool { return keepalive(); });  // false 自停
+wheel.wait_idle();                                             // 全部触发后返回
 ```
 
 ## 注意事项与已知限制

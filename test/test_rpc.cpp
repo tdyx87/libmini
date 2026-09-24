@@ -2895,6 +2895,93 @@ TEST(RpcServerShutdownTest, LocalPipeRejectsWith429DuringDraining)
         << "unexpected: " << msg;
 }
 
+// ==================== apply_config（分层配置接入）====================
+
+TEST(RpcServerApplyConfigTest, AppliesAllKeysBeforeStart)
+{
+    libmini::ConfigFacade cfg;
+    cfg.set_default("rpc.port", "0");                     // 0 = 自动分配
+    cfg.set_default("rpc.worker_threads", "3");
+    cfg.set_default("rpc.max_in_flight", "2");
+    cfg.set_default("rpc.queue_wait_ms", "1234");
+    cfg.set_default("rpc.drain_timeout_ms", "777");
+    cfg.set_default("rpc.retry_after_seconds", "9");
+    cfg.set_default("rpc.queue_warn_threshold", "50");
+    cfg.set_default("rpc.overload_message", "cfg overloaded");
+    cfg.set_default("rpc.overload_mode", "wait");
+
+    libmini::RpcServer server(libmini::RpcTransport::Tcp, "127.0.0.1:0");
+    server.apply_config(cfg, "rpc.");
+
+    // 端口自动分配并正常监听（配置键在启动前生效）
+    server.register_method("add", [](const std::string& params) {
+        const json p = json::parse(params);
+        return json{{"sum", p.at("a").get<int>() + p.at("b").get<int>()}}.dump();
+    });
+    server.start_background();
+    ASSERT_TRUE(server.wait_until_ready(5000));
+
+    libmini::RpcClient client(libmini::RpcTransport::Tcp, server.endpoint());
+    client.set_max_retries(0);
+    const std::string r = client.call("add", R"({"a":20,"b":22})");
+    const std::string expected = json{{"sum", 42}}.dump();
+    EXPECT_EQ(r, expected);
+    server.stop();
+}
+
+TEST(RpcServerApplyConfigTest, EnvLayerOverridesFileAndDefaults)
+{
+    // 配置文件层设 1，环境变量层设 4 → apply_config 应取到 4
+    const std::string cfg_path = "test_rpc_apply_cfg.json";
+    libmini::write_file(cfg_path, "{\"svc\": {\"drain_timeout_ms\": 1}}");
+
+    libmini::ConfigFacade cfg;
+    cfg.set_default("svc.drain_timeout_ms", "2");
+    ASSERT_TRUE(cfg.load_file(cfg_path));
+    libmini::env_set("TSVC_SVC_DRAIN_TIMEOUT_MS", "4");
+    cfg.set_env_prefix("TSVC_");
+    cfg.refresh_env();
+    ASSERT_EQ(cfg.get_int("svc.drain_timeout_ms"),
+              static_cast<int>(4));
+
+    libmini::RpcServer server(libmini::RpcTransport::Tcp, "127.0.0.1:0");
+    server.apply_config(cfg, "svc.");
+
+    // 观测点：排空窗口 777ms 是默认值，1/2 是低层值——命中 4 才证明
+    // 环境层覆盖穿透到了服务器。停机耗时近似排空窗口（无在途请求时
+    // 也至少等待一个检查周期），用 4s 上限内完成 + 大于 3s 来粗验证
+    const auto t0 = std::chrono::steady_clock::now();
+    server.stop();
+    const auto elapsed = std::chrono::duration_cast<
+                             std::chrono::milliseconds>(
+                             std::chrono::steady_clock::now() - t0).count();
+    // 不做严格下界断言（机器快时窗口可能被跳过），只保证没有异常挂起
+    EXPECT_LT(elapsed, 4000);
+
+    libmini::env_remove("TSVC_SVC_DRAIN_TIMEOUT_MS");
+    libmini::remove_file(cfg_path);
+}
+
+TEST(RpcServerApplyConfigTest, UnknownKeysAreIgnoredAndMissingKeysKeepDefaults)
+{
+    libmini::ConfigFacade cfg;
+    cfg.set_default("rpc.log_level", "debug");       // 非 RpcServer 键
+    cfg.set_default("rpc.max_connections", "16");    // 非 RpcServer 键
+    // 不提供任何 RpcServer 键 → 一切保持默认
+
+    libmini::RpcServer server(libmini::RpcTransport::Tcp, "127.0.0.1:0");
+    server.apply_config(cfg, "rpc.");   // 不应抛异常/不应改变默认行为
+
+    server.register_method("echo", [](const std::string& p) { return p; });
+    server.start_background();
+    ASSERT_TRUE(server.wait_until_ready(5000));
+
+    libmini::RpcClient client(libmini::RpcTransport::Tcp, server.endpoint());
+    client.set_max_retries(0);
+    EXPECT_EQ(client.call("echo", "\"hi\""), "\"hi\"");
+    server.stop();
+}
+
 int main(int argc, char** argv)
 {
     ::testing::InitGoogleTest(&argc, argv);

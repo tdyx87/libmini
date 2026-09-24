@@ -26,6 +26,8 @@ class logger;
 
 namespace libmini {
 
+class ConfigFacade;  // 前置声明：apply_config 只用引用，实现文件才 include
+
 // 过载处理模式：并发处理数达到 set_max_in_flight() 上限时的行为
 enum class RpcOverloadMode {
     RejectImmediate,  // 立即返回 429（默认；延迟低，调用方负责退避重试）
@@ -458,6 +460,24 @@ public:
     // 客户端会按该值等待后重试；0 时客户端改用自身指数退避。
     // 可运行中调整。
     void set_retry_after_seconds(int seconds);
+
+    // 从 ConfigFacade 批量应用启动配置（供服务进程统一从分层配置门面取值）。
+    // 键名在前缀后匹配（前缀匹配基于 ConfigFacade 的 '.'/'_' 归一化，
+    // 因此环境变量 MYAPP_RPC_XXX 也能覆盖同名文件键）：
+    //   port                    → Tcp/HTTP 监听端口（0 = 自动分配）
+    //   host                    → Tcp/HTTP 监听地址（set_tcp_host）
+    //   worker_threads          → set_worker_threads（须在启动前）
+    //   max_in_flight           → set_max_in_flight（须在启动前）
+    //   queue_wait_ms           → set_queue_wait_ms
+    //   drain_timeout_ms        → set_drain_timeout_ms
+    //   retry_after_seconds     → set_retry_after_seconds
+    //   queue_warn_threshold    → set_queue_warn_threshold
+    //   overload_message        → set_overload_message
+    //   overload_mode           → "reject"（RejectImmediate）/ "wait"（WaitInQueue）
+    // 未出现的键保持当前值；无法识别的键静默跳过（便于同一前缀下混放
+    // 非本模块的配置项）。仅取值，不改变 facade 本身。
+    void apply_config(const ConfigFacade& config,
+                      const std::string& key_prefix = std::string());
 
     // 请求耗时分布快照（线程安全，可在运行中随时调用）。
     // 仅统计成功进入处理阶段的请求；服务器重启（重新 run/start_background）后清零。
