@@ -43,9 +43,16 @@ struct TcpConfig {
     int heartbeat_interval_ms = 0;      // >0 启用心跳：空闲超间隔后自动发 PING
     int heartbeat_timeout_ms = 0;       // >0 且启用心跳：超过此值无任何入站帧判死
                                         // （0 = 与 interval*3 取大）
-    bool auto_reconnect = false;        // 客户端断线自动重连（指数退避）
+    bool auto_reconnect = false;        // 客户端断线自动重连（指数退避，
+                                        // TimerWheel 调度）
     int reconnect_base_delay_ms = 200;  // 重连退避基数
     int reconnect_max_delay_ms = 5000;  // 重连退避上限
+
+    // 会话超时管理实现（基准开关）：
+    //   true  = TimerWheel 事件化（默认）：入站只更新原子时间戳，
+    //           到期惰性复查；空闲连接零唤醒，CPU 不随连接数增长
+    //   false = 既有轮询：每会话线程 100ms 周期检查 last_inbound
+    bool wheel_liveness = true;
 };
 
 // ---------------- 客户端 ----------------
@@ -63,6 +70,10 @@ public:
     // 同步连接（受 connect_timeout_ms 约束）。重复 connect 会先关闭旧连接
     bool connect(const std::string& host, std::uint16_t port);
 
+    // 主动关闭（幂等）。断连回调会触发；auto_reconnect 启用时
+    // close() 视为主动关闭，不触发重连
+    void close();
+
     // 异步连接：在内部线程上执行与 connect() 相同的流程（解析/DNS/
     // 握手受 connect_timeout_ms 约束），不阻塞调用线程。返回的 future
     // 就绪即连接完成（true）或失败（false）；连接成功后 on_connect
@@ -70,9 +81,6 @@ public:
     // 线程安全：析构前未完成的连接尝试会正常结束（析构等待内部线程），
     // future 不会悬空
     std::future<bool> async_connect(const std::string& host, std::uint16_t port);
-
-    // 主动关闭（幂等）。断连回调会触发
-    void close();
 
     // 发送数据帧；false = 连接不可用（auto_reconnect 时已安排重连）
     bool send(const std::string& payload);

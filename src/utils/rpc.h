@@ -311,6 +311,21 @@ public:
     // 每连接在途请求上限（1 = 单在途但走流水线路径），默认 0 = 关闭
     void set_pipeline_max_in_flight(std::size_t max_in_flight);
 
+    // 从 ConfigFacade 批量应用客户端配置（与 RpcServer::apply_config 同风格）。
+    // 键名在前缀后匹配（ConfigFacade 的 '.'/'_' 归一化使环境变量也能覆盖）：
+    //   timeout_ms               → set_timeout_ms
+    //   max_retries              → set_max_retries
+    //   retry_base_delay_ms      → set_retry_base_delay_ms
+    //   retry_max_delay_ms       → set_retry_max_delay_ms
+    //   retry_max_total_wait_ms  → set_retry_max_total_wait_ms
+    //   retry_jitter             → set_retry_jitter（true/yes/on）
+    //   pool_max                 → set_connection_pool_max（0 = 禁用池）
+    //   pool_idle_ms             → set_connection_pool_idle_ms
+    //   pipeline_max_in_flight   → set_pipeline_max_in_flight（0 = 关闭）
+    // 未出现的键保持当前值；无法识别的键静默跳过。仅取值，不改 facade
+    void apply_config(const ConfigFacade& config,
+                      const std::string& key_prefix = std::string());
+
     // 连接池快照（线程安全，可随时调用）
     RpcClientPoolStats pool_stats() const;
 

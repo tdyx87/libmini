@@ -2034,6 +2034,47 @@ void RpcClient::set_pipeline_max_in_flight(std::size_t max_in_flight)
     impl_->pipeline_max_in_flight = max_in_flight;
 }
 
+void RpcClient::apply_config(const ConfigFacade& config,
+                             const std::string& key_prefix)
+{
+    if (!impl_) {
+        return;
+    }
+    // 每键独立 has() 判断：未提供的键保持当前值；无法识别的键跳过。
+    // 与 RpcServer::apply_config 相同的取值风格，前缀后匹配
+    const std::string p = key_prefix;
+    if (config.has(p + "timeout_ms")) {
+        set_timeout_ms(config.get_int(p + "timeout_ms", 5000));
+    }
+    if (config.has(p + "max_retries")) {
+        set_max_retries(config.get_int(p + "max_retries", 3));
+    }
+    if (config.has(p + "retry_base_delay_ms")) {
+        set_retry_base_delay_ms(config.get_int(p + "retry_base_delay_ms", 100));
+    }
+    if (config.has(p + "retry_max_delay_ms")) {
+        set_retry_max_delay_ms(config.get_int(p + "retry_max_delay_ms", 4000));
+    }
+    if (config.has(p + "retry_max_total_wait_ms")) {
+        set_retry_max_total_wait_ms(
+            config.get_int(p + "retry_max_total_wait_ms", 10000));
+    }
+    if (config.has(p + "retry_jitter")) {
+        set_retry_jitter(config.get_bool(p + "retry_jitter", false));
+    }
+    if (config.has(p + "pool_max")) {
+        set_connection_pool_max(static_cast<std::size_t>(
+            std::max(0, config.get_int(p + "pool_max", 8))));
+    }
+    if (config.has(p + "pool_idle_ms")) {
+        set_connection_pool_idle_ms(config.get_int(p + "pool_idle_ms", 30000));
+    }
+    if (config.has(p + "pipeline_max_in_flight")) {
+        set_pipeline_max_in_flight(static_cast<std::size_t>(
+            std::max(0, config.get_int(p + "pipeline_max_in_flight", 0))));
+    }
+}
+
 RpcClientPoolStats RpcClient::pool_stats() const
 {
     if (!impl_ || !impl_->pool) {

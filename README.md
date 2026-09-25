@@ -250,6 +250,7 @@ std::string manual = std::string("{\"msg\":\"") + escape_json_string(user_input)
 > RPC 选型文档两份：
 > - [docs/rpc_transport_guide.md](docs/rpc_transport_guide.md)——传输选型与连接复用（三传输 QPS、连接池 vs 流水线、决策树）
 > - [docs/rpc_concurrency_guide.md](docs/rpc_concurrency_guide.md)——并发模型选型（同步 / 异步回调 / 异步 future / 流水线，example 实测数据）
+> - [docs/config_practices.md](docs/config_practices.md)——服务配置实践（键命名约定、分层覆盖矩阵、排错方法）
 
 ```cpp
 // 服务端：四种传输任选（构造时确定，其余 API 完全一致）

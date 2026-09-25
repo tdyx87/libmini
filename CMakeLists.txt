@@ -46,6 +46,7 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin/${CMAKE_BUILD_TYPE})
 
 add_subdirectory(src)
 add_subdirectory(example)
+add_subdirectory(benchmark)
 if(BUILD_TESTING)
     enable_testing()
     find_package(GTest REQUIRED)

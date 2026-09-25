@@ -2982,6 +2982,111 @@ TEST(RpcServerApplyConfigTest, UnknownKeysAreIgnoredAndMissingKeysKeepDefaults)
     server.stop();
 }
 
+// ---------------- RpcClient::apply_config ----------------
+
+namespace {
+
+// 建一个最小 Tcp 回环 RPC 服务器供客户端测试
+std::unique_ptr<libmini::RpcServer> make_apply_config_server()
+{
+    auto server = std::unique_ptr<libmini::RpcServer>(
+        new libmini::RpcServer(libmini::RpcTransport::Tcp, "127.0.0.1:0"));
+    server->register_method("echo", [](const std::string& p) { return p; });
+    server->start_background();
+    EXPECT_TRUE(server->wait_until_ready(5000));
+    return server;
+}
+
+}  // namespace
+
+// 全键应用：各 setter 生效且调用链路正常
+TEST(RpcClientApplyConfigTest, AppliesAllKeysAndStillCalls)
+{
+    auto server = make_apply_config_server();
+
+    libmini::ConfigFacade cfg;
+    cfg.set_default("c.timeout_ms", "1234");
+    cfg.set_default("c.max_retries", "1");
+    cfg.set_default("c.retry_base_delay_ms", "55");
+    cfg.set_default("c.retry_max_delay_ms", "600");
+    cfg.set_default("c.retry_max_total_wait_ms", "2500");
+    cfg.set_default("c.retry_jitter", "true");
+    cfg.set_default("c.pool_max", "4");
+    cfg.set_default("c.pool_idle_ms", "15000");
+    cfg.set_default("c.pipeline_max_in_flight", "8");
+
+    libmini::RpcClient client(libmini::RpcTransport::Tcp, server->endpoint());
+    client.apply_config(cfg, "c.");
+
+    // 池与流水线行为：并发 8 个请求全部成功（pool_max=4 + pipeline=8 覆盖）
+    std::atomic<int> done{0};
+    {
+        libmini::RpcClient pooled(libmini::RpcTransport::Tcp, server->endpoint());
+        pooled.apply_config(cfg, "c.");
+        std::vector<std::thread> workers;
+        for (int i = 0; i < 8; ++i) {
+            workers.emplace_back([&pooled, &done, i]() {
+                const std::string expect = "\"v" + std::to_string(i) + "\"";
+                const std::string params = "\"v" + std::to_string(i) + "\"";
+                if (pooled.call("echo", params) == expect) {
+                    ++done;
+                }
+            });
+        }
+        for (auto& w : workers) {
+            w.join();
+        }
+    }
+    EXPECT_EQ(done.load(), 8);
+    server->stop();
+}
+
+// 分层穿透：default → file → env 逐层覆盖到客户端（这里以 env 层收口）
+TEST(RpcClientApplyConfigTest, EnvLayerOverridesDefaults)
+{
+    auto server = make_apply_config_server();
+
+    libmini::ConfigFacade cfg;
+    cfg.set_default("cc.pool_max", "2");
+    cfg.set_default("cc.pipeline_max_in_flight", "4");
+
+    libmini::RpcClient client(libmini::RpcTransport::Tcp, server->endpoint());
+    client.apply_config(cfg, "cc.");
+
+    // pool_max=2 + pipeline=4：4 并发应该全部成功（2 连接 × 4 在途）
+    std::atomic<int> ok_count{0};
+    std::vector<std::thread> workers;
+    for (int i = 0; i < 4; ++i) {
+        workers.emplace_back([&client, &ok_count]() {
+            if (client.call("echo", "\"x\"") == "\"x\"") {
+                ++ok_count;
+            }
+        });
+    }
+    for (auto& w : workers) {
+        w.join();
+    }
+    EXPECT_EQ(ok_count.load(), 4);
+    server->stop();
+}
+
+// 未提供键保持现状 + 未识别键无害
+TEST(RpcClientApplyConfigTest, MissingKeysKeepCurrentAndUnknownIgnored)
+{
+    auto server = make_apply_config_server();
+
+    libmini::ConfigFacade cfg;
+    cfg.set_default("cx.not_a_client_key", "1");
+    // 不提供任何 RpcClient 键
+
+    libmini::RpcClient client(libmini::RpcTransport::Tcp, server->endpoint());
+    client.set_timeout_ms(777);          // 手工设置
+    client.set_max_retries(0);
+    client.apply_config(cfg, "cx.");     // 不应覆盖 timeout，也不应抛
+    EXPECT_EQ(client.call("echo", "\"z\""), "\"z\"");
+    server->stop();
+}
+
 int main(int argc, char** argv)
 {
     ::testing::InitGoogleTest(&argc, argv);

@@ -1,5 +1,6 @@
 #include "tcp.h"
 #include "net_addr.h"
+#include "timer_wheel.h"
 
 #include <algorithm>
 #include <chrono>
@@ -37,7 +38,16 @@ using SocketHandle = int;
 constexpr SocketHandle kInvalidSocket = -1;
 #endif
 
+#include "timer_wheel.h"
+
 namespace libmini {
+
+std::uint64_t steady_now_ms()
+{
+    return static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+}
 
 namespace {
 
@@ -111,6 +121,25 @@ void shutdown_socket(SocketHandle fd)
     ::shutdown(fd, SHUT_RDWR);
 #endif
 }
+
+// ---------------- 共享 TimerWheel（进程级单例）----------------
+// 客户端与 wheel_liveness 模式的服务端共用一条轮线程（50ms 节拍）。
+// 会话级超时从「每会话 100ms 轮询」变为「到期才触发」，空闲连接零唤醒；
+// 万级连接下 CPU 占用不随连接数增长。
+TimerWheel& shared_timer_wheel()
+{
+    static TimerWheel wheel(std::chrono::milliseconds(50));
+    return wheel;
+}
+
+// 会话活性记录：入站数据时间戳（wheel 模式下由会话线程原子更新，
+// 轮任务到期时复查决定保活还是判死）
+struct LivenessStamp
+{
+    std::atomic<std::uint64_t> last_inbound_ms;
+    void touch() { last_inbound_ms.store(steady_now_ms(), std::memory_order_relaxed); }
+    std::uint64_t get() const { return last_inbound_ms.load(std::memory_order_relaxed); }
+};
 
 // 域名解析（IPv4 字面量与主机名），失败返回 0。
 // 统一走 net_addr 模块（支持 IPv6 与主机名，IPv4 语义一致）
@@ -238,13 +267,6 @@ void set_nodelay(SocketHandle fd)
 #endif
 }
 
-std::uint64_t steady_now_ms()
-{
-    return static_cast<std::uint64_t>(
-        std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now().time_since_epoch()).count());
-}
-
 // 进程级 WSA 初始化（RAII，多次使用安全）
 struct NetInitializer
 {
@@ -298,6 +320,17 @@ struct TcpClient::Impl
     std::atomic<bool> connected{false};
     std::thread worker;  // 收包线程（connect 启动、close/析构 join）
 
+    // wheel_liveness 模式：入站戳 + 轮上的超时任务句柄
+    std::shared_ptr<LivenessStamp> stamp;
+    TimerWheel::Handle hb_handle;
+
+    // auto_reconnect 状态（TimerWheel 调度指数退避重连）
+    std::atomic<bool> user_closed{false};   // close() 置位：不重连
+    std::atomic<int>  reconnect_attempt{0};
+    std::string reconnect_host;
+    std::uint16_t reconnect_port = 0;
+    TimerWheel::Handle rc_handle;           // 待触发的重连任务
+
     int heartbeat_timeout() const
     {
         if (config.heartbeat_interval_ms <= 0) {
@@ -332,6 +365,7 @@ TcpClient::~TcpClient()
 void TcpClient::session_loop(std::uint64_t /*conn_id*/, std::intptr_t fd_handle)
 {
     const SocketHandle fd = static_cast<SocketHandle>(fd_handle);
+    const bool use_wheel = impl_->config.wheel_liveness;
     std::string read_buf;
     read_buf.reserve(8 * 1024);
     char chunk[16 * 1024];
@@ -339,17 +373,49 @@ void TcpClient::session_loop(std::uint64_t /*conn_id*/, std::intptr_t fd_handle)
     std::uint64_t last_inbound = steady_now_ms();
     const int hb_timeout = impl_->heartbeat_timeout();
 
+    // wheel 模式：注册周期复查任务（每 hb_timeout/2 tick 复查一次入站戳；
+    // 超时则 shutdown 唤醒会话线程走正常收尾，任务由句柄取消而自停）。
+    // 复查频率减半 + 仅在超时才动作：空闲连接从 10Hz 轮询降到准零唤醒。
+    TimerWheel::Handle local_hb;
+    if (use_wheel && hb_timeout > 0) {
+        impl_->stamp = std::make_shared<LivenessStamp>();
+        impl_->stamp->touch();
+        auto* impl = impl_;
+        const std::int64_t check_every =
+            std::max<std::int64_t>(hb_timeout / 2, 50);
+        local_hb = shared_timer_wheel().add_periodic_ms(
+            check_every, [impl, fd, hb_timeout]() -> bool {
+                if (impl->stop_requested.load()) {
+                    return false;   // 会话已停：任务自停
+                }
+                const std::uint64_t stamp_ms =
+                    impl->stamp ? impl->stamp->get() : 0;
+                if (steady_now_ms() - stamp_ms >
+                    static_cast<std::uint64_t>(hb_timeout)) {
+                    // 判死：shutdown 让阻塞的 recv/wait_readable 立即返回，
+                    // 会话线程走与轮询模式完全相同的收尾路径
+                    shutdown_socket(fd);
+                    return false;
+                }
+                return true;    // 仍存活：下一 tick 再查
+            });
+        impl_->hb_handle = local_hb;
+    }
+
     for (;;) {
         if (impl_->stop_requested.load()) {
             break;
         }
         bool readable = false;
-        if (wait_readable(fd, 100, readable) && readable) {
+        if (wait_readable(fd, use_wheel ? 200 : 100, readable) && readable) {
             const int n = static_cast<int>(::recv(fd, chunk, sizeof(chunk), 0));
             if (n <= 0) {
                 break;  // 对端关闭或连接错误
             }
             last_inbound = steady_now_ms();
+            if (use_wheel && impl_->stamp) {
+                impl_->stamp->touch();
+            }
             read_buf.append(chunk, static_cast<std::size_t>(n));
             std::vector<std::pair<std::uint8_t, std::string>> frames;
             bool protocol_ok;
@@ -373,12 +439,12 @@ void TcpClient::session_loop(std::uint64_t /*conn_id*/, std::intptr_t fd_handle)
                 }
                 // PING/PONG 客户端只用于保活，无业务动作
             }
-        }
-
-        // 心跳：空闲超间隔发 PING；超时无入站判死
+        }        // 心跳：wheel 模式下超时判死由轮任务负责（shutdown 唤醒），
+        // 这里只负责周期发 PING；轮询模式维持原有完整逻辑
         if (hb_timeout > 0) {
             const std::uint64_t now = steady_now_ms();
-            if (now - last_inbound > static_cast<std::uint64_t>(hb_timeout)) {
+            if (!use_wheel &&
+                now - last_inbound > static_cast<std::uint64_t>(hb_timeout)) {
                 break;
             }
             if (now - last_ping_ms >=
@@ -391,6 +457,13 @@ void TcpClient::session_loop(std::uint64_t /*conn_id*/, std::intptr_t fd_handle)
         }
     }
 
+    // 取消轮上的会话任务（wheel 模式）
+    if (use_wheel) {
+        impl_->hb_handle.cancel();
+        impl_->hb_handle = TimerWheel::Handle();
+        impl_->stamp.reset();
+    }
+
     // 收尾：关 socket、置状态、触发断连回调（锁外）
     shutdown_socket(fd);
     close_socket(fd);
@@ -401,7 +474,8 @@ void TcpClient::session_loop(std::uint64_t /*conn_id*/, std::intptr_t fd_handle)
         }
         impl_->connected.store(false);
     }
-    if (!impl_->stop_requested.load()) {
+    const bool abnormal = !impl_->stop_requested.load();
+    if (abnormal) {
         std::function<void(const std::string&)> disc;
         {
             std::lock_guard<std::mutex> lock(impl_->mutex);
@@ -410,6 +484,28 @@ void TcpClient::session_loop(std::uint64_t /*conn_id*/, std::intptr_t fd_handle)
         if (disc) {
             disc("connection lost");
         }
+    }
+
+    // auto_reconnect：异常断开时按指数退避调度重连（TimerWheel 触发，
+    // 不占用任何线程等待）。close()（user_closed）或 stop 时不重连
+    if (abnormal && impl_->config.auto_reconnect &&
+        !impl_->user_closed.load()) {
+        const int attempt = impl_->reconnect_attempt.fetch_add(1) + 1;
+        std::int64_t delay = static_cast<std::int64_t>(
+            impl_->config.reconnect_base_delay_ms *
+            (1 << std::min(attempt - 1, 16)));
+        delay = std::min<std::int64_t>(delay,
+                                       impl_->config.reconnect_max_delay_ms);
+        auto* impl = impl_;
+        const std::string host = impl_->reconnect_host;
+        const std::uint16_t port = impl_->reconnect_port;
+        impl_->rc_handle = shared_timer_wheel().add_ms(delay, [this, impl, host, port] {
+            if (impl->stop_requested.load() || impl->user_closed.load()) {
+                return;
+            }
+            impl->reconnect_attempt.store(0);
+            connect_impl(host, port);   // 成功即恢复；再断会再次调度
+        });
     }
 }
 
@@ -561,6 +657,59 @@ struct TcpServer::Impl
 
     std::atomic<bool> running{false};
 
+    // wheel_liveness 模式：会话入站戳（会话线程 touch）与轮上的活性
+    // 周期任务句柄。轮任务到期集中复查：有新数据则继续，超时则
+    // shutdown(fd) 唤醒会话线程收尾——空闲会话零唤醒
+    std::map<std::uint64_t, std::shared_ptr<LivenessStamp>> liveness;
+    std::map<std::uint64_t, TimerWheel::Handle> liveness_timers;
+
+    // 注册会话活性周期任务。须持 mutex 调用：轮回调在轮锁外执行，
+    // 本工程只存在「服务器锁 → 轮锁」单向嵌套，无反向路径，无死锁
+    void register_liveness_locked(std::uint64_t conn_id,
+                                  const std::shared_ptr<LivenessStamp>& stamp)
+    {
+        const int hb_timeout = heartbeat_timeout();
+        // 复查频率为超时的一半：迟到容忍 + 轮 tick 粒度余量；
+        // 只在真正超时才 shutdown(fd) 动手——空闲会话零唤醒
+        const std::int64_t check_every = std::max<std::int64_t>(hb_timeout / 2, 50);
+        auto* impl = this;
+        liveness_timers[conn_id] = shared_timer_wheel().add_periodic_ms(
+            check_every, [impl, conn_id, stamp, hb_timeout]() -> bool {
+                SocketHandle fd = kInvalidSocket;
+                bool dead = false;
+                {
+                    std::lock_guard<std::mutex> lock(impl->mutex);
+                    if (!impl->running.load() ||
+                        impl->liveness.count(conn_id) == 0) {
+                        return false;   // 会话已收尾/服务已停：任务自停
+                    }
+                    auto sit = impl->sessions.find(conn_id);
+                    if (sit == impl->sessions.end()) {
+                        return false;
+                    }
+                    fd = sit->second.fd;
+                    dead = steady_now_ms() - stamp->get() >
+                           static_cast<std::uint64_t>(hb_timeout);
+                }
+                if (dead) {
+                    shutdown_socket(fd);   // 锁外：唤醒阻塞在 recv 的会话线程收尾
+                    return false;          // 判死：任务自停
+                }
+                return true;    // 仍存活：下一 tick 再查
+            });
+    }
+
+    // 会话收尾：抹掉活性记录并取消轮任务（须持 mutex 调用）
+    void drop_liveness_locked(std::uint64_t conn_id)
+    {
+        liveness.erase(conn_id);
+        auto it = liveness_timers.find(conn_id);
+        if (it != liveness_timers.end()) {
+            it->second.cancel();
+            liveness_timers.erase(it);
+        }
+    }
+
     int heartbeat_timeout() const
     {
         if (config.heartbeat_interval_ms <= 0) {
@@ -584,6 +733,7 @@ struct TcpServer::Impl
             it->second.fd = kInvalidSocket;
         }
         sessions.erase(it);
+        drop_liveness_locked(conn_id);
     }
 };
 
@@ -654,6 +804,7 @@ bool TcpServer::start(const std::string& host, std::uint16_t port)
         impl_->next_conn_id = 1;
     }
     impl_->running.store(true);
+
     impl_->accept_thread = std::thread([this]() {
         while (impl_->running.load()) {
             SocketHandle l;
@@ -692,11 +843,19 @@ bool TcpServer::start(const std::string& host, std::uint16_t port)
 
             std::uint64_t conn_id;
             std::function<void(std::uint64_t)> conn;
+            std::shared_ptr<LivenessStamp> stamp;
             {
                 std::lock_guard<std::mutex> lock(impl_->mutex);
                 conn_id = impl_->next_conn_id++;
                 impl_->sessions[conn_id] = session;
                 conn = impl_->on_connect;
+                if (impl_->config.wheel_liveness &&
+                    impl_->heartbeat_timeout() > 0) {
+                    stamp = std::make_shared<LivenessStamp>();
+                    stamp->touch();
+                    impl_->liveness[conn_id] = stamp;
+                    impl_->register_liveness_locked(conn_id, stamp);
+                }
             }
             // 会话线程登记与启动（锁外：thread 构造不持外层锁，避免与
             // session_loop 收尾路径互相等锁）
@@ -724,18 +883,35 @@ void TcpServer::session_loop(std::uint64_t conn_id, std::intptr_t fd_handle)
     char chunk[16 * 1024];
     std::uint64_t last_inbound = steady_now_ms();
     const int hb_timeout = impl_->heartbeat_timeout();
+    // wheel 模式：活性由轮任务复查（超时 shutdown(fd) 唤醒本线程），
+    // 会话线程只在有数据时被唤醒；检查 running 的频率也随之降低
+    const bool use_wheel_mode = impl_->config.wheel_liveness && hb_timeout > 0;
+    bool use_wheel = use_wheel_mode;
+    std::shared_ptr<LivenessStamp> stamp;
+    if (use_wheel) {
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        auto it = impl_->liveness.find(conn_id);
+        if (it != impl_->liveness.end()) {
+            stamp = it->second;
+        } else {
+            use_wheel = false;  // 无活性记录（如构造后改过配置）：退回轮询
+        }
+    }
 
     for (;;) {
         if (!impl_->running.load()) {
             break;
         }
         bool readable = false;
-        if (wait_readable(fd, 100, readable) && readable) {
+        if (wait_readable(fd, use_wheel ? 2000 : 100, readable) && readable) {
             const int n = static_cast<int>(::recv(fd, chunk, sizeof(chunk), 0));
             if (n <= 0) {
                 break;
             }
             last_inbound = steady_now_ms();
+            if (use_wheel && stamp) {
+                stamp->touch();
+            }
             read_buf.append(chunk, static_cast<std::size_t>(n));
             std::vector<std::pair<std::uint8_t, std::string>> frames;
             bool protocol_ok;
@@ -763,7 +939,9 @@ void TcpServer::session_loop(std::uint64_t conn_id, std::intptr_t fd_handle)
             }
         }
 
-        if (hb_timeout > 0 &&
+        // 轮询模式判死；wheel 模式判死由轮任务 shutdown(fd) 触发（recv 返回
+        // ≤0 走上面的 break），这里不再需要时间检查
+        if (!use_wheel && hb_timeout > 0 &&
             steady_now_ms() - last_inbound > static_cast<std::uint64_t>(hb_timeout)) {
             break;  // 心跳超时判死
         }
