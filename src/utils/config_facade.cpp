@@ -19,6 +19,12 @@
 #include <cstdlib>
 #endif
 
+// POSIX 环境块：C 运行库全局变量，必须在全局作用域声明
+//（放 namespace libmini 内会声明成 libmini::environ 导致链接失败）
+#ifndef _WIN32
+extern char** environ;
+#endif
+
 namespace libmini {
 
 namespace {
@@ -170,7 +176,6 @@ void ConfigFacade::refresh_env()
     }
 #else
     {
-        extern char** environ;
         for (char** e = environ; e != nullptr && *e != nullptr; ++e) {
             const std::string entry(*e);
             const std::size_t eq = entry.find('=');

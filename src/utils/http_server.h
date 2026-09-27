@@ -29,7 +29,7 @@ struct HttpRequest
     std::string remote_addr;                       // 对端地址（"ip:port"，可能为空）
 
     // 路径参数取值（缺失返回空串）；req.params["id"] 的便捷形式
-    std::string param(const std::string& name) const;
+    LIBMINI_API std::string param(const std::string& name) const;
 };
 
 // 服务端返回的响应。状态码默认 200；未显式设置的 Content-Type 由
@@ -40,9 +40,9 @@ struct HttpReply
     std::map<std::string, std::string> headers;
     std::string body;
 
-    static HttpReply text(int status, const std::string& body);
-    static HttpReply json(int status, const std::string& json_body);
-    static HttpReply error(int status, const std::string& message);
+    LIBMINI_API static HttpReply text(int status, const std::string& body);
+    LIBMINI_API static HttpReply json(int status, const std::string& json_body);
+    LIBMINI_API static HttpReply error(int status, const std::string& message);
 };
 
 // 处理器：返回要写给客户端的响应。在 httplib 的工作线程上并发执行，

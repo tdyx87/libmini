@@ -67,8 +67,9 @@ find_package(libmini REQUIRED CONFIG)      # 六个第三方依赖自动 find_de
 target_link_libraries(app PRIVATE libmini::libmini)
 
 # MSVC 下需与 libmini 分发配置一致的两项设置：
-#   add_compile_options(/utf-8)                      头文件含 UTF-8 中文注释
-#   set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded")  静态包按 MT 运行库分发（否则 LNK2038）
+#   add_compile_options(/utf-8)                                 头文件含 UTF-8 中文注释
+#   set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded")             Release 包按 MT 运行库分发（否则 LNK2038）
+#   set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreadedDebug")        Debug 包按 MTd（链接 conan runtime_type=Debug 的依赖）
 ```
 
 包内容：`include/`（伞头文件 + utils/ 全部模块头）、`lib/libmini.lib`、`lib/cmake/libmini/`（Config/ConfigVersion/Targets 三件套）。依赖解析优先走 conan/vcpkg 的 Config 文件（`CMAKE_FIND_PACKAGE_PREFER_CONFIG`）；包版本校验含位数（x86 包不会被 64 位工程误链），版本策略 SameMajorVersion。已用独立消费者工程实测：find_package → 编译链接 → 运行（string/json/uuid/rpc/sqlite 五模块调用）全链路通过（见 `out/consumer_test/`）。

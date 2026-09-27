@@ -8,6 +8,14 @@
 #define NOMINMAX
 #endif
 #include <Windows.h>
+#elif defined(__APPLE__)
+// macOS 没有 sys/sysinfo.h，内存信息走 sysctl（hw.memsize）
+#include <climits>
+#include <cstdio>
+#include <sys/statvfs.h>
+#include <sys/sysctl.h>
+#include <sys/types.h>
+#include <unistd.h>
 #else
 #include <climits>
 #include <cstdio>
@@ -85,6 +93,13 @@ std::uint64_t total_physical_memory()
         return 0;
     }
     return static_cast<std::uint64_t>(ms.ullTotalPhys);
+#elif defined(__APPLE__)
+    std::uint64_t mem = 0;
+    std::size_t len = sizeof(mem);
+    if (::sysctlbyname("hw.memsize", &mem, &len, NULL, 0) != 0) {
+        return 0;
+    }
+    return mem;
 #else
     struct ::sysinfo si;
     if (::sysinfo(&si) != 0) {
@@ -104,6 +119,19 @@ std::uint64_t available_physical_memory()
         return 0;
     }
     return static_cast<std::uint64_t>(ms.ullAvailPhys);
+#elif defined(__APPLE__)
+    // macOS 无 sysinfo()：以空闲页数 × 页大小近似（不含可回收缓存，
+    // 口径偏保守，仅作展示用途）
+    std::uint64_t page_size = 4096;
+    std::size_t plen = sizeof(page_size);
+    ::sysctlbyname("hw.pagesize", &page_size, &plen, NULL, 0);
+    std::uint64_t free_pages = 0;
+    std::size_t flen = sizeof(free_pages);
+    if (::sysctlbyname("vm.page_free_count", &free_pages, &flen, NULL, 0) !=
+        0) {
+        return 0;
+    }
+    return free_pages * page_size;
 #else
     struct ::sysinfo si;
     if (::sysinfo(&si) != 0) {

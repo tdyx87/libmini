@@ -5,7 +5,7 @@
 #include <string>
 #include <vector>
 
-#include "libmini.h"
+#include "export.h"
 
 namespace libmini {
 
@@ -23,11 +23,12 @@ namespace libmini {
 //   "myhost"            → host="myhost",      port=0      （无冒号视为主机名）
 // 解析失败（端口非数字/越界）返回 false，输出参数置空。
 // 注意： "::1" 不带括号的裸 IPv6 无法与 "host:port" 区分，需用括号形式。
-bool parse_endpoint(const std::string& endpoint, std::string& host, int& port);
+LIBMINI_API bool parse_endpoint(const std::string& endpoint,
+                                std::string& host, int& port);
 
 // 便捷封装：失败时 host="0.0.0.0"、port=0（服务端监听默认口径）
-void parse_endpoint_or_default(const std::string& endpoint,
-                               std::string& host, int& port);
+LIBMINI_API void parse_endpoint_or_default(const std::string& endpoint,
+                                           std::string& host, int& port);
 
 // ---------------- 域名解析 ----------------
 
@@ -41,20 +42,20 @@ struct NetAddrEntry {
 // 主机名 → 地址列表（IPv4 字面量直接返回；域名走 getaddrinfo）。
 // service_port 非空时填入每项 port。失败/无结果返回空表。
 // 首次调用会初始化 Winsock（Windows）。
-std::vector<NetAddrEntry> resolve_host(const std::string& host,
-                                       const std::string& service_port);
+LIBMINI_API std::vector<NetAddrEntry> resolve_host(
+    const std::string& host, const std::string& service_port);
 
 // 仅取第一个 IPv4（与 tcp.cpp 的 resolve_ipv4 语义一致）；
 // 失败返回 0（INADDR_ANY 语义，与既有调用方约定一致）。
-std::uint32_t resolve_ipv4_net(const std::string& host);
+LIBMINI_API std::uint32_t resolve_ipv4_net(const std::string& host);
 
 // ---------------- IPv4 格式化 ----------------
 
 // 网络序 uint32 → "a.b.c.d"
-std::string ipv4_to_string(std::uint32_t net_addr);
+LIBMINI_API std::string ipv4_to_string(std::uint32_t net_addr);
 
 // "a.b.c.d" → 网络序 uint32；非法返回 0
-std::uint32_t ipv4_from_string(const std::string& ip);
+LIBMINI_API std::uint32_t ipv4_from_string(const std::string& ip);
 
 }  // namespace libmini
 
