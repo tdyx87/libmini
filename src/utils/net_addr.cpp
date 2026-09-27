@@ -21,15 +21,27 @@
 
 namespace libmini {
 
-// macOS 把 htonl/ntohl/ntohs/htons 定义为宏（sys/_endian.h），`::htonl`
-// 这种全局限定调用会展开成 `::__DARWIN_OSSwapInt32` 编译报错。
-// 转发到不带限定的名字：Windows/POSIX 是函数，Darwin 展开宏也合法。
-using ::htonl;
-using ::ntohl;
-using ::htons;
-using ::ntohs;
-
 namespace {
+
+// 字节序转换统一走不带限定的包装：macOS 把 htonl/ntohl/ntohs/htons
+// 定义为宏（sys/_endian.h），`::htonl` 这类全局限定调用会展开成
+// `::__DARWIN_OSSwapInt32` 编译报错（run #8 macOS 实测）。包装函数
+// 内部用不带限定的名字调用：Windows/POSIX 是函数，Darwin 展开宏也合法。
+
+std::uint32_t host_to_net32(std::uint32_t v)
+{
+    return htonl(v);
+}
+
+std::uint32_t net_to_host32(std::uint32_t v)
+{
+    return ntohl(v);
+}
+
+std::uint16_t net_to_host16(std::uint16_t v)
+{
+    return ntohs(v);
+}
 
 // 进程级 Winsock 引导（Windows 需要；POSIX 空实现）。
 // 引用计数式：与 tcp 模块各自的 WSAStartup 互不干扰。
@@ -85,7 +97,7 @@ bool parse_ipv4_literal(const std::string& ip, std::uint32_t& net_out)
                                    (static_cast<std::uint32_t>(parts[1]) << 16) |
                                    (static_cast<std::uint32_t>(parts[2]) << 8) |
                                    static_cast<std::uint32_t>(parts[3]);
-    net_out = htonl(host_val);
+    net_out = host_to_net32(host_val);
     return true;
 }
 
@@ -206,13 +218,13 @@ std::vector<NetAddrEntry> resolve_host(const std::string& host,
             ::inet_ntop(AF_INET, &sa->sin_addr, text, sizeof(text));
             entry.ip = text;
             entry.is_ipv6 = false;
-            entry.port = ntohs(sa->sin_port);
+            entry.port = net_to_host16(sa->sin_port);
         } else if (ai->ai_family == AF_INET6) {
             const auto* sa = reinterpret_cast<const ::sockaddr_in6*>(ai->ai_addr);
             ::inet_ntop(AF_INET6, &sa->sin6_addr, text, sizeof(text));
             entry.ip = text;
             entry.is_ipv6 = true;
-            entry.port = ntohs(sa->sin6_port);
+            entry.port = net_to_host16(sa->sin6_port);
         } else {
             continue;
         }
@@ -249,7 +261,7 @@ std::uint32_t resolve_ipv4_net(const std::string& host)
 std::string ipv4_to_string(std::uint32_t net_addr)
 {
     char buf[16];
-    const std::uint32_t h = ntohl(net_addr);
+    const std::uint32_t h = net_to_host32(net_addr);
     const unsigned b0 = (h >> 24) & 0xff;
     const unsigned b1 = (h >> 16) & 0xff;
     const unsigned b2 = (h >> 8) & 0xff;

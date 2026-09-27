@@ -28,12 +28,16 @@ struct ConsoleExit::Impl
 #endif
 };
 // 控制处理器桥：持有属主指针，信号到达时置位并执行回调。
-// ConsoleExit 把 Impl 声明为 friend，桥接函数通过成员指针访问
+// ConsoleExit 把 Impl 声明为 friend，桥接函数通过成员指针访问。
+// g_console_exit 仅 Windows 控制处理器路径使用；POSIX 走 sigwait
+// 线程不用它，非 Windows 下不定义（strict job -Wunused-variable 实测）
+#ifdef _WIN32
 namespace {
 
 ConsoleExit* g_console_exit = nullptr;
 
 }  // namespace
+#endif
 
 #ifdef _WIN32
 BOOL WINAPI console_ctrl_handler(DWORD type)
