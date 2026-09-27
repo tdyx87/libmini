@@ -34,12 +34,15 @@ namespace libmini {
 // 节拍，O(1) 增删，代价是到期精度 ±1 tick）。
 class LIBMINI_API TimerWheel {
 public:
-    // 取消句柄（可拷贝；指向轮内 slot 中的槽位记录）
+    // 取消句柄（可拷贝；指向轮内 slot 中的槽位记录）。
+    // Handle 是独立 struct（非嵌套定义于类内的成员函数导出问题），
+    // cancel() 必须单独标 LIBMINI_API：类级标注只导出 TimerWheel 自己
+    // 的成员，嵌套类的成员不继承（windows-shared LNK2019 实测）。
     struct Handle {
         Handle() : id(0), wheel(nullptr) {}
 
         // 取消定时器。返回 true 表示成功取消（尚未触发）。
-        bool cancel();
+        LIBMINI_API bool cancel();
 
         std::uint64_t id;
         class TimerWheel* wheel;

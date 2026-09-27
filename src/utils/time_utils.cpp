@@ -156,9 +156,13 @@ std::string date_to_string(std::int64_t days)
 {
     int y, m, d;
     civil_from_days(days, y, m, d);
-    char buf[16];
-    std::snprintf(buf, sizeof(buf), "%04d-%02d-%02d", y, m, d);
-    return buf;
+    // 缓冲区取 32：16 的话 GCC -Wformat-truncation 在极端年份（INT_MIN）
+    // 下会报截断告警（strict job -Werror 实测）
+    char buf[32];
+    const int n = std::snprintf(buf, sizeof(buf), "%04d-%02d-%02d", y, m, d);
+    return (n > 0 && static_cast<std::size_t>(n) < sizeof(buf))
+               ? std::string(buf)
+               : std::string();
 }
 
 std::int64_t date_from_string(const std::string& s)
@@ -167,7 +171,17 @@ std::int64_t date_from_string(const std::string& s)
     if (s.size() != 10 || s[4] != '-' || s[7] != '-') {
         return -1;
     }
-    if (std::sscanf(s.c_str(), "%4d-%2d-%2d", &y, &m, &d) != 3) {
+    // 手工解析（格式已校验为 yyyy-mm-dd 定长）；sscanf 有 MSVC C4996 弃用告警
+    for (int i = 0; i < 10; ++i) {
+        if (i == 4 || i == 7) continue;
+        if (s[i] < '0' || s[i] > '9') {
+            return -1;
+        }
+    }
+    y = (s[0] - '0') * 1000 + (s[1] - '0') * 100 + (s[2] - '0') * 10 + (s[3] - '0');
+    m = (s[5] - '0') * 10 + (s[6] - '0');
+    d = (s[8] - '0') * 10 + (s[9] - '0');
+    if (m < 1 || m > 12 || d < 1 || d > 31) {
         return -1;
     }
     return days_from_civil(y, m, d);  // 非法日期在内部校验返回 -1
