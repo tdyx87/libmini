@@ -3,6 +3,7 @@
 #include <sqlite3.h>
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 namespace libmini {
@@ -43,12 +44,8 @@ std::int64_t SqliteValue::to_int64() const
         case Type::Text:
         case Type::Blob: {
             // 宽松转换：取前缀数字（"42abc" → 42），失败返回 0。
-            // %lld 要求 long long*（Linux 上 int64_t 是 long，不能直接传）
-            long long ll = 0;
-            if (std::sscanf(bytes.c_str(), "%lld", &ll) == 1) {
-                return static_cast<std::int64_t>(ll);
-            }
-            return 0;
+            // strtoll 语义与 sscanf("%lld") 一致（前缀解析），且无 MSVC C4996 弃用告警
+            return std::strtoll(bytes.c_str(), nullptr, 10);
         }
         default: return 0;
     }
@@ -61,11 +58,8 @@ double SqliteValue::to_double() const
         case Type::Real:    return real;
         case Type::Text:
         case Type::Blob: {
-            double v = 0.0;
-            if (std::sscanf(bytes.c_str(), "%lf", &v) == 1) {
-                return v;
-            }
-            return 0.0;
+            // strtod 语义与 sscanf("%lf") 一致（前缀解析），且无 MSVC C4996 弃用告警
+            return std::strtod(bytes.c_str(), nullptr);
         }
         default: return 0.0;
     }

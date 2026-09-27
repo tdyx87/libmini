@@ -1428,6 +1428,96 @@ TEST(TimerWheelTest, WaitIdleBlocksUntilDone)
     EXPECT_GE(elapsed, 60);   // 至少等到第一个任务到期
 }
 
+// ------------------------------- HttpServer --------------------------------
+
+TEST(HttpServerTest, RoutesParamsQueryAndLifecycle)
+{
+    using namespace libmini;
+    HttpServer server;
+
+    server.get("/hello/:name", [](const HttpRequest& req) {
+        return HttpReply::text(200, "hi " + req.param("name"));
+    });
+    server.get("/sum", [](const HttpRequest& req) {
+        const int a = std::atoi(req.param("a").empty()
+                                    ? req.query.at("a").c_str()
+                                    : req.param("a").c_str());
+        const int b = std::atoi(req.query.at("b").c_str());
+        return HttpReply::json(200, "{\"sum\":" + std::to_string(a + b) + "}");
+    });
+    server.post("/echo", [](const HttpRequest& req) {
+        return HttpReply::text(200, req.body);
+    });
+    server.set_fallback([](const HttpRequest&) {
+        return HttpReply::error(404, "no route");
+    });
+
+    // 前置过滤器：携带合法 token 放行，否则短路 401
+    server.use([](const HttpRequest& req, HttpReply& reply) {
+        const auto it = req.headers.find("x-token");
+        if (it != req.headers.end() && it->second == "secret") return true;
+        reply = HttpReply::error(401, "unauthorized");
+        return false;
+    });
+
+    std::atomic<int> logged(0);
+    server.set_access_logger([&logged](const HttpRequest&, const HttpReply&,
+                                       std::int64_t) { ++logged; });
+
+    EXPECT_TRUE(server.start_background(0));
+    EXPECT_TRUE(server.wait_until_ready());
+    ASSERT_GT(server.port(), 0);
+
+    HttpClient c("127.0.0.1", server.port());
+    c.set_default_header("X-Token", "secret");
+
+    // 路径参数 + 过滤器放行
+    const HttpResponse r1 = c.get("/hello/libmini");
+    EXPECT_TRUE(r1.ok());
+    EXPECT_EQ(r1.body, "hi libmini");
+
+    // query 解析（URL 解码 + JSON 回复）
+    const HttpResponse r2 = c.get("/sum?a=40&b=2");
+    EXPECT_TRUE(r2.ok());
+    EXPECT_EQ(r2.body, "{\"sum\":42}");
+
+    // POST 回显
+    const HttpResponse r3 = c.post("/echo", "payload 中文", "text/plain");
+    EXPECT_TRUE(r3.ok());
+    EXPECT_EQ(r3.body, "payload 中文");
+
+    // 未带 token → 过滤器短路 401（换一个无默认头的客户端）
+    HttpClient anon("127.0.0.1", server.port());
+    const HttpResponse r4 = anon.get("/hello/x");
+    EXPECT_EQ(r4.status, 401);
+
+    // 未命中路由 → fallback
+    const HttpResponse r5 = c.get("/nothing");
+    EXPECT_EQ(r5.status, 404);
+    EXPECT_NE(r5.body.find("no route"), std::string::npos);
+
+    // 访问日志钩子按请求计数
+    EXPECT_EQ(logged.load(), 5);
+
+    server.stop();
+    EXPECT_FALSE(server.is_running());
+}
+
+TEST(HttpServerTest, ApplyConfigPortFromEnv)
+{
+    using namespace libmini;
+    env_set("LT_HTTPSRV_PORT", "0");  // 0 = 系统分配，仅验证环境层穿透
+    ConfigFacade cfg;
+    cfg.set_env_prefix("LT_HTTPSRV_");
+    cfg.set_default("port", "80");
+
+    HttpServer server;
+    server.apply_config(cfg, "");
+    EXPECT_EQ(server.port(), 0);  // 环境层(0)覆盖 default 层(80)
+
+    env_remove("LT_HTTPSRV_PORT");
+}
+
 int main(int argc, char** argv)
 {
     ::testing::InitGoogleTest(&argc, argv);

@@ -664,7 +664,10 @@ std::string digest_file_hex(const std::string& path,
                             bool want_sha256)
 {
 #ifdef _WIN32
-    FILE* f = ::_wfopen(internal::utf8_to_wide(path).c_str(), L"rb");
+    FILE* f = nullptr;
+    if (::_wfopen_s(&f, internal::utf8_to_wide(path).c_str(), L"rb") != 0) {
+        f = nullptr;
+    }
 #else
     FILE* f = std::fopen(path.c_str(), "rb");
 #endif

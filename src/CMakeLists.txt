@@ -32,6 +32,7 @@ set(LIBMINI_SOURCES
     utils/sqlite.cpp
     utils/system_info.cpp
     utils/http_client.cpp
+    utils/http_server.cpp
     utils/log_facade.cpp
     utils/config_facade.cpp
     utils/net_addr.cpp

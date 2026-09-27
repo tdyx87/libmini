@@ -117,6 +117,7 @@ target_link_libraries(app PRIVATE libmini::libmini)
 | sqlite | `utils/sqlite.h` | SQLite 封装：参数绑定（索引/命名）、事务 RAII、行遍历、带类型值读取，错误不抛异常 |
 | system_info | `utils/system_info.h` | 主机名/PID/可执行文件路径/CPU 数/物理内存/磁盘容量与剩余 |
 | http_client | `utils/http_client.h` | HttpClient：GET/POST/PUT/DELETE/通用方法、query 编码拼装、默认头、超时、重定向；headers 键统一小写；status=0 表示传输层错误 |
+| http_server | `utils/http_server.h` | HttpServer：路径参数（`:name`）/query 解析、前置过滤器、fallback、访问日志钩子、请求体上限、apply_config（port/max_body_bytes） |
 | log_facade | `utils/log_facade.h` | LogFacade：一行初始化 spdlog（控制台+滚动文件、级别、格式、可选异步），运行期调级，幂等 init/shutdown |
 | config_facade | `utils/config_facade.h` | 分层配置门面：默认值 → 文件（JSON/INI 按扩展名）→ 环境变量三层合并，键路径取值（get_int/get_bool/...），source_of 查来源 |
 | net_addr | `utils/net_addr.h` | socket 地址工具：端点解析（host:port / 纯端口 / IPv6 括号）、域名解析（IPv4 优先）、IPv4 格式化往返；RPC/TCP 统一使用 |
@@ -662,6 +663,26 @@ HttpResponse r = c.get("/items", {{"page", "1"}});   // query 自动编码拼装
 if (r.ok()) { use(r.body); }                          // 2xx；r.headers 键统一小写
 
 HttpResponse p = c.post_json("/items", R"({"name":"x"})");
+```
+
+### HTTP 服务器
+
+```cpp
+using namespace libmini;
+HttpServer server;
+server.get("/items/:id", [](const HttpRequest& req) {
+    return HttpReply::json(200, "{\"id\":\"" + req.param("id") + "\"}");
+});
+server.use([](const HttpRequest& req, HttpReply& reply) {   // 前置过滤器
+    if (req.headers.count("x-token")) return true;
+    reply = HttpReply::error(401, "unauthorized");
+    return false;                                           // 短路
+});
+server.set_access_logger([](const HttpRequest& rq, const HttpReply& rp,
+                            std::int64_t ms) { /* 方法/路径/状态/耗时 */ });
+server.start_background(8080);                              // 或 0 自动分配
+server.wait_until_ready();
+server.stop();
 ```
 
 ### 统一日志门面

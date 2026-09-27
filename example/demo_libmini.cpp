@@ -677,11 +677,11 @@ LIBMINI_DEMO(rpc)
         for (int i = 0; i < 100 && local.stats().active_requests < 1; ++i) {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
-        RpcClient rejected(RpcTransport::LocalPipe, local.endpoint());
-        rejected.set_max_retries(0);
-        const std::string r = rejected.call("add", R"({"a":1,"b":1})");
+        RpcClient overflow_client(RpcTransport::LocalPipe, local.endpoint());
+        overflow_client.set_max_retries(0);
+        const std::string r = overflow_client.call("add", R"({"a":1,"b":1})");
         std::cout << "rpc 管道过载   : "
-                  << (r.empty() && rejected.last_error() == RpcError::OVERLOADED
+                  << (r.empty() && overflow_client.last_error() == RpcError::OVERLOADED
                           ? "429 语义与 HTTP 一致"
                           : "（意外：未被拒绝）")
                   << "\n";
@@ -784,8 +784,8 @@ LIBMINI_DEMO(rpc)
         if (http_bench.wait_until_ready(5000) &&
             tcp_bench.wait_until_ready(5000) &&
             pipe_bench.wait_until_ready(5000)) {
-            const int k_threads = 8;
-            const int k_calls = 200;  // 每线程请求数，总 1600/传输
+            const int t_threads = 8;
+            const int t_calls = 200;  // 每线程请求数，总 1600/传输
 
             struct BenchResult
             {
@@ -794,7 +794,7 @@ LIBMINI_DEMO(rpc)
                 double p99 = 0;
                 int failed = 0;
             };
-            // 同一并发形状压一种传输：8 线程 × k_calls，每线程一个客户端
+            // 同一并发形状压一种传输：8 线程 × t_calls，每线程一个客户端
             //（HTTP 走 httplib keep-alive，Tcp/管道走连接池）
             auto bench_transport = [&](RpcTransport transport,
                                        const std::string& endpoint,
@@ -804,7 +804,7 @@ LIBMINI_DEMO(rpc)
                 std::atomic<int> failed{0};
                 Stopwatch wall;
                 std::vector<std::thread> workers;
-                for (int t = 0; t < k_threads; ++t) {
+                for (int t = 0; t < t_threads; ++t) {
                     (void)t;
                     workers.push_back(std::thread([&] {
                         std::unique_ptr<RpcClient> client;
@@ -817,7 +817,7 @@ LIBMINI_DEMO(rpc)
                         }
                         client->set_max_retries(0);
                         client->set_timeout_ms(5000);
-                        for (int i = 0; i < k_calls; ++i) {
+                        for (int i = 0; i < t_calls; ++i) {
                             Stopwatch sw;
                             const std::string r =
                                 client->call("add", R"({"a":1,"b":2})");
@@ -838,16 +838,16 @@ LIBMINI_DEMO(rpc)
                 std::sort(lat.begin(), lat.end());
                 BenchResult r;
                 r.qps =
-                    static_cast<double>(k_threads * k_calls) /
-                    (wall.elapsed_ms() / 1000.0);
+                    static_cast<double>(t_threads * t_calls) /
+                    (static_cast<double>(wall.elapsed_ms()) / 1000.0);
                 r.p50 = percentile_of(lat, 500);
                 r.p99 = percentile_of(lat, 990);
                 r.failed = failed.load();
                 return r;
             };
 
-            std::cout << "rpc 传输对比   : HTTP vs Tcp vs 管道，" << k_threads
-                      << " 线程 x " << k_calls
+            std::cout << "rpc 传输对比   : HTTP vs Tcp vs 管道，" << t_threads
+                      << " 线程 x " << t_calls
                       << " 次（本机回环，handler 无耗时）\n";
             const BenchResult http_r = bench_transport(
                 RpcTransport::Http, std::string(), http_bench.port());
@@ -1162,7 +1162,8 @@ LIBMINI_DEMO(rpc)
                             static_cast<double>(collect_sw.elapsed_ms());
                     }
 
-                    const double wall_ms = wall.elapsed_ms();
+                    const double wall_ms =
+                        static_cast<double>(wall.elapsed_ms());
                     std::sort(lat.begin(), lat.end());
                     AsyncBench r;
                     r.qps = static_cast<double>(ok.load() + failed.load()) /
@@ -1499,6 +1500,68 @@ LIBMINI_DEMO(sysinfo_http_log)
 
     remove_file(cfg);
     remove_tree("logs_demo");
+}
+
+LIBMINI_DEMO(http_server)
+{
+    using namespace libmini;
+
+    HttpServer server;
+
+    // 路径参数 + JSON 回复
+    server.get("/hello/:name", [](const HttpRequest& req) {
+        return HttpReply::json(200, "{\"hello\":\"" + req.param("name") + "\"}");
+    });
+    // query 解析
+    server.get("/sum", [](const HttpRequest& req) {
+        const int a = std::atoi(req.query.at("a").c_str());
+        const int b = std::atoi(req.query.at("b").c_str());
+        return HttpReply::text(200, "sum=" + std::to_string(a + b));
+    });
+    // 前置过滤器：无 token 短路 401
+    server.use([](const HttpRequest& req, HttpReply& reply) {
+        if (req.headers.count("x-token")) return true;
+        reply = HttpReply::error(401, "missing token");
+        return false;
+    });
+    // 未命中路由的 fallback
+    server.set_fallback([](const HttpRequest&) {
+        return HttpReply::error(404, "no such route");
+    });
+    // 访问日志（方法/路径/状态/耗时）
+    int logged = 0;
+    server.set_access_logger([&](const HttpRequest& rq, const HttpReply& rp,
+                                 std::int64_t ms) {
+        ++logged;
+        std::cout << "  [access] " << rq.method << " " << rq.path
+                  << " -> " << rp.status << " (" << ms << "ms)\n";
+    });
+
+    if (!server.start_background(0)) {
+        std::cout << "启动失败: " << server.last_error() << "\n";
+        return;
+    }
+    if (!server.wait_until_ready()) {
+        std::cout << "等待就绪超时\n";
+        return;
+    }
+
+    HttpClient client("127.0.0.1", server.port());
+    client.set_default_header("X-Token", "demo");
+
+    const HttpResponse r1 = client.get("/hello/libmini");
+    std::cout << "路径参数        : " << r1.body << "\n";
+    const HttpResponse r2 = client.get("/sum?a=40&b=2");
+    std::cout << "query 解析      : " << r2.body << "\n";
+
+    HttpClient anon("127.0.0.1", server.port());
+    const HttpResponse r3 = anon.get("/hello/x");
+    std::cout << "过滤器短路      : status=" << r3.status << "（无 token）\n";
+    const HttpResponse r4 = client.get("/no_such");
+    std::cout << "fallback        : status=" << r4.status << "\n";
+
+    std::cout << "访问日志条数    : " << logged << "\n";
+    server.stop();
 }
 
 }  // namespace

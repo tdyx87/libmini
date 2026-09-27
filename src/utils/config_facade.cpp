@@ -139,7 +139,11 @@ std::vector<std::string> ConfigFacade::file_keys() const
 
 void ConfigFacade::set_env_prefix(const std::string& prefix)
 {
+    if (env_prefix_ == prefix) {
+        return;
+    }
     env_prefix_ = prefix;
+    refresh_env();  // 设置即生效（前缀变化必须重扫才有意义）
 }
 
 void ConfigFacade::refresh_env()

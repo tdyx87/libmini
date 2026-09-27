@@ -43,6 +43,7 @@
 #include "utils/sqlite.h"
 #include "utils/system_info.h"
 #include "utils/http_client.h"
+#include "utils/http_server.h"
 #include "utils/log_facade.h"
 #include "utils/config_facade.h"
 #include "utils/net_addr.h"

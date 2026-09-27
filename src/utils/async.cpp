@@ -125,7 +125,7 @@ bool AsyncScheduler::cancel_task(std::uint64_t id)
 void AsyncScheduler::worker_loop()
 {
     for (;;) {
-        std::int64_t next_wake;
+        std::int64_t next_wake = -1;
         Task ready;
         bool has_ready = false;
 
