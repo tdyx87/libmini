@@ -57,7 +57,10 @@ jobs:
         if: matrix.os == 'windows-latest'
 
       - name: Install Conan
-        run: pip install "conan>=2.0"
+        # 先装带 cp313 wheel 的 PyYAML 下限：runner 到 pypi 偶发超时时 pip
+        # 可能回退到 PyYAML 5.4.1 源码构建，在 Python 3.13 上撞 Cython 兼容
+        # 炸弹（cython_sources AttributeError）。加大超时与重试抗网络抖动。
+        run: pip install --timeout 60 --retries 5 "pyyaml>=6.0.1" "conan>=2.0"
 
       - name: Configure Conan profile
         shell: bash

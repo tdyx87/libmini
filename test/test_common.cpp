@@ -511,15 +511,12 @@ TEST(RateLimiterTest, BurstThenThrottles)
     std::this_thread::sleep_for(std::chrono::milliseconds(120));
     EXPECT_TRUE(limiter.try_acquire());
 
-    // 补的速率有上限
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
-    // 轮询等 refill：CI 慢机上 50ms 固定等待可能未补令牌
-    double avail = limiter.available();
-    for (int i = 0; i < 100 && avail >= 3.0; ++i) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(20));
-        avail = limiter.available();
-    }
-    EXPECT_LT(avail, 3.0);   // 未到桶上限
+    // 补充速率有上限：清空桶后等足够久（20/s × 600ms 足补 12 个），
+    // 令牌应饱和在桶容量 3，而不是无界累积。确定性断言：慢机上补充
+    // 只会更多，饱和值不变，不再依赖轮询碰中间状态。
+    std::this_thread::sleep_for(std::chrono::milliseconds(600));
+    const double avail = limiter.available();
+    EXPECT_NEAR(avail, 3.0, 1e-6);   // 饱和在桶容量
 }
 
 TEST(RateLimiterTest, AcquireBlocksUntilTokenAvailable)

@@ -500,12 +500,31 @@ TEST(DirWatcherTest, ReportsCreateModifyRemove)
     // 触发：创建 → 修改 → 重命名 → 删除（分隔符走 path_join 跨平台）
     const std::string f1 = path_join(dir, "新建.txt");
     const std::string f2 = path_join(dir, "改名.txt");
+#ifndef _WIN32
+    constexpr bool is_posix_watcher = true;
+#else
+    constexpr bool is_posix_watcher = false;
+#endif
     ASSERT_TRUE(write_file(f1, "v1"));
     std::this_thread::sleep_for(std::chrono::milliseconds(120));
     ASSERT_TRUE(append_file(f1, "v2"));
     std::this_thread::sleep_for(std::chrono::milliseconds(120));
     ASSERT_TRUE(rename_path(f1, f2));
-    std::this_thread::sleep_for(std::chrono::milliseconds(120));
+    // POSIX 轮询靠一次完整扫描才能观察到 rename 状态；若下一个动作在
+    // 扫描落地前删除了文件，rename 状态将永久消失。等到事件到达再继续，
+    // 保证 remove 不会与 rename 落在同一个扫描窗口里（CI 慢机上必现）。
+    // Windows 的 ReadDirectoryChangesW 是事件驱动，不存在该窗口。
+    if (is_posix_watcher) {
+        bool seen = false;
+        for (int i = 0; i < 100 && !seen; ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(30));
+            std::lock_guard<std::mutex> lock(mu);
+            seen = events.count("\xE6\x94\xB9\xE5\x90\x8D.txt:C") > 0;
+        }
+        ASSERT_TRUE(seen);
+    } else {
+        std::this_thread::sleep_for(std::chrono::milliseconds(120));
+    }
     ASSERT_TRUE(remove_file(f2));
 
     // 等待事件到达（ReadDirectoryChangesW 有系统通知延迟；POSIX 轮询
