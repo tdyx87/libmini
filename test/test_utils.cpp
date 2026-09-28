@@ -329,13 +329,15 @@ TEST(StopwatchTest, PauseResumeRestart)
     std::this_thread::sleep_for(std::chrono::milliseconds(40));
     EXPECT_GE(sw.elapsed_ms(), first + 30);
 
+    // 清零验证走确定性路径：记下 restart 前的累计读数（≥ first+30 ≈ 90ms），
+    // restart 后立即暂停读数——读数只含几条指令的耗时，与累计值相差一个
+    // 量级以上。不依赖 sleep 的上界：慢机上过冲只会让累计值更大，断言自愈
+    // （旧写法睡 15ms 后断言 < first≈60ms，sleep 过冲越线即误报，macOS CI 实测 69 vs 61）
+    const std::int64_t acc = sw.elapsed_ms();
     sw.restart();
     EXPECT_TRUE(sw.is_running());
-    // 余量设计：Windows 定时器粒度 15.6ms，sleep_for 会向上取整，
-    // 第二段必须远小于 first（first ≈ 60ms + 取整）才不会在
-    // 高负载/取整叠加时与 first 打平（CI 实测 40 vs 40）
-    std::this_thread::sleep_for(std::chrono::milliseconds(15));
-    EXPECT_LT(sw.elapsed_ms(), first);  // 已清零重新计时
+    sw.pause();
+    EXPECT_LT(sw.elapsed_ms(), acc / 2);  // 已清零重新计时
 }
 
 // ------------------------------ scope_guard ------------------------------
