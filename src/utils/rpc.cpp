@@ -1864,7 +1864,7 @@ struct RpcClient::Impl
     }
 
     // 相等抖动：半固定 + 半随机，期望值仍是退避间隔
-    // actual = delay/2 + uniform_random[0, delay/2)
+    // actual = delay/2 + uniform_random[0, delay/2)  （半开区间，见 rpc.h 契约）
     int apply_jitter(int delay_ms)
     {
         if (!jitter_enabled || delay_ms <= 1) {
@@ -1872,7 +1872,9 @@ struct RpcClient::Impl
         }
         const int half = delay_ms / 2;
         std::lock_guard<std::mutex> lock(rng_mutex);
-        std::uniform_int_distribution<int> dist(0, half);
+        // half-1：uniform_int_distribution 两端均含，半开语义需排除上端点，
+        // 否则顶点值会越界到 delay（实测 CI 抓到 wait=400 > 上界 399）
+        std::uniform_int_distribution<int> dist(0, half - 1);
         return half + dist(rng);
     }
 
