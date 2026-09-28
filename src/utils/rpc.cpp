@@ -1949,8 +1949,6 @@ void RpcClient::set_async_workers(std::size_t workers)
     }
     impl->async_workers = workers;
 
-    impl->async_workers = workers;
-
     std::shared_ptr<RpcAsyncExecutor> old;
     {
         std::lock_guard<std::mutex> init_lock(impl->async_exec_mutex);
@@ -1962,10 +1960,17 @@ void RpcClient::set_async_workers(std::size_t workers)
     }
     if (t_current_async_executor == old.get()) {
         // 调用者就在待排水的旧池 worker 上（在回调里调用本接口）：
-        // 直接 wait_idle 会等「自己」这个任务返回，自锁死。转交独立的
-        // 退休线程异步排水，本调用立即返回；退休线程等在途（含本回调）
-        // 清零后再 join，不丢任务
-        std::thread([old] {}).detach();
+        // 直接 wait_idle 会等「自己」这个任务返回，自锁死。把执行器的
+        // 所有权整体移交给独立退休线程：在线程内排水后析构（join 全部
+        // worker）。不能用空 lambda 复制捕获——那样调用帧的 old 在本
+        // 函数返回时可能成为最后一个引用，执行器仍在 worker 线程上
+        // 析构，wait_idle 等自己，与不换池同样死锁（ubuntu-shared
+        // 实测踩中；其余平台只是竞态侥幸）。
+        std::thread([old]() mutable {
+            std::shared_ptr<RpcAsyncExecutor> retire = std::move(old);
+            retire->wait_idle();  // 等在途任务清零（含发起本调用的回调）
+            // retire 出作用域：执行器在本线程析构，停止并 join worker
+        }).detach();
         return;
     }
     old->wait_idle();  // 不持锁等待：见函数头注释
