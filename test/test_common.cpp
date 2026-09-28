@@ -399,14 +399,13 @@ TEST(AsyncSchedulerTest, RunAfterExecutesOnce)
     std::atomic<int> calls{0};
     sched.run_after_ms(30, [&calls] { ++calls; });
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    EXPECT_EQ(calls.load(), 0);   // 未到期不执行
-
-    // 轮询等执行：CI 慢机上固定 120ms 可能不够
-    bool done = false;
-    for (int i = 0; i < 250 && !done; ++i) {
+    // 轮询等执行：CI 慢机上固定 120ms 可能不够。不设「10ms 时未执行」
+    // 的中间断言——sleep_for 是下限，休眠过冲越过 30ms 截止点会误报
+    //（macOS 实测踩过）；「执行恰好一次」由 run_after 的一次性语义保证
+    bool ran = false;
+    for (int i = 0; i < 250 && !ran; ++i) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
-        done = calls.load() >= 1;
+        ran = calls.load() >= 1;
     }
     EXPECT_EQ(calls.load(), 1);   // 到期执行且只执行一次
     EXPECT_EQ(sched.pending_count(), 0u);
