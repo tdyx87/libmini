@@ -2186,7 +2186,11 @@ void run_pool_tests(libmini::RpcTransport transport,
     //    后到者必须等先到者归还（或等待超过请求超时报 pool busy）
     {
         libmini::RpcClient client(transport, endpoint);
-        client.set_timeout_ms(400);
+        // 预算余量：slow handler 300ms 在高负载 CI 上总耗时会 2-3 倍漂移，
+        // 400ms 预算下 fast 的池等待线被 slow 越过后双双失败（macOS 门禁
+        // 实测双双空返回）；900ms 给足余量，确定结局是「等待后双成功」，
+        // pool busy 分支仅作防御保留
+        client.set_timeout_ms(900);
         client.set_connection_pool_max(1);
         client.set_max_retries(0);
 
