@@ -237,6 +237,7 @@ struct DirWatcher::Impl
     bool subtree = true;
 #else
     // POSIX：轮询快照 diff。stop 靠 10ms 分片睡眠响应（无系统级唤醒原语）
+    bool subtree = true;
     std::map<std::string, SnapEntry> snapshot;
 
     static void diff_and_dispatch(const std::map<std::string, SnapEntry>& prev,
