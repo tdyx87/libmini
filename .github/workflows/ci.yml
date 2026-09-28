@@ -113,9 +113,16 @@ jobs:
 
       - name: CTest
         shell: bash
-        run: >
+        run: |
+          # Linux 上行缓冲测试进程 stdout：套件被 CTest 超时杀死时，
+          # 逐测试输出已实时落盘（gTest 默认全缓冲会全部丢失），
+          # 可直接从日志定位真正的慢点。macOS 无 stdbuf，跳过。
+          if command -v stdbuf >/dev/null 2>&1; then
+            CTEST_BIN="$(command -v ctest)"
+            ctest() { stdbuf -oL "$CTEST_BIN" "$@"; }
+          fi
           ctest --test-dir build --output-on-failure
-          --timeout 600
+          --timeout 1200
 
       - name: Install to prefix
         run: cmake --install build

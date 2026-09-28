@@ -506,7 +506,19 @@ TEST(DirWatcherTest, ReportsCreateModifyRemove)
     constexpr bool is_posix_watcher = false;
 #endif
     ASSERT_TRUE(write_file(f1, "v1"));
-    std::this_thread::sleep_for(std::chrono::milliseconds(120));
+    // POSIX 轮询的首次扫描落点不定：若 create 与 append 落在首次扫描前，
+    // 创建事件会被基线吸收（macOS 慢机实测踩过）。等创建事件到达后再继续。
+    if (is_posix_watcher) {
+        bool created_seen = false;
+        for (int i = 0; i < 100 && !created_seen; ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(30));
+            std::lock_guard<std::mutex> lock(mu);
+            created_seen = events.count("\xE6\x96\xB0\xE5\xBB\xBA.txt:C") > 0;
+        }
+        ASSERT_TRUE(created_seen);
+    } else {
+        std::this_thread::sleep_for(std::chrono::milliseconds(120));
+    }
     ASSERT_TRUE(append_file(f1, "v2"));
     std::this_thread::sleep_for(std::chrono::milliseconds(120));
     ASSERT_TRUE(rename_path(f1, f2));

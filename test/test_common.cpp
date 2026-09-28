@@ -402,7 +402,12 @@ TEST(AsyncSchedulerTest, RunAfterExecutesOnce)
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
     EXPECT_EQ(calls.load(), 0);   // 未到期不执行
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(120));
+    // 轮询等执行：CI 慢机上固定 120ms 可能不够
+    bool done = false;
+    for (int i = 0; i < 250 && !done; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        done = calls.load() >= 1;
+    }
     EXPECT_EQ(calls.load(), 1);   // 到期执行且只执行一次
     EXPECT_EQ(sched.pending_count(), 0u);
 }
@@ -438,7 +443,14 @@ TEST(AsyncSchedulerTest, PeriodicRunsAndStopsByReturnFalse)
         return calls.fetch_add(1) + 1 < 3;
     });
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+    // 轮询等 3 次自停（慢机上固定 250ms 可能跑不完 3 次；单 worker
+    // 串行执行，第 3 次回调返回 false 后不会再有第 4 次，计数稳定）
+    bool stopped = false;
+    for (int i = 0; i < 300 && !stopped; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        stopped = calls.load() >= 3;
+    }
+    ASSERT_GE(calls.load(), 3);
     EXPECT_EQ(calls.load(), 3);
     EXPECT_EQ(sched.pending_count(), 0u);  // 后续期次已被清理
 }
@@ -451,8 +463,13 @@ TEST(AsyncSchedulerTest, PeriodicCancelStopsFutureRuns)
     std::atomic<int> calls{0};
     TaskHandle h = sched.run_every_ms(30, [&calls] { return ++calls > 0; });
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    EXPECT_GE(calls.load(), 1);   // 已至少执行过一次
+    // 轮询等首次执行：慢机上固定 100ms 可能一次都跑不到
+    bool ran = false;
+    for (int i = 0; i < 250 && !ran; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        ran = calls.load() >= 1;
+    }
+    ASSERT_GE(calls.load(), 1);   // 已至少执行过一次
     EXPECT_TRUE(h.cancel());
     const int at_cancel = calls.load();
 
