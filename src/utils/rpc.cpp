@@ -682,6 +682,16 @@ struct RpcClient::Impl
 
         ~PooledConn()
         {
+            // 先解除读取线程的阻塞再关闭描述符：POSIX 上 close() 不保证
+            // 唤醒已阻塞在 fd 的 recv()（shutdown 才可以），顺序反了
+            // join() 会永久挂死（Linux/macOS 实测踩过）。Windows 的
+            // CancelIoEx 同样要求句柄仍有效。
+            if (session) {
+                session->request_close();
+                if (session->reader.joinable()) {
+                    session->reader.join();
+                }
+            }
 #ifdef _WIN32
             if (pipe != INVALID_HANDLE_VALUE) {
                 ::CloseHandle(pipe);
@@ -691,12 +701,6 @@ struct RpcClient::Impl
                 ::close(fd);
             }
 #endif
-            if (session) {
-                session->request_close();
-                if (session->reader.joinable()) {
-                    session->reader.join();
-                }
-            }
             if (tcp) {
                 tcp->close();
             }
@@ -2954,6 +2958,19 @@ struct RpcServer::Impl
             // 循环检查 stopping 后退出，并自行取消/清理挂起的管道实例
             if (local_stop_event) {
                 ::SetEvent(local_stop_event);
+            }
+#else
+            // 唤醒阻塞在 accept() 的接受循环：用哑连接触发 accept 返回。
+            // POSIX 上其他线程 close()/shutdown() listen fd 不保证唤醒
+            // 阻塞中的 accept（且对端 close 有悬垂描述符风险），哑连接是
+            // 跨 Unix 最可靠的方式：循环检查 stopping 后退出，listen fd
+            // 与 socket 文件由 worker 自行收尾关闭，双方无共享写竞争。
+            {
+                const int wake_fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+                if (wake_fd >= 0) {
+                    (void) uds_connect(wake_fd, endpoint, 200);
+                    ::close(wake_fd);
+                }
             }
 #endif
             if (worker.joinable()) {

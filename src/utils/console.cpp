@@ -25,6 +25,8 @@ struct ConsoleExit::Impl
 #ifdef _WIN32
 #else
     std::thread wait_thread;
+    std::atomic<bool> shutdown_requested{false};  // 析构开始，sigwait 唤醒后不再回调
+    std::atomic<bool> wait_thread_exited{false};  // sigwait 线程已自行退出（真实信号路径）
 #endif
 };
 // 控制处理器桥：持有属主指针，信号到达时置位并执行回调。
@@ -76,7 +78,11 @@ ConsoleExit::ConsoleExit()
                 break;
             }
         }
-        on_signal();
+        // 析构用 pthread_kill 唤醒时不再回调（对象正在销毁）
+        if (!impl_->shutdown_requested.load()) {
+            on_signal();
+        }
+        impl_->wait_thread_exited.store(true);
     });
 #endif
 }
@@ -89,13 +95,16 @@ ConsoleExit::~ConsoleExit()
         g_console_exit = nullptr;
     }
 #else
-    // 等待线程退出（不发信号则 detached 掉，避免析构挂死）
+    // 唤醒仍阻塞在 sigwait 的等待线程再 join：直接 join 会永久挂死
+    //（测试可直接调 on_signal()，不经 sigwait 线程）。向该线程投递一个
+    // 被阻塞的信号即可让 sigwait 返回；shutdown 标志保证它醒来后不再
+    // 触发回调。真实信号路径：线程已自行退出（exited 置位），直接 join。
+    impl_->shutdown_requested.store(true);
     if (impl_->wait_thread.joinable()) {
-        if (stop_requested_.load()) {
-            impl_->wait_thread.join();
-        } else {
-            impl_->wait_thread.detach();
+        if (!impl_->wait_thread_exited.load()) {
+            ::pthread_kill(impl_->wait_thread.native_handle(), SIGINT);
         }
+        impl_->wait_thread.join();
     }
 #endif
     delete impl_;
