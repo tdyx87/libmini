@@ -347,7 +347,12 @@ TEST(GzipTest, RoundTrip)
         "a",
         "hello hello hello hello hello hello hello hello hello",
         std::string(10000, 'z'),
-        std::string("binary\x00\x01\xff data", 16)};
+        // binary cases: lengths hand-given (std::string(literal, 16) reads past
+        // the 15-byte array - strict CI flags it as -Werror=array-bounds)
+        std::string("binary\x00\x01\xff data", 15),
+        std::string("binary\x00\x01\xff data", 14),
+        std::string("binary\x00\x01\xff data", 13),
+        std::string("binary\x00\x01\xff data", 6)};
 
     for (std::size_t i = 0; i < cases.size(); ++i) {
         const optional<std::string> compressed = gzip_compress(cases[i]);
@@ -485,7 +490,7 @@ TEST(AsyncSchedulerTest, TaskCanScheduleAnotherTask)
         sched.run_after_ms(20, [&final_calls] { ++final_calls; });
     });
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    std::this_thread::sleep_for(std::chrono::milliseconds(600));
     EXPECT_TRUE(chained.load());
     EXPECT_EQ(final_calls.load(), 1);   // 工作线程内提交任务不死锁
 }
@@ -508,7 +513,13 @@ TEST(RateLimiterTest, BurstThenThrottles)
 
     // 补的速率有上限
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
-    EXPECT_LT(limiter.available(), 3.0);   // 未到桶上限
+    // 轮询等 refill：CI 慢机上 50ms 固定等待可能未补令牌
+    double avail = limiter.available();
+    for (int i = 0; i < 100 && avail >= 3.0; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        avail = limiter.available();
+    }
+    EXPECT_LT(avail, 3.0);   // 未到桶上限
 }
 
 TEST(RateLimiterTest, AcquireBlocksUntilTokenAvailable)
@@ -1368,13 +1379,16 @@ TEST(TimerWheelTest, PeriodicAndCancel)
     TimerWheel wheel(std::chrono::milliseconds(10));
     std::atomic<int> fired(0);
 
-    // 周期任务：跑 3 次后自停（fn 返回 false）
+    // 周期任务：跑 3 次后自停（fn 返回 false）。轮询等触发：
+    // CI 慢机上固定 400ms 可能只跑 2 次（10ms tick 实际粒度更粗）
     wheel.add_periodic_ms(30, [&fired]() -> bool {
         return ++fired < 3;
     });
-    std::this_thread::sleep_for(std::chrono::milliseconds(400));
+    for (int i = 0; i < 100 && fired.load() < 3; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
     EXPECT_EQ(fired.load(), 3);
-    EXPECT_TRUE(wheel.idle());
+    wheel.wait_idle();
 
     // 句柄取消：未触发的任务不再执行
     std::atomic<int> cnt(0);

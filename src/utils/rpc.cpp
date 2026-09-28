@@ -3890,6 +3890,8 @@ struct RpcServer::Impl
         sockaddr_un addr;
         std::memset(&addr, 0, sizeof(addr));
         addr.sun_family = AF_UNIX;
+        // 拷入 socket 路径（截断安全：长度检查在下方，失败即报错返回）
+        std::strncpy(addr.sun_path, endpoint.c_str(), sizeof(addr.sun_path) - 1);
         if (endpoint.size() >= sizeof(addr.sun_path) ||
             ::bind(local_listen_fd,
                    reinterpret_cast<const sockaddr*>(&addr), sizeof(addr)) !=

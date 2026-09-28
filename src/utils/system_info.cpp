@@ -12,9 +12,18 @@
 // macOS 没有 sys/sysinfo.h，内存信息走 sysctl（hw.memsize）
 #include <climits>
 #include <cstdio>
+#include <libproc.h>
 #include <sys/statvfs.h>
 #include <sys/sysctl.h>
 #include <sys/types.h>
+#include <unistd.h>
+#elif defined(__FreeBSD__)
+#include <climits>
+#include <cstdio>
+#include <sys/statvfs.h>
+#include <sys/sysctl.h>
+#include <sys/types.h>
+#include <sys/user.h>
 #include <unistd.h>
 #else
 #include <climits>
@@ -64,11 +73,31 @@ std::string executable_path()
     return internal::wide_to_utf8(std::wstring(buf, n));
 #else
     char buf[4096];
+#if defined(__APPLE__) || defined(__FreeBSD__)
+    // macOS/BSD 无 /proc：走 proc_pidpath/sysctl KERN_PROCARGS；
+    // 通用兜底 procstat 在此不引入，保持零依赖
+#if defined(__APPLE__)
+    char path_buf[PATH_MAX];
+    if (proc_pidpath(::getpid(), path_buf, sizeof(path_buf)) <= 0) {
+        return std::string();
+    }
+    return std::string(path_buf);
+#else  // __FreeBSD__
+    const int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PATHNAME, -1};
+    std::size_t len = sizeof(buf) - 1;
+    if (::sysctl(const_cast<int*>(mib), 4, buf, &len, NULL, 0) != 0 ||
+        len == 0) {
+        return std::string();
+    }
+    return std::string(buf, len > 0 && buf[len - 1] == '\0' ? len - 1 : len);
+#endif
+#else
     const ssize_t n = ::readlink("/proc/self/exe", buf, sizeof(buf) - 1);
     if (n <= 0) {
         return std::string();
     }
     return std::string(buf, static_cast<std::size_t>(n));
+#endif
 #endif
 }
 

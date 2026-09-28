@@ -12,9 +12,73 @@
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
+#else
+#include <dirent.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 #endif
 
+#include <cstdint>
+#include <map>
+
 namespace libmini {
+
+#ifndef _WIN32
+namespace {
+
+// POSIX 轮询实现的快照条目
+struct SnapEntry
+{
+    bool is_dir = false;
+    std::int64_t mtime = 0;
+    std::int64_t size = 0;
+    std::int64_t inode = 0;
+};
+
+bool stat_path(const std::string& p, SnapEntry& e)
+{
+    struct stat st;
+    if (::stat(p.c_str(), &st) != 0) {
+        return false;
+    }
+    e.is_dir = S_ISDIR(st.st_mode) != 0;
+    e.mtime = static_cast<std::int64_t>(st.st_mtime);
+    e.size = static_cast<std::int64_t>(st.st_size);
+    e.inode = static_cast<std::int64_t>(st.st_ino);
+    return true;
+}
+
+// 递归扫描目录（deep=false 只扫顶层），rel 前缀为相对 base 的路径
+void scan_recursive(const std::string& base, const std::string& rel_prefix,
+                    bool deep, std::map<std::string, SnapEntry>& out)
+{
+    const std::string dir_path =
+        rel_prefix.empty() ? base : base + "/" + rel_prefix;
+    DIR* d = ::opendir(dir_path.c_str());
+    if (d == nullptr) {
+        return;
+    }
+    while (struct dirent* de = ::readdir(d)) {
+        const std::string name = de->d_name;
+        if (name == "." || name == "..") {
+            continue;
+        }
+        const std::string rel =
+            rel_prefix.empty() ? name : rel_prefix + "/" + name;
+        SnapEntry e;
+        if (!stat_path(base + "/" + rel, e)) {
+            continue;  // 竞态窗口内被删（或无权限），跳过
+        }
+        out[rel] = e;
+        if (e.is_dir && deep) {
+            scan_recursive(base, rel, deep, out);
+        }
+    }
+    ::closedir(d);
+}
+
+}  // namespace
+#endif
 
 struct DirWatcher::Impl
 {
@@ -171,6 +235,84 @@ struct DirWatcher::Impl
     }
 
     bool subtree = true;
+#else
+    // POSIX：轮询快照 diff。stop 靠 10ms 分片睡眠响应（无系统级唤醒原语）
+    std::map<std::string, SnapEntry> snapshot;
+
+    static void diff_and_dispatch(const std::map<std::string, SnapEntry>& prev,
+                                  const std::map<std::string, SnapEntry>& now,
+                                  const std::string& dir_copy,
+                                  const WatchCallback& cb)
+    {
+        if (!cb) {
+            return;
+        }
+        WatchNotification n;
+        n.dir = dir_copy;
+        n.is_dir = false;
+        for (std::map<std::string, SnapEntry>::const_iterator it = now.begin();
+             it != now.end(); ++it) {
+            std::map<std::string, SnapEntry>::const_iterator old =
+                prev.find(it->first);
+            if (old == prev.end()) {
+                n.event = WatchEvent::Created;
+                n.name = it->first;
+                n.is_dir = it->second.is_dir;
+                cb(n);
+            } else if (old->second.mtime != it->second.mtime ||
+                       old->second.size != it->second.size ||
+                       old->second.inode != it->second.inode) {
+                if (it->second.is_dir) {
+                    continue;  // 目录 mtime 随子项变化，不单独报告
+                }
+                n.event = WatchEvent::Modified;
+                n.name = it->first;
+                cb(n);
+            }
+        }
+        for (std::map<std::string, SnapEntry>::const_iterator it =
+                 prev.begin();
+             it != prev.end(); ++it) {
+            if (now.find(it->first) == now.end()) {
+                n.event = WatchEvent::Removed;
+                n.name = it->first;
+                n.is_dir = it->second.is_dir;
+                cb(n);
+            }
+        }
+    }
+
+    void posix_run_loop()
+    {
+        // 起始快照（启动前已存在的内容不报告）
+        scan_recursive(directory, "", subtree, snapshot);
+        for (;;) {
+            // 分片睡眠：响应 stop()（≤10ms）
+            for (int i = 0; i < 20; ++i) {
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    if (!running) {
+                        return;
+                    }
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+            std::map<std::string, SnapEntry> now;
+            scan_recursive(directory, "", subtree, now);
+            WatchCallback cb;
+            std::string dir_copy;
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                if (!running) {
+                    return;
+                }
+                cb = callback;
+                dir_copy = directory;
+            }
+            diff_and_dispatch(snapshot, now, dir_copy, cb);
+            snapshot.swap(now);
+        }
+    }
 #endif
 
     bool start_impl(const std::string& dir, bool watch_subtree)
@@ -180,9 +322,23 @@ struct DirWatcher::Impl
             return false;  // 已在运行；先 stop()
         }
 #ifndef _WIN32
-        (void)dir;
-        (void)watch_subtree;
-        return false;  // 非 Windows 平台暂无实现
+        if (dir.empty()) {
+            return false;
+        }
+        // 确认目录可打开（fail-fast，与 Windows CreateFileW 语义对齐）
+        {
+            DIR* probe = ::opendir(dir.c_str());
+            if (probe == nullptr) {
+                return false;
+            }
+            ::closedir(probe);
+        }
+        subtree = watch_subtree;
+        directory = dir;
+        running = true;
+        lock.unlock();
+        worker = std::thread([this]() { posix_run_loop(); });
+        return true;
 #else
         if (dir.empty()) {
             return false;

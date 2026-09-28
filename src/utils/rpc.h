@@ -10,15 +10,7 @@
 #include <vector>
 
 #include "libmini.h"
-#ifndef LIBMINI_STATIC
-#ifdef LIBMINI_EXPORTS
-#define LIBMINI_API __declspec(dllexport)
-#else
-#define LIBMINI_API __declspec(dllimport)
-#endif
-#else
-#define LIBMINI_API
-#endif
+#include "export.h"  // LIBMINI_API：平台相关的导出宏（勿在此内联定义）
 
 namespace spdlog {
 class logger;

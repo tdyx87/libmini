@@ -303,6 +303,10 @@ ProcessResult run_process(const std::string& program,
     result.exit_code = timed_out
                            ? -1
                            : (WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+    // exec 失败惯例退出码 127：映射为「启动失败」-1，跨平台语义一致
+    if (result.exit_code == 127) {
+        result.exit_code = -1;
+    }
     result.stdout_text = drain_fd(out_pipe[0]);
     result.stderr_text = drain_fd(err_pipe[0]);
     return result;
