@@ -1,0 +1,140 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write  # 上传 Release 产物必需
+
+jobs:
+  package:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: ubuntu-x64
+            os: ubuntu-latest
+            artifact_glob: 'libmini-*-Linux-x64.*'
+          - name: macos-arm64
+            os: macos-latest
+            artifact_glob: 'libmini-*-Darwin-arm64.*'
+          - name: windows-x64
+            os: windows-latest
+            # Windows runner 可能是 x64 或 arm64（CPACK 按处理器判定），
+            # 宽松匹配两种后缀
+            artifact_glob: 'libmini-*-Windows-*.*'
+
+    env:
+      PREFIX: ${{ github.workspace }}/smoke/prefix
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ilammy/msvc-dev-cmd@v1
+        if: matrix.os == 'windows-latest'
+
+      - name: Install Conan
+        # 与 ci.yml 同款加固：pypi 抖动时防 PyYAML 5.4.1 源码构建炸 Python 3.13
+        run: pip install --timeout 60 --retries 5 "pyyaml>=6.0.1" "conan>=2.0"
+
+      - name: Configure Conan profile
+        shell: bash
+        run: |
+          conan profile detect --force
+          p="$(conan profile path default)"
+          if ! grep -q '^compiler.cppstd=' "$p"; then
+            awk '/^\[settings\]$/{print; print "compiler.cppstd=14"; next} {print}' "$p" > "$p.tmp" && mv "$p.tmp" "$p"
+          fi
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            awk 'BEGIN{d=0} /^compiler\.runtime=/{print "compiler.runtime=static"; d=1; next} {print} END{if(!d) print "compiler.runtime=static"}' "$p" > "$p.tmp" && mv "$p.tmp" "$p"
+            printf '\n[conf]\ntools.cmake.cmaketoolchain:generator=Ninja\n' >> "$p"
+          fi
+          conan profile show
+
+      - name: Cache Conan packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.conan2/p
+          key: conan-${{ matrix.os }}-release-${{ hashFiles('conanfile.py') }}
+
+      - name: Install dependencies (Conan)
+        run: conan install . -of deps --build=missing -s build_type=Release
+
+      - name: Configure (CMake + Ninja)
+        shell: bash
+        run: >
+          cmake -S . -B build -G Ninja
+          -DCMAKE_TOOLCHAIN_FILE=deps/conan_toolchain.cmake
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_INSTALL_PREFIX="$PREFIX"
+          -DLIBMINI_BUILD_SWF_VIEWER=OFF
+          -DBUILD_TESTING=OFF
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Package (CPack)
+        shell: bash
+        run: |
+          cd build
+          cpack -G "ZIP;TGZ"
+          cd ..
+          ls -la build/libmini-*
+
+      - name: Smoke consumer (find_package + link + run)
+        shell: bash
+        # 发布前的最后验证：安装树可被下游 find_package 消费。
+        # 测试已在 CI 矩阵覆盖（同 commit 的 ci.yml 全绿是打 tag 的前提），
+        # 这里只装包 + 冒烟，不重复跑全套测试
+        run: |
+          ws="$GITHUB_WORKSPACE"
+          command -v cygpath >/dev/null 2>&1 && ws=$(cygpath -m "$ws")
+          cmake --install build
+          cmake -S ci/smoke_consumer -B smoke/build -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="$ws/deps/conan_toolchain.cmake" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_PREFIX_PATH="$ws/smoke/prefix"
+          cmake --build smoke/build --parallel
+          for dll in "$ws"/smoke/prefix/bin/*libmini*.dll; do
+            [ -f "$dll" ] && cp "$dll" smoke/build/
+          done
+          ./smoke/build/consumer
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: packages-${{ matrix.name }}
+          path: build/libmini-*
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish GitHub Release
+    needs: package
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all package artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: packages-*
+          merge-multiple: true
+          path: dist
+
+      - name: List dist
+        run: ls -la dist/
+
+      - name: Create GitHub Release and upload packages
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          generate_release_notes: true
+          files: dist/libmini-*
+          fail_on_unmatched_files: true
