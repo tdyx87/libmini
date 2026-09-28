@@ -2768,9 +2768,18 @@ struct RpcServer::Impl
     std::mutex active_pipes_mutex;
     std::set<HANDLE> active_pipes;
 #else
-    // 活跃 UDS 连接注册表：停机时 shutdown 所有连接解除 recv 阻塞
+    // 活跃 UDS 连接注册表：停机时 shutdown 所有连接解除 recv 阻塞；
+    // 同一份注册表也保存连接线程本身——线程随注册而动（insert 时入表、
+    // 连接结束时自除），停机 join 剩余线程，避免析构后访问 this
+    //（detached 线程访问已析构对象 = double free 崩溃，Linux 实测踩过）
+    struct UdsConnEntry
+    {
+        int fd = -1;
+        std::shared_ptr<std::atomic<bool>> done;  // 连接线程退出标志
+        std::thread th;
+    };
     std::mutex active_uds_mutex;
-    std::set<int> active_uds;
+    std::map<int, UdsConnEntry> active_uds;
 #endif
 
     // 可监控计数（全部由 stats_mutex 保护）
@@ -3543,6 +3552,36 @@ struct RpcServer::Impl
 #else
     int local_listen_fd = -1;
 
+    // 收割已完成的 UDS 连接：join 线程、关闭 fd、移出注册表。
+    // fd 的唯一关闭者是收割者（连接线程只置 done 标志），保证注册表
+    // 里的 fd 不会被新连接复用引发错杀。仅在 accept 循环线程与停机
+    // 路径调用，无并发收割。
+    std::size_t reap_finished_uds()
+    {
+        std::vector<UdsConnEntry> finished;
+        {
+            std::lock_guard<std::mutex> lock(active_uds_mutex);
+            for (auto it = active_uds.begin(); it != active_uds.end();) {
+                if (it->second.done &&
+                    it->second.done->load(std::memory_order_acquire)) {
+                    finished.push_back(std::move(it->second));
+                    it = active_uds.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
+        for (auto& e : finished) {
+            if (e.th.joinable()) {
+                e.th.join();
+            }
+            if (e.fd >= 0) {
+                ::close(e.fd);
+            }
+        }
+        return finished.size();
+    }
+
     void local_accept_loop()
     {
         while (!stopping.load(std::memory_order_relaxed)) {
@@ -3553,12 +3592,22 @@ struct RpcServer::Impl
                 }
                 break;  // listen fd 已关闭（停机）
             }
-            // 一连接一线程；读循环 + 派发（带 id 请求异步处理，与管道一致）
-            std::thread([this, fd]() {
-                {
-                    std::lock_guard<std::mutex> lock(active_uds_mutex);
-                    active_uds.insert(fd);
-                }
+            // 一连接一线程；读循环 + 派发（带 id 请求异步处理，与管道一致）。
+            // 线程注册进 active_uds，连接结束时自除——但「自除」前先自
+            // detach 不行：停机时可能正在遍历注册表 join。改为：线程结束
+            // 时不自除，仅从 fd 表转出到待收尾列表；停机路径统一 join。
+            // 常规路径（对象存活）由 bind_and_listen 尾部的收割循环回收。
+            std::shared_ptr<std::atomic<bool>> conn_done(
+                new std::atomic<bool>(false));
+            {
+                // 注册先行：停机广播 shutdown(fd) 从此覆盖该连接；线程
+                // 只置 done 标志，join/close/移表全部归收割者
+                std::lock_guard<std::mutex> lock(active_uds_mutex);
+                UdsConnEntry& e = active_uds[fd];
+                e.fd = fd;
+                e.done = conn_done;
+            }
+            std::thread conn_th([this, fd, conn_done]() {
                 std::mutex send_mutex;
                 auto send_one = [&](const std::string& payload) -> bool {
                     std::lock_guard<std::mutex> lock(send_mutex);
@@ -3602,12 +3651,15 @@ struct RpcServer::Impl
                         t.join();
                     }
                 }
-                {
-                    std::lock_guard<std::mutex> lock(active_uds_mutex);
-                    active_uds.erase(fd);
-                }
-                ::close(fd);
-            }).detach();
+                // 收尾三件事归收割者：join、close(fd)、移出注册表。
+                // 这里只置退出标志（fd 保持打开，防编号复用错杀）
+                conn_done->store(true, std::memory_order_release);
+            });
+            {
+                std::lock_guard<std::mutex> lock(active_uds_mutex);
+                active_uds[fd].th = std::move(conn_th);
+            }
+            reap_finished_uds();
         }
     }
 #endif
@@ -3944,15 +3996,30 @@ struct RpcServer::Impl
 
         local_accept_loop();
 
-        // 停机：解除所有活跃连接的 recv 阻塞（连接池常驻连接否则不会退出）
+        // 停机：先解除所有活跃连接的 recv 阻塞（连接池常驻连接否则不会
+        // 退出），再收割全部连接线程——join 必须发生在对象析构前，否则
+        // detached/未收的线程访问已析构的 this（double free 根因）
         {
-            std::set<int> snapshot;
+            std::vector<int> snapshot;
             {
                 std::lock_guard<std::mutex> lock(active_uds_mutex);
-                snapshot = active_uds;
+                snapshot.reserve(active_uds.size());
+                for (const auto& kv : active_uds) {
+                    snapshot.push_back(kv.first);
+                }
             }
             for (int fd : snapshot) {
                 ::shutdown(fd, SHUT_RDWR);
+            }
+            // 收割直至清空（连接线程 recv 返回后置 done 即可收）。
+            // done 标志置位后的连接线程不再访问 this，仅自旋等待，
+            // 轮询即可安全驱动；上限防异常路径死循环。
+            for (int i = 0; i < 6000 && !active_uds.empty(); ++i) {
+                reap_finished_uds();
+                if (!active_uds.empty()) {
+                    std::this_thread::sleep_for(
+                        std::chrono::milliseconds(10));
+                }
             }
         }
 
