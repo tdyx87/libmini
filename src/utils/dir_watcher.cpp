@@ -285,8 +285,7 @@ struct DirWatcher::Impl
 
     void posix_run_loop()
     {
-        // 起始快照（启动前已存在的内容不报告）
-        scan_recursive(directory, "", subtree, snapshot);
+        // 基线快照已由 start_impl 同步建立（启动前已存在的内容不报告）
         for (;;) {
             // 分片睡眠：响应 stop()（≤10ms）
             for (int i = 0; i < 20; ++i) {
@@ -333,10 +332,14 @@ struct DirWatcher::Impl
                 return false;
             }
             ::closedir(probe);
-        }
-        subtree = watch_subtree;
+        }        subtree = watch_subtree;
         directory = dir;
+        // 基线快照在 start() 返回前同步建立：此后发生的变更必然被报告。
+        // 若放到线程里异步建基线，start() 后立即写入的文件会被当作
+        // "启动前已存在"而漏报 Created（CI 上真实踩过）。
+        scan_recursive(directory, "", subtree, snapshot);
         running = true;
+
         lock.unlock();
         worker = std::thread([this]() { posix_run_loop(); });
         return true;

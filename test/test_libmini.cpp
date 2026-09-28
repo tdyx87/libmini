@@ -513,7 +513,12 @@ TEST(DirWatcherTest, ReportsCreateModifyRemove)
     for (int i = 0; i < 100; ++i) {
         std::lock_guard<std::mutex> lock(mu);
         const bool created = events.count("新建.txt:C") > 0;
+#ifdef _WIN32
         const bool renamed_new = events.count("改名.txt:N") > 0;
+#else
+        // POSIX 轮询把 rename 观察为「新名创建」，报告的是 Created 事件
+        const bool renamed_new = events.count("改名.txt:C") > 0;
+#endif
 #ifdef _WIN32
         const bool removed = events.count("改名.txt:R") > 0;
 #else
@@ -535,7 +540,11 @@ TEST(DirWatcherTest, ReportsCreateModifyRemove)
     EXPECT_GT(events["新建.txt:M"], 0);   // 修改
     EXPECT_GT(events["新建.txt:O"], 0);   // 重命名：旧名
 #endif
-    EXPECT_GT(events["改名.txt:N"], 0);   // 重命名：新名（POSIX 下为创建）
+#ifdef _WIN32
+    EXPECT_GT(events["改名.txt:N"], 0);   // 重命名：新名
+#else
+    EXPECT_GT(events["改名.txt:C"], 0);   // POSIX 轮询：rename 观察为创建
+#endif
     if (events["改名.txt:R"] > 0) {       // 删除（POSIX rename 已报 Removed 时不再有）
         EXPECT_GT(events["改名.txt:R"], 0);
     }
