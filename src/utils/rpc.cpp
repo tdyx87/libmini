@@ -4283,7 +4283,12 @@ bool RpcServer::is_running() const
         return impl_->tcp_server && impl_->tcp_server->is_running() &&
                !impl_->stopping.load();
     }
-    return impl_->http.is_running();
+    // HTTP：httplib 的 is_running 要等 accept 循环进入才置位，而
+    // wait_until_ready 等的 bind_ok 在 bind 完成即发布——两者之间存在窗口
+    // （CI 实测 AutoPortAssignment 偶发 false）。与 LocalPipe 分支统一为
+    // 「绑定成功且未停机」口径；异常退出场景由 http.is_running() 兜底
+    return (impl_->bind_ok && !impl_->stopping.load()) ||
+           impl_->http.is_running();
 }
 
 int RpcServer::port() const
