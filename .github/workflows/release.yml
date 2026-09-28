@@ -12,8 +12,19 @@ permissions:
   contents: write  # 上传 Release 产物必需
 
 jobs:
+  # 发布门禁：tag 指向的提交必须先过完整 CI（三平台 × Debug/shared/告警
+  # 严格 + CTest + 安装冒烟）。uses 调用引用同提交的工作流文件，验证的
+  # 代码与实际发布的严格一致；全绿才进入打包，避免发布未经验证的二进制。
+  # 被调方的 concurrency group 是 ci-<tag-ref>，与 main push 的
+  # ci-refs/heads/main 不同组，不会互相取消
+  ci-gate:
+    name: CI gate
+    uses: ./.github/workflows/ci.yml
+    # secrets: 不需要——依赖均来自公开 conan center
+
   package:
     name: ${{ matrix.name }}
+    needs: ci-gate
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -117,7 +128,7 @@ jobs:
 
   publish:
     name: Publish GitHub Release
-    needs: package
+    needs: [ci-gate, package]
     runs-on: ubuntu-latest
     steps:
       - name: Download all package artifacts
