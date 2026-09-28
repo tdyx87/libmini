@@ -121,8 +121,7 @@ jobs:
             CTEST_BIN="$(command -v ctest)"
             ctest() { stdbuf -oL "$CTEST_BIN" "$@"; }
           fi
-          ctest --test-dir build --output-on-failure
-          --timeout 1200
+          ctest --test-dir build --output-on-failure --timeout 1200
 
       - name: Install to prefix
         run: cmake --install build
