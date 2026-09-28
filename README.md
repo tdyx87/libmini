@@ -28,6 +28,10 @@ cmake --build --preset conan-debug
   Debug、Shared（DLL/SO 导出面）、warnings-strict（`-Wall -Wextra -Werror`），
   全部走 conan + Ninja 构建、CTest 全套、安装后 `find_package` 冒烟
   （`ci/smoke_consumer`）；push/PR 到 main 时自动运行
+- 发布：`.github/workflows/release.yml` —— tag 触发（`v*`），先以可复用
+  工作流门禁重跑同提交的完整 CI（全绿才打包）；三平台 CPack 产物
+  （ZIP/TGZ）逐包带 `.sha256` 并在 publish 阶段验证 artifact 传输完整性，
+  Release 页附 `SHA256SUMS` 总清单，下载后 `sha256sum -c SHA256SUMS` 一键核对
 - 编译器告警默认 `-Wall`/`-Wextra`（MSVC `/W4`）可见；
   `-DLIBMINI_WARNINGS_AS_ERRORS=ON` 升格为错误
 

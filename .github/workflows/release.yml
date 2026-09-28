@@ -96,8 +96,15 @@ jobs:
         run: |
           cd build
           cpack -G "ZIP;TGZ"
-          cd ..
-          ls -la build/libmini-*
+          # 源侧校验和：每包一个 .sha256（sha256sum 标准格式）。artifact 的
+          # path 通配 libmini-* 会一并带上海绵的 .sha256，供 publish 阶段
+          # 验证 artifact 传输完整性，消费者也可单独下载核对
+          for f in libmini-*.zip libmini-*.tar.gz; do
+            [ -f "$f" ] || continue
+            sha256sum "$f" > "$f.sha256"
+          done
+          ls -la libmini-*
+          cat libmini-*.sha256
 
       - name: Smoke consumer (find_package + link + run)
         shell: bash
@@ -138,8 +145,24 @@ jobs:
           merge-multiple: true
           path: dist
 
-      - name: List dist
-        run: ls -la dist/
+      - name: Verify package checksums (artifact transfer integrity)
+        # artifact 在 upload/download 间由 GitHub 中转，先逐包核对源侧
+        # 校验和：任何包损坏/缺失/被塞入多余文件都在发布前拦截
+        run: |
+          cd dist
+          ls -la
+          shopt -s nullglob
+          sums=(*.sha256)
+          [ ${#sums[@]} -ge 6 ] || { echo "expected >=6 checksum files, got ${#sums[@]}"; exit 1; }
+          sha256sum -c "${sums[@]}"
+          # 内部校验和使命完成，删除后生成发布总清单（文件名 + 哈希）
+          rm -f "${sums[@]}"
+          pkgs=(libmini-*)
+          [ ${#pkgs[@]} -ge 6 ] || { echo "expected >=6 packages, got ${#pkgs[@]}"; exit 1; }
+          sha256sum "${pkgs[@]}" > SHA256SUMS
+          # 自校验：确保总清单可完整验证全部产物
+          sha256sum -c SHA256SUMS
+          cat SHA256SUMS
 
       - name: Create GitHub Release and upload packages
         uses: softprops/action-gh-release@v2
@@ -147,5 +170,10 @@ jobs:
           tag_name: ${{ github.ref_name }}
           name: ${{ github.ref_name }}
           generate_release_notes: true
-          files: dist/libmini-*
+          # 显式列出上架物：三平台 ZIP/TGZ + 校验和总清单。SHA256SUMS
+          # 让消费者下载后可 sha256sum -c 核对完整性
+          files: |
+            dist/libmini-*.zip
+            dist/libmini-*.tar.gz
+            dist/SHA256SUMS
           fail_on_unmatched_files: true
