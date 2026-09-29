@@ -13,6 +13,8 @@ set(LIBMINI_SOURCES
     utils/json_utils.cpp
     utils/xml_utils.cpp
     utils/serialization.cpp
+    utils/msgpack.cpp
+    utils/proto_buf.cpp
     utils/rpc.cpp
     utils/uuid.cpp
     utils/crc.cpp

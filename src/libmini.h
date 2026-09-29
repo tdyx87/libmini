@@ -18,6 +18,8 @@
 #include "utils/json_utils.h"
 #include "utils/xml_utils.h"
 #include "utils/serialization.h"
+#include "utils/msgpack.h"
+#include "utils/proto_buf.h"
 #include "utils/rpc.h"
 #include "utils/uuid.h"
 #include "utils/crc.h"

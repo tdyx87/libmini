@@ -243,6 +243,56 @@ LIBMINI_DEMO(serialization)
     std::cout << "to_xml        : " << xml << "\n";
     std::cout << "from_xml      : "
               << deserialize_from_xml<DemoHost>(xml).port << "\n";
+
+    // -------- 二进制格式：MsgPack（nlohmann 内置）/ ProtoBuf（proto3 wire）--------
+    const std::string mp = serialize_to_msgpack(host);
+    const DemoHost mp_back = deserialize_from_msgpack<DemoHost>(mp);
+    std::cout << "msgpack       : " << mp.size() << " bytes, roundtrip "
+              << mp_back.name << ":" << mp_back.port << "\n";
+
+    // proto 字段号就是线上身份：这里约定 1=name, 2=port
+    JsonValue pmsg = JsonValue::object();
+    pmsg["1"] = host.name;
+    pmsg["2"] = host.port;
+    const std::string pb = json_to_proto(pmsg);
+    const JsonValue pback = proto_to_json(pb);
+    std::cout << "protobuf      : " << pb.size()
+              << " bytes, field#1 = " << pback["1"].get<std::string>()
+ << "\n";
+
+    // -------- 三格式体积对比（同一条记录）--------
+    std::cout << "size compare  : json=" << json.size() << "B  xml="
+              << xml.size() << "B  msgpack=" << mp.size() << "B  proto="
+              << pb.size() << "B\n";
+
+    // 编解码耗时粗测：2 万条记录编码，看三格式相对量级。
+    // 记录用字段号键（proto 嵌套 message 的键就是线上字段号，
+    // 约定 1=id, 2=score, 3=tag），三种格式编码同一棵树
+    JsonValue big = JsonValue::array();
+    for (int i = 0; i < 20000; ++i) {
+        JsonValue rec = JsonValue::object();
+        rec["1"] = i;
+        rec["2"] = i * 0.5;
+        rec["3"] = "record-";
+        big.push_back(rec);
+    }
+    // proto 顶层必须是 message：把数组挂在字段号 1 下
+    JsonValue big_msg = JsonValue::object();
+    big_msg["1"] = big;
+
+    Stopwatch sw;
+    const std::string big_json = to_json_string(big);
+    const double json_ms = static_cast<double>(sw.elapsed_ms());
+    sw.restart();
+    const std::string big_mp = json_to_msgpack(big);
+    const double mp_ms = static_cast<double>(sw.elapsed_ms());
+    sw.restart();
+    const std::string big_pb = json_to_proto(big_msg);
+    const double pb_ms = static_cast<double>(sw.elapsed_ms());
+    std::cout << "encode 20k    : json=" << json_ms << "ms ("
+              << big_json.size() << "B)  msgpack=" << mp_ms << "ms ("
+              << big_mp.size() << "B)  proto=" << pb_ms << "ms ("
+              << big_pb.size() << "B)\n";
 }
 
 LIBMINI_DEMO(ini_env)

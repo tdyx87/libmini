@@ -976,6 +976,225 @@ TEST(SerializationTest, XmlOrFallback)
     EXPECT_EQ(deserialize_from_xml_or<int>("<value></value>", -1), -1);
 }
 
+// ==================== MsgPack（nlohmann 内置编解码，字节级规范兼容）====================
+
+TEST(SerializationTest, MsgPackScalarRoundTrip)
+{
+    using namespace libmini;
+    const JsonValue v = JsonValue::object();
+    (void)v;
+
+    // 标量逐个往返
+    JsonValue obj = JsonValue::object();
+    obj["i"] = 150;
+    obj["neg"] = -7;
+    obj["b"] = true;
+    obj["d"] = 3.5;
+    obj["s"] = "msgpack \"hello\"";
+    obj["n"] = nullptr;
+    obj["u64"] = 18446744073709551615ULL;
+
+    const std::string bytes = json_to_msgpack(obj);
+    const JsonValue back = msgpack_to_json(bytes);
+    EXPECT_EQ(back["i"], 150);
+    EXPECT_EQ(back["neg"], -7);
+    EXPECT_EQ(back["b"], true);
+    EXPECT_DOUBLE_EQ(back["d"].get<double>(), 3.5);
+    EXPECT_EQ(back["s"], "msgpack \"hello\"");
+    EXPECT_TRUE(back["n"].is_null());
+    EXPECT_EQ(back["u64"], 18446744073709551615ULL);
+
+    // 类型化封装
+    EXPECT_EQ(deserialize_from_msgpack<int>(serialize_to_msgpack(42)), 42);
+    EXPECT_EQ(deserialize_from_msgpack<std::string>(
+                  serialize_to_msgpack(std::string("hi"))),
+              "hi");
+}
+
+TEST(SerializationTest, MsgPackContainerAndStruct)
+{
+    using namespace libmini;
+    // 复用 JSON 组的 Task 结构：能 JSON 序列化的类型 MsgPack 同样能
+    test_ns::Task task;
+    task.title = "write docs";
+    task.priority = 2;
+    task.done = false;
+    task.tags.push_back("doc");
+    task.tags.push_back("v2");
+
+    const std::string bytes = serialize_to_msgpack(task);
+    const test_ns::Task back =
+        deserialize_from_msgpack<test_ns::Task>(bytes);
+    EXPECT_EQ(back.title, "write docs");
+    EXPECT_EQ(back.priority, 2);
+    EXPECT_EQ(back.done, false);
+    ASSERT_EQ(back.tags.size(), 2u);
+    EXPECT_EQ(back.tags[1], "v2");
+
+    // map 容器
+    std::map<std::string, double> prices;
+    prices["apple"] = 1.5;
+    prices["pear"] = 2.0;
+    const std::map<std::string, double> got =
+        deserialize_from_msgpack<std::map<std::string, double> >(
+            serialize_to_msgpack(prices));
+    EXPECT_EQ(got.size(), 2u);
+    EXPECT_DOUBLE_EQ(got.at("pear"), 2.0);
+}
+
+TEST(SerializationTest, MsgPackBinaryPayload)
+{
+    using namespace libmini;
+    // nlohmann 的 binary 类型在 MsgPack 里走 bin 格式，往返保留
+    std::vector<std::uint8_t> raw;
+    raw.push_back(0x00);
+    raw.push_back(0x01);
+    raw.push_back(0xFF);
+    JsonValue v = JsonValue::binary(raw, 0);
+    EXPECT_TRUE(v.is_binary());
+
+    const std::string bytes = json_to_msgpack(v);
+    const JsonValue back = msgpack_to_json(bytes);
+    ASSERT_TRUE(back.is_binary());
+    const std::vector<std::uint8_t> got = back.get_binary();
+    ASSERT_EQ(got.size(), 3u);
+    EXPECT_EQ(got[2], 0xFF);
+}
+
+TEST(SerializationTest, MsgPackOrFallback)
+{
+    using namespace libmini;
+    // 非法字节流 / 类型不匹配 → fallback
+    EXPECT_EQ(deserialize_from_msgpack_or<int>("\\xff\\xff\\xff", -1), -1);
+    EXPECT_EQ(deserialize_from_msgpack_or<int>(serialize_to_msgpack("str"),
+                                               -1),
+              -1);
+}
+
+// ==================== ProtoBuf（proto3 wire format）====================
+
+TEST(SerializationTest, ProtoScalarRoundTrip)
+{
+    using namespace libmini;
+    JsonValue msg = JsonValue::object();
+    msg["1"] = 150;               // int → varint
+    msg["2"] = "testing";         // string → length-delimited
+    msg["3"] = 1.5;               // double → fixed64
+    msg["4"] = true;              // bool → varint 1
+    msg["5"] = JsonValue(nullptr);  // 空 message → 0 字节载荷
+
+    const std::string bytes = json_to_proto(msg);
+    const JsonValue back = proto_to_json(bytes);
+    EXPECT_EQ(back["1"], 150);
+    EXPECT_EQ(back["2"], "testing");
+    EXPECT_DOUBLE_EQ(back["3"].get<double>(), 1.5);
+    EXPECT_EQ(back["4"].get<int>(), 1);  // bool 读取端按 varint 数值
+    EXPECT_TRUE(back["5"].is_null());    // 空载荷按约定读回 null
+}
+
+TEST(SerializationTest, ProtoOfficialWireCompat)
+{
+    using namespace libmini;
+    // 官方文档标准示例：message { int32 a = 1; } 序列化为 08 96 01
+    const std::string official;
+    (void)official;
+    const char kOfficialBytes[] = "\x08\x96\x01";
+    const JsonValue back = proto_to_json(std::string(kOfficialBytes, 3));
+    EXPECT_EQ(back["1"], 150);
+
+    // 反向：同样内容编出的字节一致
+    JsonValue msg = JsonValue::object();
+    msg["1"] = 150;
+    const std::string bytes = json_to_proto(msg);
+    ASSERT_EQ(bytes.size(), 3u);
+    EXPECT_EQ(static_cast<unsigned char>(bytes[0]), 0x08);
+    EXPECT_EQ(static_cast<unsigned char>(bytes[1]), 0x96);
+    EXPECT_EQ(static_cast<unsigned char>(bytes[2]), 0x01);
+
+    // 负数 int32：proto3 以 64 位二补码 varint 编码（10 字节），
+    // 读取端无法区分 64 位大数，按无符号返回（与官方 C++ API 的
+    // uint64 视角一致）
+    JsonValue neg = JsonValue::object();
+    neg["1"] = -1;
+    const JsonValue back2 = proto_to_json(json_to_proto(neg));
+    EXPECT_TRUE(back2["1"].is_number_unsigned());
+    EXPECT_EQ(back2["1"], 18446744073709551615ULL);
+}
+
+TEST(SerializationTest, ProtoNestedAndRepeated)
+{
+    using namespace libmini;
+    JsonValue inner = JsonValue::object();
+    inner["1"] = "inner";
+
+    JsonValue msg = JsonValue::object();
+    msg["1"] = inner;                 // 嵌套 message
+    JsonValue arr = JsonValue::array();
+    arr.push_back("alpha");
+    arr.push_back("beta");
+    msg["2"] = arr;                   // repeated：同号重复出现
+
+    const JsonValue back = proto_to_json(json_to_proto(msg));
+    ASSERT_TRUE(back["1"].is_object());
+    EXPECT_EQ(back["1"]["1"], "inner");
+    ASSERT_TRUE(back["2"].is_array());
+    EXPECT_EQ(back["2"][0], "alpha");
+    EXPECT_EQ(back["2"][1], "beta");
+}
+
+TEST(SerializationTest, ProtoUnfoldPacked)
+{
+    using namespace libmini;
+    // 官方 packed repeated：field 5, wire 2, len 3, varint 1,2,3
+    // 手工组帧（写端数组走非 packed，packed 场景用 unfold_packed 读）
+    const char kPacked[] = "\x2A\x03\x01\x02\x03";
+    const JsonValue back = proto_to_json(std::string(kPacked, 5));
+    // 载荷 01 02 03 不是合法 message（字段号 0）→ 落为原始字符串
+    ASSERT_TRUE(back["5"].is_string());
+
+    JsonValue tree = back;
+    unfold_packed(tree, "5", ProtoWireType::Varint);
+    ASSERT_TRUE(tree["5"].is_array());
+    EXPECT_EQ(tree["5"][0], 1);
+    EXPECT_EQ(tree["5"][2], 3);
+
+    // 写端数组逐元素重复 tag；单元素数组读回是标量（无 schema 无法
+    // 区分 repeated 与单值），两个元素才往返为数组
+    JsonValue fmsg = JsonValue::object();
+    JsonValue farr = JsonValue::array();
+    farr.push_back(0.5);
+    farr.push_back(1.5);
+    fmsg["3"] = farr;
+    JsonValue ftree = proto_to_json(json_to_proto(fmsg));
+    ASSERT_TRUE(ftree["3"].is_array());
+    EXPECT_DOUBLE_EQ(ftree["3"][0].get<double>(), 0.5);
+    EXPECT_DOUBLE_EQ(ftree["3"][1].get<double>(), 1.5);
+}
+
+TEST(SerializationTest, ProtoOrFallbackAndErrors)
+{
+    using namespace libmini;
+    // wire type 7 非法 / 截断流 → fallback
+    const char kBadWire[] = "\x0F";  // field 1, wire 7
+    const JsonValue fallback = JsonValue::object();
+    EXPECT_TRUE(proto_to_json_or(std::string(kBadWire, 1), fallback)
+                    .is_object());
+    const char kTruncated[] = "\x0A\x05\x61";  // len 5 实际 1 字节
+    EXPECT_TRUE(proto_to_json_or(std::string(kTruncated, 3), fallback)
+                    .is_object());
+
+    // 非 message 顶层 / 非字段号键 → 抛 runtime_error
+    JsonValue scalar = JsonValue(42);
+    EXPECT_THROW(json_to_proto(scalar), std::runtime_error);
+    JsonValue badkey = JsonValue::object();
+    badkey["name"] = "x";
+    EXPECT_THROW(json_to_proto(badkey), std::runtime_error);
+
+    // 类型化封装 fallback
+    EXPECT_EQ(deserialize_from_proto_or<int>(std::string(kBadWire, 1), -1),
+              -1);
+}
+
 // ==================== HMAC（RFC 2104 / RFC 4231 / RFC 2202 向量）====================
 
 TEST(HmacTest, Sha256Rfc4231Vectors)

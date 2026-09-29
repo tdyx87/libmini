@@ -93,6 +93,8 @@ target_link_libraries(app PRIVATE libmini::libmini)
 | json_utils | `utils/json_utils.h` | 基于 nlohmann 的解析/序列化与转义 |
 | xml_utils | `utils/xml_utils.h` | 基于 pugixml 的 XML 解析/序列化 + SimpleXmlNode 轻量结构 |
 | serialization | `utils/serialization.h` | 基于 nlohmann 的通用 JSON 序列化 + XML 树映射序列化 |
+| msgpack | `utils/msgpack.h` | MsgPack 二进制序列化（nlohmann 内置编解码，规范全兼容）：JsonValue 树/类型化封装，与 JSON 同套类型支持 |
+| proto_buf | `utils/proto_buf.h` | ProtoBuf proto3 wire format 编解码（零依赖手写，与官方字节级兼容）：字段号键的 JsonValue 树、packed 展开工具 |
 | rpc | `utils/rpc.h` | JSON RPC（HTTP / Windows 命名管道 / POSIX UDS / 裸 TCP 帧四种传输，一套 API）：客户端连接池/重试/抖动/日志，服务端过载保护（立即拒绝或排队背压）/延迟分位/队列监控/spdlog 日志 |
 | uuid | `utils/uuid.h` | RFC 4122 v4 生成与解析 |
 | crc | `utils/crc.h` | CRC-32（zlib）/ CRC-16 Modbus / CRC-64 XZ / Adler-32，均支持增量计算 |
@@ -604,6 +606,31 @@ Host h4 = deserialize_from_xml_or<Host>("<broken", h); // 不抛版
 // std::string 特化：数字样文本（"0089"）往返不变形；
 // JSON↔XML 原始互转另见 json_to_xml()/xml_to_json()
 ```
+
+### 二进制序列化（MsgPack / ProtoBuf）
+
+```cpp
+// ---- MsgPack：能 JSON 序列化的类型全部可用，体积更小、编解码更快 ----
+std::string mp = serialize_to_msgpack(h);              // 复用上面的 Host
+Host h5 = deserialize_from_msgpack<Host>(mp);
+Host h6 = deserialize_from_msgpack_or<Host>("\xff", h); // 不抛版
+
+// ---- ProtoBuf（proto3 wire format，与官方实现字节级互操作）----
+// 对象 = message，键 = 十进制字段号（proto3 线上格式只认号不输名字）
+libmini::JsonValue msg;
+msg["1"] = 150;                       // varint（负数按 64 位二补码）
+msg["2"] = "testing";                 // length-delimited
+msg["3"] = 1.5;                       // fixed64
+double d = msg["3"].get<double>();
+std::string bytes = libmini::json_to_proto(msg);
+libmini::JsonValue back = libmini::proto_to_json(bytes);   // 嵌套 message 自动探测
+// packed repeated 数值字段（官方默认编码）需按 schema 显式展开：
+libmini::unfold_packed(back, "5", libmini::ProtoWireType::Varint);
+```
+
+选型提示：RPC params、对外接口用 JSON（可读、生态广）；本机/内网大载荷
+用 MsgPack（体积 -20%~50%、无需 schema）；与官方 protobuf 服务互操作或
+带宽敏感且字段稳定时用 proto_buf（最小体积，字段号即契约）。
 
 ### 命令行解析
 
