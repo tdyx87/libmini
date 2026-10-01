@@ -116,7 +116,7 @@ target_link_libraries(app PRIVATE libmini::libmini)
 | lru_cache | `utils/lru_cache.h` | 容量上限 LRU 缓存：get_or_compute（防击穿）、命中率统计、线程安全 |
 | base32 | `utils/base32.h` | RFC 4648 Base32 编解码（宽松/严格模式，容空白字符） |
 | console | `utils/console.h` | 控制台退出信号封装：Ctrl+C/Ctrl+Break/SIGTERM 触发回调 + stop_requested 轮询，前台与服务模式共用清理逻辑 |
-| tcp | `utils/tcp.h` | 裸 TCP 长连接：帧协议（免粘包）、心跳保活、大帧完整性、服务端多连接/广播，零第三方依赖 |
+| tcp | `utils/tcp.h` | 裸 TCP 长连接：帧协议（免粘包）、心跳保活（配置校验 validate）、大帧完整性、服务端多连接/广播，零第三方依赖 |
 | retry | `utils/retry.h` | poll_until 指数退避轮询（抖动防风暴、deadline 变体） |
 | object_pool | `utils/object_pool.h` | 线程安全对象池：RAII Lease 借出归还、工厂创建、归还重置钩子 |
 | zip | `utils/zip.h` | ZIP 包读写（zlib deflate/store，UTF-8 文件名，CRC 校验），零新增依赖 |
@@ -517,7 +517,8 @@ server.start("127.0.0.1", 9000);            // 端口 0 = 系统分配，用 por
 
 TcpConfig cfg;
 cfg.heartbeat_interval_ms = 30000;          // 空闲 30s 发 PING，服务端自动回 PONG
-cfg.heartbeat_timeout_ms = 90000;           // 超时无入站帧判死
+cfg.heartbeat_timeout_ms = 90000;           // 超时无入站帧判死（推荐 >= 3*interval）
+cfg.validate();                             // 显式校验；start/connect 也会自动拒绝非法配置
 TcpClient client(cfg);
 client.set_on_message([](const std::string& msg) { handle(msg); });
 client.connect("127.0.0.1", 9000);

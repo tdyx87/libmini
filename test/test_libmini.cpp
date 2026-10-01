@@ -1832,6 +1832,77 @@ TEST(TcpTest, DisconnectCallbackFires)
     server.stop();
 }
 
+TEST(TcpTest, ConfigValidateAcceptsDefaultsAndSaneHeartbeat)
+{
+    libmini::TcpConfig cfg;
+    EXPECT_TRUE(cfg.validate());   // 默认值合法
+
+    cfg.heartbeat_interval_ms = 1000;
+    cfg.heartbeat_timeout_ms = 0;  // 0 = interval*3 兕底，合法
+    EXPECT_TRUE(cfg.validate());
+
+    cfg.heartbeat_timeout_ms = 3000;   // 3x 推荐配比
+    EXPECT_TRUE(cfg.validate());
+
+    cfg.auto_reconnect = true;
+    EXPECT_TRUE(cfg.validate());
+}
+
+TEST(TcpTest, ConfigValidateRejectsInvalid)
+{
+    libmini::TcpConfig cfg;
+
+    cfg.connect_timeout_ms = -1;
+    EXPECT_FALSE(cfg.validate());
+    cfg.connect_timeout_ms = 5000;
+
+    cfg.max_frame_bytes = 0;
+    EXPECT_FALSE(cfg.validate());
+    cfg.max_frame_bytes = 1024;
+
+    // 判死阈值 <= PING 间隔：健康连接的正常心跳间隙就会被判死
+    cfg.heartbeat_interval_ms = 500;
+    cfg.heartbeat_timeout_ms = 400;
+    EXPECT_FALSE(cfg.validate());
+
+    // 负的心跳/退避毫秒值
+    cfg.heartbeat_interval_ms = -100;
+    cfg.heartbeat_timeout_ms = 0;
+    EXPECT_FALSE(cfg.validate());
+    cfg.heartbeat_interval_ms = 0;
+    cfg.reconnect_base_delay_ms = -1;
+    EXPECT_FALSE(cfg.validate());
+    cfg.reconnect_base_delay_ms = 200;
+
+    // 退避上限低于基数
+    cfg.auto_reconnect = true;
+    cfg.reconnect_max_delay_ms = 100;
+    EXPECT_FALSE(cfg.validate());
+}
+
+TEST(TcpTest, StartAndConnectRejectInvalidConfig)
+{
+    libmini::TcpConfig bad;
+    bad.heartbeat_interval_ms = 500;
+    bad.heartbeat_timeout_ms = 100;   // < interval，非法
+    ASSERT_FALSE(bad.validate());
+
+    libmini::TcpServer server(bad);
+    EXPECT_FALSE(server.start("127.0.0.1", 0));
+
+    libmini::TcpClient client(bad);
+    EXPECT_FALSE(client.connect("127.0.0.1", 1));
+
+    // 合法配置不受影响（同一对对象换回好配置后可正常工作）
+    libmini::TcpConfig good;
+    libmini::TcpServer server2(good);
+    ASSERT_TRUE(server2.start("127.0.0.1", 0));
+    libmini::TcpClient client2(good);
+    EXPECT_TRUE(client2.connect("127.0.0.1", server2.port()));
+    client2.close();
+    server2.stop();
+}
+
 TEST(TcpTest, HeartbeatDetectsDeadPeer)
 {
     libmini::TcpConfig cfg;

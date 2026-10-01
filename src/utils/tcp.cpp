@@ -1,4 +1,5 @@
 #include "tcp.h"
+#include "log_facade.h"
 #include "net_addr.h"
 #include "timer_wheel.h"
 
@@ -10,6 +11,8 @@
 #include <mutex>
 #include <thread>
 #include <vector>
+
+#include <spdlog/logger.h>
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -301,6 +304,44 @@ bool extract_frames(const TcpConfig& config, std::string& buffer,
 
 }  // namespace
 
+// ---------------- 配置校验 ----------------
+
+// TcpConfig::validate：非法项逐条经 LogFacade 记 warn（入库即留痕），
+// 任一命中返回 false。start/connect 会先调用本函数拒绝非法配置。
+bool TcpConfig::validate() const
+{
+    bool ok = true;
+    spdlog::logger* log = LogFacade::logger();
+
+    const auto warn = [&ok, log](bool bad, const char* what) {
+        if (bad) {
+            if (log) {
+                log->warn("tcp config invalid: {}", what);
+            }
+            ok = false;
+        }
+    };
+
+    warn(connect_timeout_ms < 0, "connect_timeout_ms < 0");
+    warn(max_frame_bytes <= 0, "max_frame_bytes must be positive");
+    warn(heartbeat_interval_ms < 0, "heartbeat_interval_ms < 0");
+    warn(heartbeat_timeout_ms < 0, "heartbeat_timeout_ms < 0");
+    warn(reconnect_base_delay_ms < 0, "reconnect_base_delay_ms < 0");
+    warn(reconnect_max_delay_ms < 0, "reconnect_max_delay_ms < 0");
+
+    // 判死阈值必须大于对端 PING 间隔：阈值 <= interval 时健康连接的
+    // 正常 PING 间隙就可能被判死（推荐 >= 3*interval，容忍丢包+抖动）。
+    // interval 开启而 timeout 为 0 时取 interval*3 兜底，不算非法
+    if (heartbeat_interval_ms > 0 && heartbeat_timeout_ms > 0 &&
+        heartbeat_timeout_ms <= heartbeat_interval_ms) {
+        warn(true, "heartbeat_timeout_ms must be > heartbeat_interval_ms "
+                   "(recommended >= 3x)");
+    }
+    warn(auto_reconnect && reconnect_max_delay_ms < reconnect_base_delay_ms,
+         "reconnect_max_delay_ms < reconnect_base_delay_ms");
+    return ok;
+}
+
 // ============================ 客户端 ============================
 
 struct TcpClient::Impl
@@ -566,6 +607,10 @@ bool TcpClient::connect_impl(const std::string& host, std::uint16_t port)
 {
     close();  // 重复 connect：停旧线程（若在跑，close 内部 join）
 
+    if (!impl_->config.validate()) {
+        return false;   // 非法配置（原因已经 LogFacade 记 warn）
+    }
+
     const std::uint32_t net_addr = resolve_ipv4(host);
     if (net_addr == 0) {
         return false;
@@ -788,6 +833,10 @@ TcpServer::~TcpServer()
 bool TcpServer::start(const std::string& host, std::uint16_t port)
 {
     stop();
+
+    if (!impl_->config.validate()) {
+        return false;   // 非法配置（原因已经 LogFacade 记 warn）
+    }
 
     SocketHandle l = ::socket(AF_INET, SOCK_STREAM, 0);
     if (l == kInvalidSocket) {

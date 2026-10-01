@@ -38,21 +38,42 @@ namespace libmini {
 //   - 回调里调用 server.stop() / client.close() 允许（延迟到回调返回后执行）。
 
 struct TcpConfig {
-    int connect_timeout_ms = 5000;      // 客户端 connect 超时
+    int connect_timeout_ms = 5000;      // 客户端 connect 超时（解析+握手总额）
     int max_frame_bytes = 16 * 1024 * 1024;  // 单帧载荷上限（防异常长度炸弹）
+
+    // 心跳（两端应使用相同配置）。
+    //   - heartbeat_interval_ms <= 0：心跳整体关闭（interval/timeout 均不生效）；
+    //   - 判死阈值 = heartbeat_timeout_ms > 0 ? 其值 : interval * 3；
+    //   - 推荐配比：timeout >= 3 * interval——容忍一个 PING 丢失 + 调度抖动，
+    //     再高只是拖延判死；timeout < interval 属配置错误（validate 拒绝）；
+    //   - 客户端 PING 节奏精确跟随 interval（等待上限自适应收窄），
+    //     interval 可低于 100ms；建议 >= 200ms，过低徒增小包开销。
     int heartbeat_interval_ms = 0;      // >0 启用心跳：空闲超间隔后自动发 PING
     int heartbeat_timeout_ms = 0;       // >0 且启用心跳：超过此值无任何入站帧判死
-                                        // （0 = 与 interval*3 取大）
-    bool auto_reconnect = false;        // 客户端断线自动重连（指数退避，
-                                        // TimerWheel 调度）
+                                        // （0 = interval*3；< interval 非法）
+
+    // 客户端断线自动重连：指数退避 base * 2^(n-1) 封顶 max，
+    // TimerWheel 调度；close() 视为主动关闭不触发
+    bool auto_reconnect = false;
     int reconnect_base_delay_ms = 200;  // 重连退避基数
     int reconnect_max_delay_ms = 5000;  // 重连退避上限
 
     // 会话超时管理实现（基准开关）：
     //   true  = TimerWheel 事件化（默认）：入站只更新原子时间戳，
     //           到期惰性复查；空闲连接零唤醒，CPU 不随连接数增长
-    //   false = 既有轮询：每会话线程 100ms 周期检查 last_inbound
+    //   false = 轮询：等待上限自适应——有心跳时收窄到判死截止/下一次
+    //           PING 应发时刻（空闲唤醒 ~1Hz），无心跳时 100ms 兜底
     bool wheel_liveness = true;
+
+    // 配置合法性校验。非法项逐条经 LogFacade 记 warn，任一命中返回 false：
+    //   - connect_timeout_ms / max_frame_bytes / 心跳与退避的各毫秒值 < 0；
+    //   - max_frame_bytes == 0；
+    //   - 心跳开启时 heartbeat_timeout_ms 落在 (0, interval) 区间
+    //     （判死阈值必须大于对端 PING 间隔，推荐 >= 3*interval）；
+    //   - reconnect_max_delay_ms < reconnect_base_delay_ms。
+    // TcpServer::start / TcpClient::connect 前会自动调用并拒绝非法配置，
+    // 组装配置后也可显式调用提前暴露问题。
+    bool validate() const;
 };
 
 // ---------------- 客户端 ----------------
