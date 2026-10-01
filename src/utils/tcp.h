@@ -37,7 +37,7 @@ namespace libmini {
 //   - send() 线程安全（帧级串行化）；
 //   - 回调里调用 server.stop() / client.close() 允许（延迟到回调返回后执行）。
 
-struct TcpConfig {
+struct LIBMINI_API TcpConfig {
     int connect_timeout_ms = 5000;      // 客户端 connect 超时（解析+握手总额）
     int max_frame_bytes = 16 * 1024 * 1024;  // 单帧载荷上限（防异常长度炸弹）
 
