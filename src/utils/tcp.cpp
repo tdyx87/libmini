@@ -406,8 +406,24 @@ void TcpClient::session_loop(std::uint64_t /*conn_id*/, std::intptr_t fd_handle)
         if (impl_->stop_requested.load()) {
             break;
         }
+        // 等待上限自适应：心跳开启时不得越过下一次 PING 应发时刻。
+        // 固定唤醒间隔（wheel 200ms / 轮询 100ms）会把 PING 节奏拖慢到
+        // 超过对端判死线——默认超时 interval*3 在 interval<100ms 时甚至
+        // 小于轮询间隔，健康连接必被误杀
+        int wait_ms = use_wheel ? 200 : 100;
+        if (hb_timeout > 0) {
+            const std::uint64_t interval = static_cast<std::uint64_t>(
+                impl_->config.heartbeat_interval_ms);
+            const std::uint64_t since_ping = steady_now_ms() - last_ping_ms;
+            if (since_ping < interval) {
+                wait_ms = static_cast<int>(std::min<std::uint64_t>(
+                    static_cast<std::uint64_t>(wait_ms), interval - since_ping));
+            } else {
+                wait_ms = 1;   // PING 已到期：立即醒来发送
+            }
+        }
         bool readable = false;
-        if (wait_readable(fd, use_wheel ? 200 : 100, readable) && readable) {
+        if (wait_readable(fd, wait_ms, readable) && readable) {
             const int n = static_cast<int>(::recv(fd, chunk, sizeof(chunk), 0));
             if (n <= 0) {
                 break;  // 对端关闭或连接错误
