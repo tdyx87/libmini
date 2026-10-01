@@ -409,17 +409,37 @@ void TcpClient::session_loop(std::uint64_t /*conn_id*/, std::intptr_t fd_handle)
         // 等待上限自适应：心跳开启时不得越过下一次 PING 应发时刻。
         // 固定唤醒间隔（wheel 200ms / 轮询 100ms）会把 PING 节奏拖慢到
         // 超过对端判死线——默认超时 interval*3 在 interval<100ms 时甚至
-        // 小于轮询间隔，健康连接必被误杀
+        // 小于轮询间隔，健康连接必被误杀。
+        // 轮询模式进一步把「入站判死检查」并入等待上限：空闲会话从
+        // 10Hz 轮询降到按心跳节奏唤醒（~1Hz），判死延迟不变；
+        // wheel 模式判死由轮任务负责，固定等待只兜底 stop 检查
         int wait_ms = use_wheel ? 200 : 100;
         if (hb_timeout > 0) {
             const std::uint64_t interval = static_cast<std::uint64_t>(
                 impl_->config.heartbeat_interval_ms);
-            const std::uint64_t since_ping = steady_now_ms() - last_ping_ms;
-            if (since_ping < interval) {
-                wait_ms = static_cast<int>(std::min<std::uint64_t>(
-                    static_cast<std::uint64_t>(wait_ms), interval - since_ping));
+            const std::uint64_t now = steady_now_ms();
+            if (!use_wheel) {
+                const std::uint64_t since_in = now - last_inbound;
+                if (since_in >= static_cast<std::uint64_t>(hb_timeout)) {
+                    break;  // 入站超时判死（原循环尾检查，前移到等待前）
+                }
+                std::uint64_t cap =
+                    static_cast<std::uint64_t>(hb_timeout) - since_in;
+                const std::uint64_t since_ping = now - last_ping_ms;
+                if (since_ping < interval) {
+                    cap = std::min<std::uint64_t>(cap, interval - since_ping);
+                } else {
+                    cap = 1;   // PING 已到期：立即醒来发送
+                }
+                wait_ms = static_cast<int>(cap);
             } else {
-                wait_ms = 1;   // PING 已到期：立即醒来发送
+                const std::uint64_t since_ping = now - last_ping_ms;
+                if (since_ping < interval) {
+                    wait_ms = static_cast<int>(std::min<std::uint64_t>(
+                        static_cast<std::uint64_t>(wait_ms), interval - since_ping));
+                } else {
+                    wait_ms = 1;   // PING 已到期：立即醒来发送
+                }
             }
         }
         bool readable = false;
@@ -456,13 +476,9 @@ void TcpClient::session_loop(std::uint64_t /*conn_id*/, std::intptr_t fd_handle)
                 // PING/PONG 客户端只用于保活，无业务动作
             }
         }        // 心跳：wheel 模式下超时判死由轮任务负责（shutdown 唤醒），
-        // 这里只负责周期发 PING；轮询模式维持原有完整逻辑
+        // 这里只负责周期发 PING；轮询模式的判死已前移到循环顶部
         if (hb_timeout > 0) {
             const std::uint64_t now = steady_now_ms();
-            if (!use_wheel &&
-                now - last_inbound > static_cast<std::uint64_t>(hb_timeout)) {
-                break;
-            }
             if (now - last_ping_ms >=
                 static_cast<std::uint64_t>(impl_->config.heartbeat_interval_ms)) {
                 const std::string ping = make_frame(kFramePing, "");
@@ -918,8 +934,23 @@ void TcpServer::session_loop(std::uint64_t conn_id, std::intptr_t fd_handle)
         if (!impl_->running.load()) {
             break;
         }
+        // 轮询模式等待上限自适应：有心跳时收窄到「入站超时判死截止」
+        //（即下一个对端 PING 应到时刻），空闲会话从 10Hz 降到 ~1Hz 唤醒，
+        // 判死延迟不变；无心跳时维持 100ms——stop() 回收会话线程靠
+        // shutdown 唤醒 + 该粒度兜底。超时判定合并到等待前，一处完成
+        int wait_ms = use_wheel ? 2000 : 100;
+        if (!use_wheel && hb_timeout > 0) {
+            const std::uint64_t now = steady_now_ms();
+            const std::uint64_t since_in = now - last_inbound;
+            if (since_in >= static_cast<std::uint64_t>(hb_timeout)) {
+                break;  // 心跳超时判死
+            }
+            wait_ms = static_cast<int>(std::min<std::uint64_t>(
+                static_cast<std::uint64_t>(wait_ms),
+                static_cast<std::uint64_t>(hb_timeout) - since_in));
+        }
         bool readable = false;
-        if (wait_readable(fd, use_wheel ? 2000 : 100, readable) && readable) {
+        if (wait_readable(fd, wait_ms, readable) && readable) {
             const int n = static_cast<int>(::recv(fd, chunk, sizeof(chunk), 0));
             if (n <= 0) {
                 break;
@@ -955,12 +986,8 @@ void TcpServer::session_loop(std::uint64_t conn_id, std::intptr_t fd_handle)
             }
         }
 
-        // 轮询模式判死；wheel 模式判死由轮任务 shutdown(fd) 触发（recv 返回
-        // ≤0 走上面的 break），这里不再需要时间检查
-        if (!use_wheel && hb_timeout > 0 &&
-            steady_now_ms() - last_inbound > static_cast<std::uint64_t>(hb_timeout)) {
-            break;  // 心跳超时判死
-        }
+        // wheel 模式判死由轮任务 shutdown(fd) 触发（recv 返回 ≤0 走上面的
+        // break）；轮询模式的超时判定已合并到循环顶部等待上限的计算处
     }
 
     // 收尾：摘除会话 + 断连回调（锁外执行）
