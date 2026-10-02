@@ -3016,8 +3016,32 @@ struct RpcServer::Impl
             // 不持 stats_mutex——派发线程完成时要拿它记统计
             drain_dispatch_workers(drain_timeout_ms);
         } else {
-            // HTTP：先停止监听（关闭 listen socket 使 WSAPoll 返回），
-            // 再 join accept 线程——顺序反了 join 会永远等不到循环退出
+            // HTTP：先确保 httplib 真正停止监听，再 join accept 线程。
+            //
+            // 0.28.0 的 Server::stop() 以 is_running_ 为闸门——它要等
+            // listen_after_bind() 进入 accept 循环才置位；而 bind_to_any_port
+            // 成功后我们即发布 bind_ok（wait_until_ready 放行）。若 stop 落在
+            // 这个窗口，stop() 是空操作，accept 循环随后照常进入并永远阻塞，
+            // 下面的 join 无界挂死（CI 三次套件级 1200s 超时均在此域）。
+            //
+            // 修法：轮询等待 is_running_ 就绪（有界 5s）后再 stop()，确保
+            // shutdown_socket/listen socket 真正发生；注意不能用 stopping
+            // 退出等待（进到这里时它已为 true），改用 bind 状态区分：
+            //   bind_done && bind_ok → 预期进入过 listen，等 is_running_
+            //   从未启动/绑定失败   → worker 已退出或即将退出，直接跳过
+            bool expect_listen = false;
+            {
+                std::lock_guard<std::mutex> lk(ready_mutex);
+                expect_listen = bind_done && bind_ok;
+            }
+            if (expect_listen) {
+                const auto wait_deadline = std::chrono::steady_clock::now() +
+                                           std::chrono::seconds(5);
+                while (!http.is_running() &&
+                       std::chrono::steady_clock::now() < wait_deadline) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                }
+            }
             http.stop();
             if (worker.joinable()) {
                 worker.join();
