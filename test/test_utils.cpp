@@ -304,7 +304,13 @@ TEST(StopwatchTest, MeasuresElapsed)
     EXPECT_LE(ms, 2000);
 
     EXPECT_GE(sw.elapsed_us(), ms * 1000);
-    EXPECT_GE(sw.elapsed_ns(), sw.elapsed_us() * 1000);
+    // 注意求值顺序：elapsed_ns() 与 elapsed_us() 各自独立取当前时钟，
+    // 若在同一断言里写 EXPECT_GE(elapsed_ns(), elapsed_us()*1000)，
+    // gtest 宏对两实参的求值顺序不确定——ns 先读、us 后读时，µs 截断值
+    // ×1000 可能反超 ns 读数（慢机上差几十纳秒即翻转）。固定顺序预读：
+    // 先 us 后 ns，后读时间恒 >= 前读，比较才确定成立。
+    const std::int64_t us = sw.elapsed_us();
+    EXPECT_GE(sw.elapsed_ns(), us * 1000);
     // 两次读取之间时间会前进，用宽松比较验证换算一致
     EXPECT_NEAR(sw.elapsed_seconds(), static_cast<double>(sw.elapsed_ns()) / 1e9,
                 1e-3);
