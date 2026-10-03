@@ -44,9 +44,10 @@ cmake --build --preset conan-debug
 可运行的完整示例见 `example/demo_libmini.cpp`（构建后为 `example`，即 `bin/Debug/example.exe`）：
 
 ```bat
-example --list               # 列出 18 个演示节
+example --list               # 列出 23 个演示节
 example                      # 全部运行
 example --only rpc,sqlite    # 只看指定节
+example --only hardware      # 硬件查看器（CPU/网卡/磁盘/卷/BIOS）
 ```
 
 演示覆盖全部模块，其中 RPC 节会本地起服务端并演示重试/过载保护回环，入口参数本身就是用 `Args` 解析的。
@@ -123,6 +124,7 @@ target_link_libraries(app PRIVATE libmini::libmini)
 | aes_gcm | `utils/aes_gcm.h` | AES-256-GCM 认证加密（Windows CNG / OpenSSL EVP），seal/open 落盘格式 |
 | sqlite | `utils/sqlite.h` | SQLite 封装：参数绑定（索引/命名）、事务 RAII、行遍历、带类型值读取，错误不抛异常 |
 | system_info | `utils/system_info.h` | 主机名/PID/可执行文件路径/CPU 数/物理内存/磁盘容量与剩余 |
+| hardware_info | `utils/hardware_info.h` | 硬件清单：CPU 型号与拓扑、网卡（MAC/IPv4/IPv6）、物理磁盘（型号/序列号/总线）、卷（盘符/文件系统/标识）、主板与 BIOS |
 | http_client | `utils/http_client.h` | HttpClient：GET/POST/PUT/DELETE/通用方法、query 编码拼装、默认头、超时、重定向；headers 键统一小写；status=0 表示传输层错误 |
 | http_server | `utils/http_server.h` | HttpServer：路径参数（`:name`）/query 解析、前置过滤器、fallback、访问日志钩子、请求体上限、apply_config（port/max_body_bytes） |
 | log_facade | `utils/log_facade.h` | LogFacade：一行初始化 spdlog（控制台+滚动文件、级别、格式、可选异步），运行期调级，幂等 init/shutdown |

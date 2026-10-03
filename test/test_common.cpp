@@ -820,6 +820,135 @@ TEST(SystemInfoTest, BasicQueriesAreSane)
     EXPECT_EQ(disk_total_bytes("no_such_dir_atomic_9x7/none"), 0u);
 }
 
+// ------------------------------ hardware_info ------------------------------
+//
+// 硬件清单跨平台差异极大（虚拟盘无序列号、DMI 需 root、容器里没有网卡…），
+// 因此测试只断言「结构上必然成立的性质」：非空列表的元素必须字段合法、
+// 格式可校验，不对具体机器的字段值做断言。
+
+TEST(HardwareInfoTest, FormatMacNormalizes)
+{
+    using namespace libmini;
+    EXPECT_EQ(format_mac("AA-BB-CC-DD-EE-FF"), "aa:bb:cc:dd:ee:ff");
+    EXPECT_EQ(format_mac("aabbccddeeff"), "aa:bb:cc:dd:ee:ff");
+    EXPECT_EQ(format_mac("AA:BB:CC:DD:EE:FF"), "aa:bb:cc:dd:ee:ff");
+    EXPECT_EQ(format_mac("aa bb cc dd ee ff"), "aa:bb:cc:dd:ee:ff");
+    // 非法输入原样返回（不猜测）
+    EXPECT_EQ(format_mac(""), "");
+    EXPECT_EQ(format_mac("not-a-mac"), "not-a-mac");
+    EXPECT_EQ(format_mac("aabbcc"), "aabbcc");
+    // 长度正确才规范化
+    EXPECT_NE(format_mac("aabbccddeeff"), "aabbccddeeff");
+}
+
+TEST(HardwareInfoTest, CpuInfoIsSane)
+{
+    using namespace libmini;
+    const CpuInfo cpu = cpu_info();
+    EXPECT_FALSE(cpu.empty()) << "任何真实机器都应能取到 CPU 信息";
+    EXPECT_GE(cpu.logical_cores, 1);
+    EXPECT_FALSE(cpu.architecture.empty());
+    EXPECT_NE(cpu.architecture, "unknown");
+    // 物理核数与超线程标记自洽
+    if (cpu.physical_cores > 0) {
+        EXPECT_GE(cpu.logical_cores, cpu.physical_cores);
+        if (cpu.logical_cores > cpu.physical_cores) {
+            EXPECT_TRUE(cpu.hyperthreading);
+        }
+    }
+    if (cpu.hyperthreading) {
+        EXPECT_GT(cpu.logical_cores, 0);
+    }
+    // 与 system_info 的核数口径一致（都是逻辑核）
+    EXPECT_EQ(cpu.logical_cores, cpu_count());
+}
+
+TEST(HardwareInfoTest, NetworkAdaptersAreWellFormed)
+{
+    using namespace libmini;
+    const std::vector<NetworkAdapterInfo> adapters = network_adapters();
+    ASSERT_FALSE(adapters.empty()) << "至少应有回环适配器";
+    std::size_t up_count = 0;
+    for (std::size_t i = 0; i < adapters.size(); ++i) {
+        const NetworkAdapterInfo& a = adapters[i];
+        EXPECT_FALSE(a.name.empty()) << "适配器必须有名字";
+        if (!a.mac_address.empty()) {
+            // 格式必须是 aa:bb:cc:dd:ee:ff
+            EXPECT_EQ(a.mac_address.size(), 17u);
+            EXPECT_EQ(a.mac_address[2], ':');
+            EXPECT_EQ(a.mac_address[8], ':');
+            EXPECT_EQ(a.mac_address[14], ':');
+            EXPECT_EQ(a.mac_error, "");
+        } else {
+            EXPECT_FALSE(a.mac_error.empty())
+                << "无 MAC 时必须说明原因：" << a.name;
+        }
+        for (std::size_t j = 0; j < a.ipv4_addresses.size(); ++j) {
+            // IPv4 字面量必须是点分四段、且不含冒号（不含 IPv6）
+            const std::string& ip = a.ipv4_addresses[j];
+            EXPECT_FALSE(ip.empty());
+            EXPECT_EQ(ip.find(':'), std::string::npos);
+            EXPECT_EQ(std::count(ip.begin(), ip.end(), '.'), 3);
+        }
+        if (a.is_up && !a.is_loopback) {
+            ++up_count;
+        }
+    }
+    // 便捷接口与列表一致：非空时必须是列表里某个适配器的值
+    const std::string mac = primary_mac_address();
+    if (!mac.empty()) {
+        bool found = false;
+        for (std::size_t i = 0; i < adapters.size(); ++i) {
+            if (adapters[i].mac_address == mac) {
+                found = true;
+            }
+        }
+        EXPECT_TRUE(found);
+    }
+}
+
+TEST(HardwareInfoTest, DisksAndVolumesAreWellFormed)
+{
+    using namespace libmini;
+    const std::vector<DiskInfo> ds = disks();
+    for (std::size_t i = 0; i < ds.size(); ++i) {
+        EXPECT_FALSE(ds[i].device_path.empty());
+        EXPECT_FALSE(ds[i].interface_type.empty());
+        if (!ds[i].serial_number.empty()) {
+            EXPECT_TRUE(ds[i].serial_error.empty())
+                << "拿到序列号就不该再有错误说明";
+        }
+    }
+
+    const std::vector<VolumeInfo> vs = volumes();
+    for (std::size_t i = 0; i < vs.size(); ++i) {
+        EXPECT_FALSE(vs[i].mount_point.empty());
+        EXPECT_GT(vs[i].total_bytes, 0u);
+        EXPECT_LE(vs[i].free_bytes, vs[i].total_bytes);
+    }
+    // 根卷必然存在（任何平台都挂载了 / 或 C:\）
+    bool has_root = false;
+    for (std::size_t i = 0; i < vs.size(); ++i) {
+        if (vs[i].mount_point == "/" || vs[i].mount_point == "C:") {
+            has_root = true;
+        }
+    }
+    EXPECT_TRUE(has_root) << "应至少列出一个根卷";
+}
+
+TEST(HardwareInfoTest, BiosInfoIsConsistent)
+{
+    using namespace libmini;
+    const BiosInfo bios = bios_info();
+    if (!bios.serial_number.empty()) {
+        EXPECT_TRUE(bios.serial_error.empty())
+            << "拿到序列号就不该再有错误说明";
+    } else if (!bios.empty()) {
+        EXPECT_FALSE(bios.serial_error.empty())
+            << "其他 BIOS 字段有值但序列号为空时，必须说明原因";
+    }
+}
+
 TEST(SystemInfoTest, ExecutablePathIsAbsolute)
 {
     using namespace libmini;

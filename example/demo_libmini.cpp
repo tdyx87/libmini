@@ -1552,6 +1552,116 @@ LIBMINI_DEMO(sysinfo_http_log)
     remove_tree("logs_demo");
 }
 
+LIBMINI_DEMO(hardware)
+{
+    // ---- CPU：型号/架构/核数/频率 ----
+    const CpuInfo cpu = cpu_info();
+    std::cout << "CPU            : " << (cpu.brand.empty() ? "(未知)" : cpu.brand)
+              << "\n";
+    std::cout << "  厂商/架构    : " << cpu.vendor << " / " << cpu.architecture
+              << "\n";
+    std::cout << "  物理/逻辑核  : ";
+    if (cpu.physical_cores > 0) {
+        std::cout << cpu.physical_cores << " / " << cpu.logical_cores;
+    } else {
+        std::cout << "(未知) / " << cpu.logical_cores;
+    }
+    std::cout << (cpu.hyperthreading ? "（超线程）" : "") << "\n";
+    if (cpu.max_frequency_mhz > 0) {
+        std::cout << "  标称频率     : " << cpu.max_frequency_mhz << " MHz\n";
+    }
+    if (!cpu.error.empty()) {
+        std::cout << "  型号不可读   : " << cpu.error << "\n";
+    }
+
+    // ---- 主板/BIOS ----
+    const BiosInfo bios = bios_info();
+    if (!bios.empty()) {
+        std::cout << "主板/BIOS      : " << bios.system_vendor << " "
+                  << bios.system_model << "\n";
+        std::cout << "  BIOS         : " << bios.bios_vendor << " "
+                  << bios.bios_version;
+        if (!bios.bios_release_date.empty()) {
+            std::cout << " (" << bios.bios_release_date << ")";
+        }
+        std::cout << "\n";
+        std::cout << "  序列号       : "
+                  << (bios.serial_number.empty() ? "(不可读)" : bios.serial_number)
+                  << "\n";
+        if (!bios.serial_error.empty()) {
+            std::cout << "                原因：" << bios.serial_error << "\n";
+        }
+    }
+
+    // ---- 网络适配器：MAC / IP ----
+    const std::vector<NetworkAdapterInfo> adapters = network_adapters();
+    std::cout << "网卡           : " << adapters.size() << " 个\n";
+    for (std::size_t i = 0; i < adapters.size(); ++i) {
+        const NetworkAdapterInfo& a = adapters[i];
+        std::cout << "  " << a.name << (a.is_up ? " [UP]" : " [down]")
+                  << (a.is_loopback ? " [回环]" : "") << "\n";
+        std::cout << "    MAC        : "
+                  << (a.mac_address.empty() ? "(无)" : a.mac_address);
+        if (!a.mac_error.empty()) {
+            std::cout << "  // " << a.mac_error;
+        }
+        std::cout << "\n";
+        for (std::size_t j = 0; j < a.ipv4_addresses.size(); ++j) {
+            std::cout << "    IPv4       : " << a.ipv4_addresses[j] << "\n";
+        }
+        for (std::size_t j = 0; j < a.ipv6_addresses.size(); ++j) {
+            std::cout << "    IPv6       : " << a.ipv6_addresses[j] << "\n";
+        }
+    }
+    std::cout << "  便捷接口     : primary MAC="
+              << (primary_mac_address().empty() ? "(无)"
+                                                : primary_mac_address())
+              << "  primary IPv4="
+              << (primary_ipv4_address().empty() ? "(无)"
+                                                 : primary_ipv4_address())
+              << "\n";
+
+    // ---- 物理磁盘：型号/序列号/总线/容量 ----
+    const std::vector<DiskInfo> ds = disks();
+    std::cout << "物理磁盘       : " << ds.size() << " 块\n";
+    for (std::size_t i = 0; i < ds.size(); ++i) {
+        std::cout << "  " << ds[i].device_path << "  " << ds[i].interface_type;
+        if (ds[i].size_bytes > 0) {
+            std::cout << "  "
+                      << format_bytes(static_cast<std::int64_t>(ds[i].size_bytes));
+        }
+        std::cout << "\n";
+        std::cout << "    型号       : "
+                  << (ds[i].model.empty() ? "(未提供)" : ds[i].model) << "\n";
+        std::cout << "    序列号     : "
+                  << (ds[i].serial_number.empty() ? "(不可读)"
+                                                  : ds[i].serial_number);
+        if (!ds[i].serial_error.empty()) {
+            std::cout << "  // " << ds[i].serial_error;
+        }
+        std::cout << "\n";
+    }
+
+    // ---- 卷：盘符/文件系统/标识/容量 ----
+    const std::vector<VolumeInfo> vs = volumes();
+    std::cout << "卷             : " << vs.size() << " 个\n";
+    for (std::size_t i = 0; i < vs.size(); ++i) {
+        std::cout << "  " << vs[i].mount_point << "  " << vs[i].filesystem;
+        if (!vs[i].label.empty()) {
+            std::cout << "  [" << vs[i].label << "]";
+        }
+        std::cout << "\n";
+        std::cout << "    标识       : "
+                  << (vs[i].serial_number.empty() ? "(不可读)"
+                                                  : vs[i].serial_number)
+                  << "  可用/总量 "
+                  << format_bytes(static_cast<std::int64_t>(vs[i].free_bytes))
+                  << " / "
+                  << format_bytes(static_cast<std::int64_t>(vs[i].total_bytes))
+                  << "\n";
+    }
+}
+
 LIBMINI_DEMO(http_server)
 {
     using namespace libmini;

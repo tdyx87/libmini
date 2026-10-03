@@ -33,6 +33,7 @@ set(LIBMINI_SOURCES
     utils/args.cpp
     utils/sqlite.cpp
     utils/system_info.cpp
+    utils/hardware_info.cpp
     utils/http_client.cpp
     utils/http_server.cpp
     utils/log_facade.cpp
@@ -114,7 +115,8 @@ target_link_libraries(libmini PUBLIC
 if(WIN32)
     # bcrypt：aes_gcm 的 CNG 实现（MSVC 由 pragma comment 自动链接，
     # MinGW 不支持该 pragma，需显式链接）
-    target_link_libraries(libmini PUBLIC ws2_32 bcrypt)
+    # iphlpapi：hardware_info 的 GetAdaptersAddresses（网卡/MAC/IP）
+    target_link_libraries(libmini PUBLIC ws2_32 bcrypt iphlpapi)
 else()
     # OpenSSL：aes_gcm 的 EVP 实现。CONFIG 优先（conan 的 CMakeDeps 只在
     # generators 目录生成 config 文件，FindOpenSSL 模块模式搜不到包体）；
