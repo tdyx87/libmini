@@ -2099,6 +2099,39 @@ libmini::RpcServer make_local_server()
 
 }  // namespace
 
+// --------------------- 启动/停机不变量：就绪即可服务 ---------------------
+//
+// 契约：wait_until_ready() 返回即意味着新连接可以建立并被处理——HTTP / Tcp /
+// LocalPipe 三种传输行为一致。这是「就绪状态只在内核层面已可服务之后发布」这条
+// 不变量的可执行表达（说明见 rpc.h）。若有人把就绪发布挪到 accept 循环之前，
+// 或更换 HTTP 实现后引入同类问题，本测试会先失败。
+//
+// 注意与上面四个停机形状的分工：那条不变量防的是「就绪发布过早」；而历史事故是
+// 「就绪发布早于 httplib 内部 is_running_，停机落在两者之间变空操作」——形状四用
+// 测试钩子确定性覆盖，本测试覆盖其可观测面。
+
+TEST(RpcTransportInvariantTest, ReadinessImpliesServable)
+{
+    {// HTTP：fixture 内部已完成 start_background + wait_until_ready
+        TestServer ts;
+        libmini::RpcClient c("127.0.0.1", ts.port());
+        EXPECT_EQ(c.call("add", R"({"a":2,"b":3})"), R"({"sum":5})")
+            << "HTTP：wait_until_ready 返回后首次调用必须成功";
+    }
+    {  // Tcp
+        libmini::RpcServer s = make_tcp_server();
+        libmini::RpcClient c(libmini::RpcTransport::Tcp, s.endpoint());
+        EXPECT_EQ(c.call("add", R"({"a":2,"b":3})"), R"({"sum":5})")
+            << "Tcp：wait_until_ready 返回后首次调用必须成功";
+    }
+    {  // LocalPipe
+        libmini::RpcServer s = make_local_server();
+        libmini::RpcClient c(libmini::RpcTransport::LocalPipe, s.endpoint());
+        EXPECT_EQ(c.call("add", R"({"a":2,"b":3})"), R"({"sum":5})")
+            << "LocalPipe：wait_until_ready 返回后首次调用必须成功";
+    }
+}
+
 TEST(RpcLocalTransportTest, RoundTripCall)
 {
     libmini::RpcServer server = make_local_server();
