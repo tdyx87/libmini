@@ -737,8 +737,13 @@ std::vector<NetworkAdapterInfo> network_adapters()
                     sockaddr_dl* sdl =
                         reinterpret_cast<sockaddr_dl*>(ifa->ifa_addr);
                     if (sdl->sdl_alen > 0 && sdl->sdl_alen <= 32) {
-                        out[i].mac_address = format_mac(
-                            hex_bytes(LL_ADDR(sdl), sdl->sdl_alen));
+                        // 不用 LL_ADDR 宏：新版 SDK 并非所有平台都导出它，
+                        // 直接按定义取地址（= sdl_data + sdl_nlen）
+                        const unsigned char* addr =
+                            reinterpret_cast<const unsigned char*>(
+                                sdl->sdl_data + sdl->sdl_nlen);
+                        out[i].mac_address =
+                            format_mac(hex_bytes(addr, sdl->sdl_alen));
                     }
                 }
 #else
