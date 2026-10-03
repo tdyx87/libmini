@@ -28,14 +28,19 @@
 #include <ifaddrs.h>
 #include <net/if.h>
 #include <netinet/in.h>
+#include <sys/socket.h>
 #include <sys/statvfs.h>
 #include <sys/types.h>
 #include <unistd.h>
 #include <climits>
 #include <cstdlib>
+#if defined(__linux__)
+#include <netpacket/packet.h>  // sockaddr_ll / AF_PACKET（Linux 取 MAC）
+#endif
 #endif
 
 #ifdef __APPLE__
+#include <net/if_dl.h>   // sockaddr_dl / LL_ADDR（AF_LINK 取 MAC）
 #include <sys/mount.h>
 #include <sys/sysctl.h>
 #include <nlohmann/json.hpp>
@@ -73,26 +78,15 @@ std::string hex_bytes(const unsigned char* data, std::size_t len)
     return out;
 }
 
-#if !defined(_WIN32)
+#if defined(__APPLE__)
+// 仅 macOS 分支使用的辅助函数
+
 std::string lower(std::string s)
 {
     std::transform(s.begin(), s.end(), s.begin(), [](char ch) {
         return static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
     });
     return s;
-}
-
-// 读整个文本文件；不存在/无权限返回 false
-bool read_file(const std::string& path, std::string& out)
-{
-    std::ifstream in(path.c_str(), std::ios::binary);
-    if (!in) {
-        return false;
-    }
-    std::ostringstream ss;
-    ss << in.rdbuf();
-    out = ss.str();
-    return true;
 }
 
 // 从 "Capacity" 之类的文本解析字节数："1 TB" / "512 GB" / "8000 MB"。
@@ -129,7 +123,24 @@ std::uint64_t parse_capacity_text(const std::string& text)
     }
     return value * scale;
 }
-#endif  // !_WIN32（下面两个辅助函数仅 POSIX 分支使用）
+#endif  // __APPLE__
+
+#if defined(__linux__)
+// 仅 Linux 分支使用的辅助函数
+
+// 读整个文本文件；不存在/无权限返回 false
+bool read_file(const std::string& path, std::string& out)
+{
+    std::ifstream in(path.c_str(), std::ios::binary);
+    if (!in) {
+        return false;
+    }
+    std::ostringstream ss;
+    ss << in.rdbuf();
+    out = ss.str();
+    return true;
+}
+#endif  // __linux__
 
 const char* architecture_name()
 {
@@ -663,7 +674,6 @@ std::vector<NetworkAdapterInfo> network_adapters()
     // Linux / macOS：getifaddrs 两遍扫描——第一遍收 IP 与 flags，第二遍收 MAC
     struct ifaddrs* ifs = nullptr;
     if (::getifaddrs(&ifs) == 0) {
-        std::vector<std::size_t> order;  // 保持首次出现顺序
         for (struct ifaddrs* ifa = ifs; ifa != nullptr; ifa = ifa->ifa_next) {
             if (ifa->ifa_name == nullptr || ifa->ifa_addr == nullptr) {
                 continue;
