@@ -489,7 +489,7 @@ public:
     // 请求耗时分布快照（线程安全，可在运行中随时调用）。
     // 仅统计成功进入处理阶段的请求；服务器重启（重新 run/start_background）后清零。
     // filter 指定传输过滤：All = 全部合计（默认），Http/Tcp/Local = 只统计
-// 该传输处理的请求（与 stats() 的分列口径一致）。指定传输无样本时
+    // 该传输处理的请求（与 stats() 的分列口径一致）。指定传输无样本时
     // sample_count 为 0、各分位为 -1
     RpcLatencyStats latency_stats(
         const std::vector<double>& extra_percentiles
@@ -502,6 +502,22 @@ public:
     // 满足：completed_total = http.completed + tcp.completed + local.completed
     //       + malformed.completed（rejected 同理）
     RpcServerStats stats() const;
+
+    // ------------------ 测试钩子（生产路径零开销） ------------------
+    //
+    // 仅供测试与问题诊断使用。HTTP 传输在 bind 成功、就绪状态已发布之后、进入
+    // accept 循环之前注入一段固定延迟，用来确定性复现「stop() 落在启动窗口」
+    // 的竞态：httplib 0.28.0 的 Server::stop() 以 is_running_ 为闸门，而
+    // is_running_ 要到 accept 循环进入才置位。该窗口本身只有微秒级，真实机器
+    // 上只能靠负载偶发命中（历史上 CI 套件级挂死三次），无法稳定回归。
+    //
+    // 用法：RpcServer::set_test_bind_delay_ms(50) 后走一次 start→stop 即落在
+    // 窗口内；传 0 关闭（默认值，也是生产常态）。上限 5000ms，超出按 5000
+    // 处理，避免误设把进程长时间挂住。进程级全局（所有实例共享），仅启动
+    // 路径读取一次。
+    //
+    // 业务代码不要使用：它拖慢启动并掩盖真实启动时序。
+    static void set_test_bind_delay_ms(int ms);
 
 private:
     struct Impl;

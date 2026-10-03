@@ -56,6 +56,16 @@ namespace libmini {
 
 namespace {
 
+// ==================== 测试钩子 ====================
+
+// HTTP 传输在 bind 就绪发布之后、进入 accept 循环之前注入的延迟（毫秒）。
+// 默认 0 = 关闭（生产常态），仅测试/诊断通过
+// RpcServer::set_test_bind_delay_ms 设置。详见 rpc.h 的说明。
+std::atomic<int> g_test_bind_delay_ms{0};
+
+// 上限：避免误设把进程长时间挂住
+constexpr int kMaxTestBindDelayMs = 5000;
+
 // ==================== 传输端点识别 ====================
 
 // 端点是否为本地传输：Windows 管道前缀或 UDS 路径（'/' 开头）
@@ -3170,6 +3180,14 @@ struct RpcServer::Impl
         if (bound < 0) {
             return false;
         }
+        // 测试钩子：把「bind 就绪已发布 → accept 循环进入」这段窗口拉宽，
+        // 让 stop() 落在窗口内的场景可被测试确定性命中。默认 0 时仅一次
+        // 原子读，无实际开销。
+        const int hook_delay_ms =
+            g_test_bind_delay_ms.load(std::memory_order_relaxed);
+        if (hook_delay_ms > 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(hook_delay_ms));
+        }
         return http.listen_after_bind();
     }
 
@@ -4259,6 +4277,13 @@ RpcLatencyStats RpcServer::latency_stats(
     const std::vector<double>& extra_percentiles, RpcTransportFilter filter) const
 {
     return impl_->latency_stats(extra_percentiles, filter);
+}
+
+void RpcServer::set_test_bind_delay_ms(int ms)
+{
+    const int clamped =
+        ms < 0 ? 0 : (ms > kMaxTestBindDelayMs ? kMaxTestBindDelayMs : ms);
+    g_test_bind_delay_ms.store(clamped, std::memory_order_relaxed);
 }
 
 void RpcServer::run()

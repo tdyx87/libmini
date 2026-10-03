@@ -648,6 +648,148 @@ TEST(RpcServerTest, RestartAfterStop)
     EXPECT_EQ(reply, "1");
 }
 
+// --------------------------- 停机压力回归 ---------------------------
+//
+// 历史背景：httplib 0.28.0 的 Server::stop() 以 is_running_ 为闸门，而is_running_
+// 要到 listen_after_bind() 进入 accept 循环才置位。若 stop() 落在「bind_to_any_port
+// 返回」与「accept 循环启动」之间的窗口，它不会关闭任何 socket；accept 循环随后
+// 照常进入并永久阻塞，worker.join() 挂死——CI 上 StopIsIdempotent 曾三次这样吃掉
+// 整个 rpc_test 套件的 1200s 预算。RpcServer::shutdown() 已加「等 is_running_ 置位
+// 后再 stop」的修复。
+//
+// 下面四个形状分工明确，不要混淆：
+//   形状一/二/三——金丝雀。广泛覆盖三个停机窗口（bind 后 / 有连接后 / bind 中），
+//     便宜（合计 ~60ms）。但必须说清楚：它们抓不住上面那个微秒级竞态——已实测，
+//     把修复去掉后它们在本机仍全绿；那类竞态只能靠负载偶发命中。
+//   形状四——真正的回归防线。用测试钩子拉宽窗口，确定性命中（已实测：去掉修复后
+//     稳定失败并给出诊断）。
+//
+// 断言方式刻意不用「让套件撞超时被杀」：那种失败拿不到任何诊断信息（历史上就是
+// 只能看到 1200s 超时）。这里用有界等待把挂死变成一条带原因的失败断言；超时未完成
+// 时工作线程会泄漏，但不影响进程正常退出与后续测试运行。
+
+namespace {
+
+// 在独立线程里跑 stress()，最多等 budget；返回是否按时完成。
+// promise 由 shared_ptr 持有——超时返回后工作线程仍可能稍后 set_value，
+// 不能让它碰到已销毁的 promise。
+template <typename F>
+bool run_within_budget(F stress, std::chrono::milliseconds budget, const char* what)
+{
+    auto finished = std::make_shared<std::promise<void>>();
+    std::thread worker([stress, finished] {
+        stress();
+        finished->set_value();
+    });
+    worker.detach();
+
+    std::future<void> fut = finished->get_future();
+    const bool ok = fut.wait_for(budget) == std::future_status::ready;
+    EXPECT_TRUE(ok) << what;
+    return ok;
+}
+
+}  // namespace
+
+// 形状一（金丝雀）：构造后立即停机——wait_until_ready 只等 bind 完成，位置最接近
+// 竞态窗口。40 轮里真实机器上可能一轮都不落进窗口（实测如此），它的价值在于广泛
+// 压测停机收敛性，而非证明该竞态已修。
+TEST(RpcServerTest, StartStopStressImmediateStop)
+{
+    const int kIterations = 40;
+
+    const bool ok = run_within_budget(
+        [kIterations] {
+            for (int i = 0; i < kIterations; ++i) {
+                TestServer ts;
+                ts.server().stop();  // 不发任何请求，直接停机
+            }
+        },
+        std::chrono::seconds(60),
+        "40 轮「构造后立即 stop」未在 60s 内完成：http.stop() 可能又落回 "
+        "bind/accept 竞态窗口（worker.join 永久阻塞）");
+
+    if (!ok) return;
+    // 循环能整体跑完即说明每轮都正常收敛；再补一次独立停机确认端口已释放
+    TestServer ts;
+    ts.server().stop();
+    EXPECT_FALSE(ts.server().is_running());
+}
+
+// 形状二（金丝雀）：先发一次请求再立即停机——覆盖「有连接建立过」的停机路径，
+// 验证连接池/keep-alive 场景下的停机同样不会挂。
+TEST(RpcServerTest, StartStopStressWithTraffic)
+{
+    const int kIterations = 10;
+
+    run_within_budget(
+        [kIterations] {
+            for (int i = 0; i < kIterations; ++i) {
+                TestServer ts;
+                libmini::RpcClient client("127.0.0.1", ts.port());
+                client.call("echo", "ping");  // 只为建立连接，不在子线程里做断言
+                ts.server().stop();
+            }
+        },
+        std::chrono::seconds(60),
+        "10 轮「请求后立即 stop」未在 60s 内完成：停机路径挂死");
+}
+
+// 形状三（金丝雀）：不等 ready 就停机——stop 落在 bind 尚未完成的窗口里，
+// 与形状一（bind 完成、accept 未就绪）互补，两个启动期窗口都要有防线。
+TEST(RpcServerTest, StartStopDuringBind)
+{
+    const int kIterations = 50;
+
+    const bool ok = run_within_budget(
+        [kIterations] {
+            for (int i = 0; i < kIterations; ++i) {
+                libmini::RpcServer s(0);
+                s.register_method("echo",
+                                  [](const std::string& p) { return p; });
+                s.start_background();
+                s.stop();  // 不等 wait_until_ready，stop 可能落在 bind 中途
+            }
+        },
+        std::chrono::seconds(60),
+        "50 轮「不等 ready 直接 stop」未在 60s 内完成：启动期停机路径挂死");
+
+    if (!ok) return;
+    libmini::RpcServer s(0);
+    s.start_background();
+    s.stop();
+    EXPECT_FALSE(s.is_running());
+}
+
+// 形状四（确定性）：用测试钩子把「bind 就绪已发布 → accept 循环进入」的窗口
+// 拉宽到 50ms，让 stop() 必然落在窗口内。修复前 http.stop() 是空操作，accept
+// 循环随后永久阻塞、join 挂死；修复后 shutdown() 会等 is_running_ 置位再 stop，
+// 必然收敛。这是唯一能把该竞态变成「稳定失败」的形状，也是它的回归防线。
+TEST(RpcServerTest, StopInsideBindAcceptWindowIsDeterministic)
+{
+    // 无论断言成败都复位钩子，避免污染同进程后续测试的启动时序
+    struct HookGuard {
+        ~HookGuard() { libmini::RpcServer::set_test_bind_delay_ms(0); }
+    } guard;
+    libmini::RpcServer::set_test_bind_delay_ms(50);
+
+    const int kIterations = 3;  // 命中已确定，少量迭代足够（50ms × 3）
+
+    run_within_budget(
+        [kIterations] {
+            for (int i = 0; i < kIterations; ++i) {
+                libmini::RpcServer s(0);
+                s.register_method("echo", [](const std::string& p) { return p; });
+                s.start_background();
+                s.wait_until_ready(5000);  // bind 已发布就绪，accept 尚在钩子睡眠中
+                s.stop();                  // 必然落在启动窗口内
+            }
+        },
+        std::chrono::seconds(30),
+        "stop() 落在 bind→accept 窗口内时未在 30s 内收敛：http.stop() 空操作"
+        "导致 accept 循环永久阻塞——启动窗口竞态回归");
+}
+
 TEST(RpcClientServerTest, ManySequentialCalls)
 {
     TestServer ts;
