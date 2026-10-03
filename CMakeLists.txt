@@ -38,7 +38,7 @@ option(LIBMINI_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" OFF)
 option(BUILD_TESTING "Build tests" ON)
 
 # 库版本号（src/CMakeLists 的 set_target_properties 与下方 CPack 共用）
-set(LIBMINI_VERSION 0.2.0)
+set(LIBMINI_VERSION 0.2.1)
 
 set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib/${CMAKE_BUILD_TYPE})
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib/${CMAKE_BUILD_TYPE})
