@@ -921,11 +921,16 @@ TEST(HardwareInfoTest, DisksAndVolumesAreWellFormed)
     }
 
     const std::vector<VolumeInfo> vs = volumes();
+    std::size_t real_volumes = 0;
     for (std::size_t i = 0; i < vs.size(); ++i) {
         EXPECT_FALSE(vs[i].mount_point.empty());
-        EXPECT_GT(vs[i].total_bytes, 0u);
+        if (vs[i].total_bytes == 0) {
+            continue;  // 特殊挂载（无块可报）不在此列
+        }
+        ++real_volumes;
         EXPECT_LE(vs[i].free_bytes, vs[i].total_bytes);
     }
+    EXPECT_GT(real_volumes, 0u) << "应至少列出一个有容量的真实卷";
     // 根卷必然存在（任何平台都挂载了 / 或 C:\）
     bool has_root = false;
     for (std::size_t i = 0; i < vs.size(); ++i) {

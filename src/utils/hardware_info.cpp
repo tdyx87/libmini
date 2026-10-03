@@ -332,16 +332,20 @@ std::string descriptor_string(const STORAGE_DEVICE_DESCRIPTOR& desc,
     return trim(ansi_to_utf8(base + offset));
 }
 
-#elif defined(__linux__)
+#elif defined(__linux__) || defined(__APPLE__)
 
-// /proc/mounts 里的伪文件系统（不属于「卷」的语义）
+// 伪文件系统（不属于「卷」的语义）。Linux 读 /proc/mounts、macOS 读
+// getmntinfo，两边都要过滤：macOS 的 devfs/autofs/map 条目块数为 0，
+// 留着既无意义又让容量字段自相矛盾。
 bool is_pseudo_filesystem(const std::string& fs)
 {
     static const char* kPseudo[] = {
         "proc", "sysfs", "devtmpfs", "devpts", "tmpfs", "cgroup", "cgroup2",
         "securityfs", "pstore", "bpf", "debugfs", "tracefs", "configfs",
         "fusectl", "mqueue", "hugetlbfs", "autofs", "binfmt_misc", "ramfs",
-        "squashfs", "efivarfs", "nsfs", "rpc_pipefs", "selinuxfs"
+        "squashfs", "efivarfs", "nsfs", "rpc_pipefs", "selinuxfs",
+        // macOS
+        "devfs", "map", "volfs"
     };
     for (std::size_t i = 0; i < sizeof(kPseudo) / sizeof(kPseudo[0]); ++i) {
         if (fs == kPseudo[i]) {
@@ -350,6 +354,10 @@ bool is_pseudo_filesystem(const std::string& fs)
     }
     return false;
 }
+
+#endif  // __linux__ || __APPLE__
+
+#if defined(__linux__)
 
 // 虚拟/分区设备：跳过 loop、ram、zram、sr 光驱、dm 映射、md raid
 bool is_virtual_block_name(const std::string& name)
@@ -1100,6 +1108,10 @@ std::vector<VolumeInfo> volumes()
             VolumeInfo vol;
             vol.mount_point = mounts[i].f_mntonname;
             vol.filesystem = mounts[i].f_fstypename;
+            if (vol.mount_point.empty() ||
+                is_pseudo_filesystem(vol.filesystem)) {
+                continue;  // 伪文件系统/无名挂载点，不是「卷」
+            }
             vol.total_bytes = static_cast<std::uint64_t>(mounts[i].f_blocks) *
                               static_cast<std::uint64_t>(mounts[i].f_bsize);
             vol.free_bytes = static_cast<std::uint64_t>(mounts[i].f_bavail) *
