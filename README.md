@@ -96,7 +96,7 @@ target_link_libraries(app PRIVATE libmini::libmini)
 | serialization | `utils/serialization.h` | 基于 nlohmann 的通用 JSON 序列化 + XML 树映射序列化 |
 | msgpack | `utils/msgpack.h` | MsgPack 二进制序列化（nlohmann 内置编解码，规范全兼容）：JsonValue 树/类型化封装，与 JSON 同套类型支持 |
 | proto_buf | `utils/proto_buf.h` | ProtoBuf proto3 wire format 编解码（零依赖手写，与官方字节级兼容）：字段号键的 JsonValue 树、packed 展开工具 |
-| rpc | `utils/rpc.h` | JSON RPC（HTTP / Windows 命名管道 / POSIX UDS / 裸 TCP 帧四种传输，一套 API）：客户端连接池/重试/抖动/日志，服务端过载保护（立即拒绝或排队背压）/延迟分位/队列监控/spdlog 日志 |
+| rpc | `utils/rpc.h` | JSON RPC（HTTP / Windows 命名管道 / POSIX UDS / 裸 TCP 帧四种传输，一套 API）：客户端连接池/重试/抖动/日志，服务端过载保护（立即拒绝或排队背压）/延迟分位/队列监控/spdlog 日志；`config()` 导出配置快照 + `validate()` 非法值自检 |
 | uuid | `utils/uuid.h` | RFC 4122 v4 生成与解析 |
 | crc | `utils/crc.h` | CRC-32（zlib）/ CRC-16 Modbus / CRC-64 XZ / Adler-32，均支持增量计算 |
 | encoding | `utils/encoding.h` | Base64 / Hex / URL 编解码 |
@@ -295,6 +295,14 @@ server.set_retry_after_seconds(2);       // 429 响应的 Retry-After（0 = 不�
 // 可配键：port / host / worker_threads / max_in_flight / queue_wait_ms /
 //         drain_timeout_ms / retry_after_seconds / queue_warn_threshold /
 //         overload_message / overload_mode（"reject"|"wait"）
+// apply_config 结束会自动自检一次，非法项经 LogFacade 记 warn
+
+// 配置快照 + 合法性自检（负值等非法项在 setter 层已钳到 0 并记 warn；
+// validate() 还能识别跨字段的非法组合，如流水线未配合连接池启用）
+RpcServerConfig sc = server.config();
+if (!sc.validate()) { /* 逐条 warn 已由日志给出 */ }
+RpcClientConfig cc = client.config();
+cc.validate();                            // 例：max_retries<0 / 退避上限低于基数
 
 // 服务端延迟分位（对数分桶直方图，处理耗时 O(log) 记录、内存恒定）
 RpcLatencyStats ls = server.latency_stats({99.9});   // 可追加自定义分位

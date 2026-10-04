@@ -27,6 +27,7 @@
 
 #include "tcp.h"
 #include "net_addr.h"
+#include "log_facade.h"
 
 // 注意：必须在 httplib.h 之后引入——它包含 Windows.h，
 // 若先于 httplib 会把 _WIN32_WINNT 锁在旧值导致其静态断言失败
@@ -65,6 +66,32 @@ std::atomic<int> g_test_bind_delay_ms{0};
 
 // 上限：避免误设把进程长时间挂住
 constexpr int kMaxTestBindDelayMs = 5000;
+
+// ==================== 配置校验 ====================
+
+// 配置非法项的 warn 收集器：与 TcpConfig::validate 同风格——逐条记
+// warn（入库即留痕），任一命中整体判否。LogFacade 未 init 时静默跳过，
+// 不因日志缺失改变判定结果
+class ConfigWarn
+{
+public:
+    void add(bool bad, const char* what)
+    {
+        if (!bad) {
+            return;
+        }
+        spdlog::logger* log = LogFacade::logger();
+        if (log) {
+            log->warn("rpc config invalid: {}", what);
+        }
+        ok_ = false;
+    }
+
+    bool ok() const { return ok_; }
+
+private:
+    bool ok_ = true;
+};
 
 // ==================== 传输端点识别 ====================
 
@@ -2000,30 +2027,71 @@ std::size_t RpcClient::async_workers() const
     return impl->async_exec ? impl->async_exec->size() : impl->async_workers;
 }
 
+// set_* 的负值防御：负的超时/等待预算在实现里要么退化成「无超时」
+// （HTTP：timeval 为 0 = 永不超时）要么退化成「立即超时」（本地/Tcp 的
+// wait_for 负值），两种都不是调用方的本意，且会掩盖配置笔误。
+// 统一钳到 0 并记 warn（0 在各字段上都有明确语义：超时 0 = 交由调用级
+// 超时决定 / 等待 0 = 不等待），行为可预期且不静默丢弃配置意图。
+// 交叉约束（退避上限 >= 基数、流水线需配合连接池）不在此处处理：
+// 那依赖其他字段的当前值，由 config().validate() 统一判定。
+
 void RpcClient::set_timeout_ms(int timeout_ms)
 {
-    impl_->timeout_ms = timeout_ms;
+    int v = timeout_ms;
+    if (v < 0) {
+        ConfigWarn().add(true, "set_timeout_ms(<0) clamped to 0");
+        v = 0;
+    }
+    impl_->timeout_ms = v;
     impl_->apply_timeout();
 }
 
 void RpcClient::set_max_retries(int retries)
 {
-    impl_->max_retries = retries;
+    int v = retries;
+    if (v < 0) {
+        // 负值会让 `attempt <= max_retries` 循环一次都不进：请求根本没
+        // 发出去，call() 返回空串 + UNKNOWN，看起来像服务器不可达。
+        // 钳到 0（禁用重试）保留「至少试一次」的语义
+        ConfigWarn().add(true, "set_max_retries(<0) clamped to 0");
+        v = 0;
+    }
+    impl_->max_retries = v;
 }
 
 void RpcClient::set_retry_base_delay_ms(int ms)
 {
-    impl_->retry_base_delay_ms = ms;
+    int v = ms;
+    if (v < 0) {
+        ConfigWarn().add(true, "set_retry_base_delay_ms(<0) clamped to 0");
+        v = 0;
+    }
+    impl_->retry_base_delay_ms = v;
 }
 
 void RpcClient::set_retry_max_delay_ms(int ms)
 {
-    impl_->retry_max_delay_ms = ms;
+    int v = ms;
+    if (v < 0) {
+        ConfigWarn().add(true, "set_retry_max_delay_ms(<0) clamped to 0");
+        v = 0;
+    }
+    // 退避封顶必须不低于基数，否则首次重试就已超出声明的上限
+    if (v < impl_->retry_base_delay_ms) {
+        ConfigWarn().add(true, "set_retry_max_delay_ms < base clamped to base");
+        v = impl_->retry_base_delay_ms;
+    }
+    impl_->retry_max_delay_ms = v;
 }
 
 void RpcClient::set_retry_max_total_wait_ms(int ms)
 {
-    impl_->retry_max_total_wait_ms = ms;
+    int v = ms;
+    if (v < 0) {
+        ConfigWarn().add(true, "set_retry_max_total_wait_ms(<0) clamped to 0");
+        v = 0;
+    }
+    impl_->retry_max_total_wait_ms = v;
 }
 
 void RpcClient::set_retry_jitter(bool enable)
@@ -2047,7 +2115,12 @@ void RpcClient::set_connection_pool_max(std::size_t max_connections)
 
 void RpcClient::set_connection_pool_idle_ms(int ms)
 {
-    impl_->pool_idle_timeout_ms = ms;
+    int v = ms;
+    if (v < 0) {
+        ConfigWarn().add(true, "set_connection_pool_idle_ms(<0) clamped to 0");
+        v = 0;
+    }
+    impl_->pool_idle_timeout_ms = v;
 }
 
 void RpcClient::set_pipeline_max_in_flight(std::size_t max_in_flight)
@@ -2094,6 +2167,34 @@ void RpcClient::apply_config(const ConfigFacade& config,
         set_pipeline_max_in_flight(static_cast<std::size_t>(
             std::max(0, config.get_int(p + "pipeline_max_in_flight", 0))));
     }
+
+    // 灌完配置自检一次：非法项在此记 warn，早于第一次请求暴露问题。
+    // 须写 this->config()：形参 config（ConfigFacade）遮蔽了成员函数名
+    this->config().validate();
+}
+
+RpcClientConfig RpcClient::config() const
+{
+    RpcClientConfig c;
+    Impl* impl = impl_;
+    if (!impl) {
+        return c;
+    }
+    {
+        // timeout_ms 的写入方（set_timeout_ms / 按调用超时临时切换）都在
+        // 这把锁下，读侧同锁取快照，避免读到半更新的组合
+        std::lock_guard<std::mutex> lock(impl->http_timeout_mutex);
+        c.timeout_ms = impl->timeout_ms;
+    }
+    c.max_retries = impl->max_retries;
+    c.retry_base_delay_ms = impl->retry_base_delay_ms;
+    c.retry_max_delay_ms = impl->retry_max_delay_ms;
+    c.retry_max_total_wait_ms = impl->retry_max_total_wait_ms;
+    c.retry_jitter = impl->jitter_enabled;
+    c.pool_max = impl->pool_max_conns;
+    c.pool_idle_ms = impl->pool_idle_timeout_ms;
+    c.pipeline_max_in_flight = impl->pipeline_max_in_flight;
+    return c;
 }
 
 RpcClientPoolStats RpcClient::pool_stats() const
@@ -4253,19 +4354,60 @@ void RpcServer::set_overload_mode(RpcOverloadMode mode)
     impl_->overload_mode = mode;
 }
 
+// 与客户端同策略：负值钳到 0 并记 warn，不静默丢弃配置
 void RpcServer::set_queue_wait_ms(int ms)
 {
-    impl_->queue_wait_ms = ms;
+    int v = ms;
+    if (v < 0) {
+        ConfigWarn().add(true, "set_queue_wait_ms(<0) clamped to 0");
+        v = 0;
+    }
+    impl_->queue_wait_ms = v;
 }
 
 void RpcServer::set_drain_timeout_ms(int ms)
 {
-    impl_->drain_timeout_ms = ms;
+    int v = ms;
+    if (v < 0) {
+        ConfigWarn().add(true, "set_drain_timeout_ms(<0) clamped to 0");
+        v = 0;
+    }
+    impl_->drain_timeout_ms = v;
 }
 
 void RpcServer::set_retry_after_seconds(int seconds)
 {
-    impl_->retry_after_seconds = seconds;
+    int v = seconds;
+    if (v < 0) {
+        ConfigWarn().add(true, "set_retry_after_seconds(<0) clamped to 0");
+        v = 0;
+    }
+    impl_->retry_after_seconds = v;
+}
+
+RpcServerConfig RpcServer::config() const
+{
+    RpcServerConfig c;
+    Impl* impl = impl_;
+    if (!impl) {
+        return c;
+    }
+    c.transport = impl->transport;
+    c.host = impl->tcp_host;
+    {
+        std::lock_guard<std::mutex> lock(impl->stats_mutex);
+        c.port = impl->port;
+        c.worker_threads = impl->worker_threads;
+        // max_in_flight 与队列硬上限同值写入（set_max_in_flight），
+        // 读该字段即等价于读当前处理上限
+        c.max_in_flight = impl->max_queued_requests;
+        c.queue_warn_threshold = impl->queue_warn_threshold;
+    }
+    c.overload_mode = impl->overload_mode;
+    c.queue_wait_ms = impl->queue_wait_ms;
+    c.drain_timeout_ms = impl->drain_timeout_ms;
+    c.retry_after_seconds = impl->retry_after_seconds;
+    return c;
 }
 
 RpcServerStats RpcServer::stats() const
@@ -4410,6 +4552,8 @@ void RpcServer::apply_config(const ConfigFacade& config,
             if (v >= 0 && v <= 65535) {
                 std::lock_guard<std::mutex> lock(impl->stats_mutex);
                 impl->port = v;
+            } else {
+                ConfigWarn().add(true, "port out of range [0, 65535], ignored");
             }
         }
     }
@@ -4425,9 +4569,10 @@ void RpcServer::apply_config(const ConfigFacade& config,
         const std::string k = LIBMINI_RPC_CFG_KEY("worker_threads");
         if (config.has(k)) {
             const int v = config.get_int(k, 0);
-            if (v >= 0) {
-                set_worker_threads(static_cast<std::size_t>(v));
+            if (v < 0) {
+                ConfigWarn().add(true, "worker_threads(<0) clamped to 0");
             }
+            set_worker_threads(static_cast<std::size_t>(v < 0 ? 0 : v));
         }
     }
     // 最大在途请求数（须在启动前；0 = 不限制）
@@ -4435,39 +4580,31 @@ void RpcServer::apply_config(const ConfigFacade& config,
         const std::string k = LIBMINI_RPC_CFG_KEY("max_in_flight");
         if (config.has(k)) {
             const int v = config.get_int(k, 0);
-            if (v >= 0) {
-                set_max_in_flight(static_cast<std::size_t>(v));
+            if (v < 0) {
+                ConfigWarn().add(true, "max_in_flight(<0) clamped to 0");
             }
+            set_max_in_flight(static_cast<std::size_t>(v < 0 ? 0 : v));
         }
     }
-    // WaitInQueue 排队等待上限
+    // WaitInQueue 排队等待上限（0 = 不等待、立即 429，与 drain 同为显式 0 语义）
     {
         const std::string k = LIBMINI_RPC_CFG_KEY("queue_wait_ms");
         if (config.has(k)) {
-            const int v = config.get_int(k, 0);
-            if (v > 0) {
-                set_queue_wait_ms(v);
-            }
-    }
+            set_queue_wait_ms(config.get_int(k, 10000));  // 负值由 setter 钳制并记 warn
+        }
     }
     // 优雅停机排空窗口
     {
         const std::string k = LIBMINI_RPC_CFG_KEY("drain_timeout_ms");
         if (config.has(k)) {
-            const int v = config.get_int(k, 0);
-            if (v >= 0) {
-                set_drain_timeout_ms(v);
-            }
+            set_drain_timeout_ms(config.get_int(k, 3000));
         }
     }
     // 429 Retry-After 秒数
     {
         const std::string k = LIBMINI_RPC_CFG_KEY("retry_after_seconds");
         if (config.has(k)) {
-            const int v = config.get_int(k, 0);
-        if (v >= 0) {
-                set_retry_after_seconds(v);
-            }
+            set_retry_after_seconds(config.get_int(k, 1));
         }
     }
     // 队列积压告警阈值
@@ -4475,9 +4612,11 @@ void RpcServer::apply_config(const ConfigFacade& config,
         const std::string k = LIBMINI_RPC_CFG_KEY("queue_warn_threshold");
         if (config.has(k)) {
             const int v = config.get_int(k, 0);
-            if (v >= 0) {
-                set_queue_warn_threshold(static_cast<std::size_t>(v));
+            if (v < 0) {
+                ConfigWarn().add(true, "queue_warn_threshold(<0) clamped to 0");
             }
+            set_queue_warn_threshold(
+                static_cast<std::size_t>(v < 0 ? 0 : v));
         }
     }
     // 过载拒绝文本
@@ -4501,6 +4640,51 @@ void RpcServer::apply_config(const ConfigFacade& config,
     }
 
     #undef LIBMINI_RPC_CFG_KEY
+
+    // 灌完配置自检一次：非法项在此记 warn，早于第一次请求暴露问题。
+    // 须写 this->config()：形参 config（ConfigFacade）遮蔽了成员函数名
+    this->config().validate();
+}
+
+// ---------------- 配置校验 ----------------
+
+// 判定「会不会破坏运行时不变量」，不评判配置是否合理
+bool RpcClientConfig::validate() const
+{
+    ConfigWarn w;
+    w.add(timeout_ms < 0, "timeout_ms < 0");
+    w.add(max_retries < 0, "max_retries < 0 (retry loop would never run)");
+    w.add(retry_base_delay_ms < 0, "retry_base_delay_ms < 0");
+    w.add(retry_max_delay_ms < 0, "retry_max_delay_ms < 0");
+    w.add(retry_max_total_wait_ms < 0, "retry_max_total_wait_ms < 0");
+    w.add(pool_idle_ms < 0, "pool_idle_ms < 0");
+    // 退避封顶低于基数时首次重试就已越界，封顶形同虚设
+    w.add(retry_max_delay_ms < retry_base_delay_ms,
+          "retry_max_delay_ms < retry_base_delay_ms (cap below base)");
+    // 流水线只在连接池启用时生效，此组合静默退化为「每调用一连接」
+    w.add(pipeline_max_in_flight > 0 && pool_max == 0,
+          "pipeline_max_in_flight > 0 but pool_max == 0 (pipeline inactive)");
+    return w.ok();
+}
+
+bool RpcServerConfig::validate() const
+{
+    ConfigWarn w;
+    const bool networked =
+        (transport == RpcTransport::Http || transport == RpcTransport::Tcp);
+    // 本地传输的端点是路径，port/host 不参与判定
+    if (networked) {
+        w.add(port < 0 || port > 65535, "port out of range [0, 65535]");
+        w.add(host.empty(), "host is empty (bind would fail)");
+    }
+    w.add(queue_wait_ms < 0, "queue_wait_ms < 0");
+    w.add(drain_timeout_ms < 0, "drain_timeout_ms < 0");
+    w.add(retry_after_seconds < 0, "retry_after_seconds < 0");
+    // 没有处理上限就永远拿不到 429，等待队列形同虚设
+    w.add(overload_mode == RpcOverloadMode::WaitInQueue && max_in_flight == 0,
+          "overload_mode == WaitInQueue but max_in_flight == 0 "
+          "(no limit, backpressure inactive)");
+    return w.ok();
 }
 
 }  // namespace libmini

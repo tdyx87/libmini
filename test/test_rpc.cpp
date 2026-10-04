@@ -3266,6 +3266,184 @@ TEST(RpcClientApplyConfigTest, MissingKeysKeepCurrentAndUnknownIgnored)
     server->stop();
 }
 
+// ==================== 配置校验（config() + validate()） ====================
+
+// 快照与 setter 的钳制一致：config() 读到的永远是「已钳制」的值
+TEST(RpcConfigValidationTest, ClientDefaultConfigIsValid)
+{
+    libmini::RpcClient client("127.0.0.1", 1);
+    const libmini::RpcClientConfig c = client.config();
+    EXPECT_TRUE(c.validate());
+    EXPECT_EQ(c.timeout_ms, 5000);
+    EXPECT_EQ(c.max_retries, 3);
+    EXPECT_EQ(c.pool_max, 8u);
+    EXPECT_EQ(c.pool_idle_ms, 30000);
+    EXPECT_EQ(c.pipeline_max_in_flight, 0u);
+}
+
+// 负值不得进入运行时：钳到 0 且 config() 立即反映
+TEST(RpcConfigValidationTest, ClientSettersClampNegativeValues)
+{
+    libmini::RpcClient client("127.0.0.1", 1);
+    client.set_timeout_ms(-1);
+    client.set_max_retries(-5);
+    client.set_retry_base_delay_ms(-2);
+    client.set_retry_max_delay_ms(-3);
+    client.set_retry_max_total_wait_ms(-4);
+    client.set_connection_pool_idle_ms(-6);
+
+    const libmini::RpcClientConfig c = client.config();
+    EXPECT_EQ(c.timeout_ms, 0);
+    EXPECT_EQ(c.max_retries, 0);
+    EXPECT_EQ(c.retry_base_delay_ms, 0);
+    EXPECT_EQ(c.retry_max_delay_ms, 0);
+    EXPECT_EQ(c.retry_max_total_wait_ms, 0);
+    EXPECT_EQ(c.pool_idle_ms, 0);
+    EXPECT_TRUE(c.validate());
+}
+
+// max_retries<0 曾让重试循环一次都不进：请求根本没发出，call() 返回
+// 空串 + UNKNOWN，看起来像服务器不可达。钳制后必须仍能完成一次调用
+TEST(RpcConfigValidationTest, NegativeRetriesStillPerformsOneAttempt)
+{
+    auto server = make_apply_config_server();
+
+    libmini::RpcClient client(libmini::RpcTransport::Tcp, server->endpoint());
+    client.set_max_retries(-3);   // 旧行为：0 次尝试
+    client.set_timeout_ms(3000);
+    EXPECT_EQ(client.config().max_retries, 0);
+    EXPECT_EQ(client.call("echo", "\"still-works\""), "\"still-works\"");
+    server->stop();
+}
+
+// 退避上限低于基数时首次重试就已越界，setter 抬到基数
+TEST(RpcConfigValidationTest, RetryMaxDelayBelowBaseIsRaised)
+{
+    libmini::RpcClient client("127.0.0.1", 1);
+    client.set_retry_base_delay_ms(500);
+    client.set_retry_max_delay_ms(100);
+    const libmini::RpcClientConfig c = client.config();
+    EXPECT_EQ(c.retry_max_delay_ms, 500);
+    EXPECT_TRUE(c.validate());
+}
+
+// validate() 能识别绕过 setter（直接组装结构体）的非法组合
+TEST(RpcConfigValidationTest, ClientValidateRejectsIllegalCombinations)
+{
+    libmini::RpcClientConfig c;
+    EXPECT_TRUE(c.validate());
+
+    c.max_retries = -1;
+    EXPECT_FALSE(c.validate());
+    c.max_retries = 0;
+
+    c.retry_max_delay_ms = 10;
+    c.retry_base_delay_ms = 100;
+    EXPECT_FALSE(c.validate());   // 上限低于基数
+    c.retry_base_delay_ms = 10;
+
+    // 流水线在连接池禁用时不生效：静默退化，必须判非法
+    c.pipeline_max_in_flight = 4;
+    c.pool_max = 0;
+    EXPECT_FALSE(c.validate());
+    c.pool_max = 8;
+    EXPECT_TRUE(c.validate());
+}
+
+TEST(RpcConfigValidationTest, ServerDefaultConfigIsValid)
+{
+    libmini::RpcServer server(0);
+    const libmini::RpcServerConfig c = server.config();
+    EXPECT_TRUE(c.validate());
+    EXPECT_EQ(c.transport, libmini::RpcTransport::Http);
+    EXPECT_EQ(c.port, 0);
+    EXPECT_EQ(c.host, "0.0.0.0");
+    EXPECT_EQ(c.worker_threads, 0u);
+    EXPECT_EQ(c.drain_timeout_ms, 3000);
+    EXPECT_EQ(c.retry_after_seconds, 1);
+}
+
+TEST(RpcConfigValidationTest, ServerSettersClampNegativeValues)
+{
+    libmini::RpcServer server(0);
+    server.set_queue_wait_ms(-1);
+    server.set_drain_timeout_ms(-2);
+    server.set_retry_after_seconds(-3);
+
+    const libmini::RpcServerConfig c = server.config();
+    EXPECT_EQ(c.queue_wait_ms, 0);
+    EXPECT_EQ(c.drain_timeout_ms, 0);
+    EXPECT_EQ(c.retry_after_seconds, 0);
+    EXPECT_TRUE(c.validate());
+}
+
+TEST(RpcConfigValidationTest, ServerValidateRejectsIllegalCombinations)
+{
+    libmini::RpcServerConfig c;
+    EXPECT_TRUE(c.validate());
+
+    c.port = 70000;              // 超出 uint16
+    EXPECT_FALSE(c.validate());
+    c.port = -1;
+    EXPECT_FALSE(c.validate());
+    c.port = 0;
+
+    c.host.clear();              // Http 传输绑定到空地址必然失败
+    EXPECT_FALSE(c.validate());
+    c.host = "127.0.0.1";
+
+    // WaitInQueue 但没有处理上限：永远拿不到 429，背压失效
+    c.overload_mode = libmini::RpcOverloadMode::WaitInQueue;
+    c.max_in_flight = 0;
+    EXPECT_FALSE(c.validate());
+    c.max_in_flight = 4;
+    EXPECT_TRUE(c.validate());
+}
+
+// 本地传输的端点是路径，port/host 不参与判定
+TEST(RpcConfigValidationTest, LocalTransportIgnoresPortAndHost)
+{
+    libmini::RpcServerConfig c;
+    c.transport = libmini::RpcTransport::LocalPipe;
+    c.port = -1;
+    c.host.clear();
+    EXPECT_TRUE(c.validate());
+}
+
+// config() 是只读快照：改副本不影响对象
+TEST(RpcConfigValidationTest, ConfigSnapshotIsDetached)
+{
+    libmini::RpcClient client("127.0.0.1", 1);
+    client.set_timeout_ms(1234);
+    libmini::RpcClientConfig c = client.config();
+    EXPECT_EQ(c.timeout_ms, 1234);
+    c.timeout_ms = 999;
+    EXPECT_EQ(client.config().timeout_ms, 1234);
+}
+
+// apply_config 灌完非法值后自检：值已钳制，快照干净
+TEST(RpcConfigValidationTest, ApplyConfigClampsAndSelfChecks)
+{
+    libmini::ConfigFacade cfg;
+    cfg.set_default("rpc.worker_threads", "-2");
+    cfg.set_default("rpc.max_in_flight", "-5");
+    cfg.set_default("rpc.queue_wait_ms", "-7");
+    cfg.set_default("rpc.drain_timeout_ms", "-9");
+    cfg.set_default("rpc.retry_after_seconds", "-3");
+    cfg.set_default("rpc.queue_warn_threshold", "-4");
+
+    libmini::RpcServer server(libmini::RpcTransport::Tcp, "127.0.0.1:0");
+    server.apply_config(cfg, "rpc.");
+
+    const libmini::RpcServerConfig c = server.config();
+    EXPECT_EQ(c.worker_threads, 0u);       // apply_config 原有防线：负值不应用
+    EXPECT_EQ(c.max_in_flight, 0u);
+    EXPECT_EQ(c.queue_wait_ms, 0);         // 原 >0 守卫会跳过负值 → 现 0 生效
+    EXPECT_EQ(c.drain_timeout_ms, 0);
+    EXPECT_EQ(c.retry_after_seconds, 0);
+    EXPECT_TRUE(c.validate());
+}
+
 int main(int argc, char** argv)
 {
     ::testing::InitGoogleTest(&argc, argv);

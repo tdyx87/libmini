@@ -120,6 +120,69 @@ enum class RpcError {
     UNKNOWN               // 其他未知错误
 };
 
+// 客户端配置快照（config() 返回）与合法性校验。
+//
+// 存在意义：set_* 系列只做单点赋值，非法值要等到某次 call() 才暴露成
+// 难以定位的运行时症状（例如 max_retries 传负数会让重试循环一次都不进，
+// call() 直接返回空串 + UNKNOWN，看不出是配置问题）。config() 把当前
+// 配置整体导出，validate() 给出「哪一项非法、为什么」的判定，apply_config
+// 灌完配置后自检一次，早于第一次请求暴露问题。
+//
+// 校验通过不代表配置合理，只代表没有会破坏运行时不变量的取值；语义上
+// 的取舍（如退避是否偏激进）由调用方自行判断。
+struct LIBMINI_API RpcClientConfig {
+    int timeout_ms = 5000;                // 单次请求超时（<=0 非法，见 validate）
+    int max_retries = 3;                  // 重试次数上限，0 = 禁用重试
+    int retry_base_delay_ms = 100;        // 指数退避基数
+    int retry_max_delay_ms = 4000;        // 单次退避上限
+    int retry_max_total_wait_ms = 10000;  // 单次 call 累计等待上限
+    bool retry_jitter = false;            // 相等抖动
+    std::size_t pool_max = 8;             // 连接池上限，0 = 禁用池
+    int pool_idle_ms = 30000;             // 空闲连接回收时间（0 = 不回收）
+    std::size_t pipeline_max_in_flight = 0;  // 每连接在途上限，0 = 关闭流水线
+
+    // 非法项逐条经 LogFacade 记 warn，任一命中返回 false：
+    //   - timeout_ms <= 0：HTTP 传输会退化成「无超时」（挂死），本地/Tcp
+    //     传输退化成「立即超时」，两种都不可能是本意；
+    //   - max_retries < 0：重试循环 `attempt <= max_retries` 一次都不进，
+    //     call() 直接返回空串 + UNKNOWN，看起来像服务器不可达；
+    //   - retry_base_delay_ms / retry_max_delay_ms / retry_max_total_wait_ms /
+    //     pool_idle_ms < 0：负的等待预算与「上限」语义冲突；
+    //   - retry_max_delay_ms < retry_base_delay_ms：首次重试的等待就已经
+    //     超出声明的上限，退避封顶形同虚设；
+    //   - pipeline_max_in_flight > 0 但 pool_max == 0：流水线只在连接池
+    //     启用时生效，此配置静默退化为「每调用一连接」。
+    bool validate() const;
+};
+
+// 服务器配置快照（config() 返回）与合法性校验。字段与各自的 set_*
+// 一一对应（host/port 另由构造与 set_tcp_host 决定）。
+struct LIBMINI_API RpcServerConfig {
+    RpcTransport transport = RpcTransport::Http;
+    std::string host = "0.0.0.0";   // Http/Tcp 监听地址
+    int port = 0;                   // Http/Tcp 监听端口，0 = 自动分配
+    std::size_t worker_threads = 0; // 0 = 用默认（max(8, CPU-1)）
+    std::size_t max_in_flight = 0;  // 0 = 不限制
+    RpcOverloadMode overload_mode = RpcOverloadMode::RejectImmediate;
+    int queue_wait_ms = 10000;        // WaitInQueue 排队等待上限
+    int drain_timeout_ms = 3000;      // 优雅停机排空窗口，0 = 立即放弃
+    int retry_after_seconds = 1;      // 429 的 Retry-After 头秒数，0 = 不发送
+    std::size_t queue_warn_threshold = 0;  // 积压告警阈值，0 = 不告警
+
+    // 非法项逐条经 LogFacade 记 warn，任一命中返回 false：
+    //   - port 越界 [0, 65535]（本地传输忽略该项，不参与判定）；
+    //   - Http/Tcp 传输 host 为空：绑定到空地址必然失败；
+    //   - queue_wait_ms < 0 / drain_timeout_ms < 0 / retry_after_seconds < 0：
+    //     负的等待预算与「上限」语义冲突（负值在实现里会被当作 0，
+    //     与显式配 0 混为一谈，掩盖配置笔误）；
+    //   - overload_mode == WaitInQueue 但 max_in_flight == 0：没有处理上限
+    //     就永远拿不到 429，背压完全失效（配置看着生效了其实没有）。
+    // 不判定 queue_wait_ms 与 overload_mode 的一致性：queue_wait_ms 的
+    // 默认值就是 10000 而默认模式是 RejectImmediate，两者本来就不同步，
+    // 把「只在 WaitInQueue 下生效」判成非法会让默认配置永远报 warn。
+    bool validate() const;
+};
+
 // 简单 RPC 客户端
 //
 // 端点与传输：
@@ -318,6 +381,11 @@ public:
     void apply_config(const ConfigFacade& config,
                       const std::string& key_prefix = std::string());
 
+    // 当前客户端配置快照（仅取值，不改状态；可在任何时候调用）。
+    // 配合 RpcClientConfig::validate() 在启动前/改配置后自检；
+    // apply_config 结束时会自动自检一次（非法项经 LogFacade 记 warn）
+    RpcClientConfig config() const;
+
     // 连接池快照（线程安全，可随时调用）
     RpcClientPoolStats pool_stats() const;
 
@@ -333,6 +401,7 @@ private:
                           RpcError* async_error, std::string* async_message,
                           int call_timeout_ms = 0);
 };
+
 //
 // 端点与传输（三选一，构造时确定）：
 //   RpcServer(8080)                        → HTTP over TCP（0 = 自动分配端口）
@@ -503,6 +572,11 @@ public:
     // 非本模块的配置项）。仅取值，不改变 facade 本身。
     void apply_config(const ConfigFacade& config,
                       const std::string& key_prefix = std::string());
+
+    // 当前服务器配置快照（仅取值，不改状态；port/host 取「配置值」而非
+    // 实际绑定结果，实际监听端口用 port()）。配合 RpcServerConfig::validate()
+    // 在启动前自检；apply_config 结束时会自动自检一次
+    RpcServerConfig config() const;
 
     // 请求耗时分布快照（线程安全，可在运行中随时调用）。
     // 仅统计成功进入处理阶段的请求；服务器重启（重新 run/start_background）后清零。
