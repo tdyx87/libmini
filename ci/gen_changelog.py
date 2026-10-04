@@ -34,6 +34,7 @@ CHANGELOG 里手写的「未发布」段必然会和提交历史漂移：合并�
     python ci/gen_changelog.py              # 刷新 CHANGELOG.md 里的清单
     python ci/gen_changelog.py --print      # 只打印，不写文件
     python ci/gen_changelog.py --check      # 校验是否与历史一致（CI 用）
+    python ci/gen_changelog.py --force      # HEAD 在 tag 上也照常处理
     python ci/gen_changelog.py --until HEAD # 连最新一条一起收录
     python ci/gen_changelog.py --since v0.2.0 --print
 
@@ -389,6 +390,8 @@ def main(argv):
                         help="只打印生成结果，不写文件")
     parser.add_argument("--check", dest="check", action="store_true",
                         help="校验清单是否与历史一致；不一致时退出码 1")
+    parser.add_argument("--force", dest="force", action="store_true",
+                        help="即使 HEAD 在 tag 上也照常处理（发版后重新基线用）")
     args = parser.parse_args(argv)
 
     if hasattr(sys.stdout, "reconfigure"):
@@ -398,7 +401,7 @@ def main(argv):
 
     cwd = os.path.dirname(os.path.abspath(args.path)) or "."
     try:
-        if head_is_tagged(cwd) and not args.print_only:
+        if head_is_tagged(cwd) and not args.print_only and not args.force:
             sys.stderr.write("gen_changelog: HEAD 落在 tag 上，"
                              "未发布段已冻结为正式版本段落，跳过。\n")
             return 0

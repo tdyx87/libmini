@@ -341,8 +341,16 @@ def case_head_on_tag():
         assert rc == 0 and r.read() == before, '刷新不应改动已冻结的清单'
         assert 'tampered entry' in r.read()   # 仍是人为改坏的内容
 
-        # tag 之后再提交一个提交，闸门重新生效
+        # --force 是发版后的逃生口：打 tag 的提交上重新基线清单
+        rc, out, err = r.run('--force')
+        assert rc == 0, (rc, err)
+        assert 'tampered entry' not in r.read(), '--force 应重写清单'
+        assert '（暂无提交）' in r.read()
+
+        # tag 之后再提交一个提交，闸门重新生效（--force 重新基线后是自洽的）
         r.commit('Add post-release work', 'b.txt')
+        assert r.check()[0] == 0, '重新基线后应自洽'
+        r.commit('Add another post-release work', 'c.txt')
         assert r.check()[0] == 1, 'tag 之后必须恢复校验'
         r.sync()
         assert r.check()[0] == 0

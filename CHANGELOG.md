@@ -27,27 +27,7 @@
 
 ### 提交清单
 
-#### 新增
-
-- Add deterministic regression test for the HTTP bind/accept stop race（[7f03e1b](https://github.com/tdyx87/libmini/commit/7f03e1b78f50da3634673fe4099f6e974c92975a)）
-- Add hardware_info module: CPU, adapters, disks, volumes, BIOS inventory（[bdc686d](https://github.com/tdyx87/libmini/commit/bdc686d7c3803db3172eda7354bb9cc12fc8b469)）
-- Add RpcClient/RpcServer config snapshots with validate()（[245b9de](https://github.com/tdyx87/libmini/commit/245b9ded1b5828a818351c4c353186d3557c9619)）
-- Add machine_fingerprint: stable machine identity for license binding（[8a4a6e6](https://github.com/tdyx87/libmini/commit/8a4a6e636ccc4a2d7fe0ebc6310dc156b82dc65c)）
-
-#### 变更
-
-- Generate the Unreleased changelog list from the commit log（[30c5b06](https://github.com/tdyx87/libmini/commit/30c5b06e0831d40290983dd2236ababb873951a2)）
-
-#### 修复
-
-- Fix POSIX build of hardware_info: missing headers and unused helpers（[11d1d3b](https://github.com/tdyx87/libmini/commit/11d1d3bc0c7fb0225507849b6df69dfaac4774f8)）
-- Read the link-layer address directly instead of the LL_ADDR macro（[1d0fe85](https://github.com/tdyx87/libmini/commit/1d0fe857de61688a721ff76f42acc2373174b20d)）
-- Filter pseudo filesystems from macOS volumes（[9d04b15](https://github.com/tdyx87/libmini/commit/9d04b154829dd3c1170d125c4eafd652787aaaea)）
-
-#### 内部
-
-- Document startup/shutdown invariant and test it per transport（[7e71f7a](https://github.com/tdyx87/libmini/commit/7e71f7a560593f4a90740f5151a9bf3e6d0ffd00)）
-- Add CHANGELOG so release notes stop living only in commit history（[c8408c1](https://github.com/tdyx87/libmini/commit/c8408c1a1beac063794982c8e879fd0b21d3c1d1)）
+（暂无提交）
 
 <!-- END generated:unreleased -->
 
