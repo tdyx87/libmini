@@ -17,6 +17,42 @@
 `ci/gen_changelog.py` 从 `git log` 生成，保证不漏不重）。改了提交信息就跑一次
 `python ci/gen_changelog.py` 刷新清单；CI 会校验它是否与提交历史一致。
 
+<!-- BEGIN generated:unreleased -->
+
+> 本小节由 `ci/gen_changelog.py` 从 `git log` 生成，**勿手改**。
+> 提交信息首词决定分类；判错就在正文加一行 `Category: 修复`
+> （可选值：新增 / 变更 / 修复 / 内部），不想收录就加
+> `Changelog-Skip: yes`。改完提交信息后跑一次
+> `python ci/gen_changelog.py` 刷新。
+
+### 提交清单
+
+#### 新增
+
+- Add deterministic regression test for the HTTP bind/accept stop race（[7f03e1b](https://github.com/tdyx87/libmini/commit/7f03e1b78f50da3634673fe4099f6e974c92975a)）
+- Add hardware_info module: CPU, adapters, disks, volumes, BIOS inventory（[bdc686d](https://github.com/tdyx87/libmini/commit/bdc686d7c3803db3172eda7354bb9cc12fc8b469)）
+- Add RpcClient/RpcServer config snapshots with validate()（[245b9de](https://github.com/tdyx87/libmini/commit/245b9ded1b5828a818351c4c353186d3557c9619)）
+- Add machine_fingerprint: stable machine identity for license binding（[8a4a6e6](https://github.com/tdyx87/libmini/commit/8a4a6e636ccc4a2d7fe0ebc6310dc156b82dc65c)）
+
+#### 变更
+
+- Generate the Unreleased changelog list from the commit log（[30c5b06](https://github.com/tdyx87/libmini/commit/30c5b06e0831d40290983dd2236ababb873951a2)）
+
+#### 修复
+
+- Fix POSIX build of hardware_info: missing headers and unused helpers（[11d1d3b](https://github.com/tdyx87/libmini/commit/11d1d3bc0c7fb0225507849b6df69dfaac4774f8)）
+- Read the link-layer address directly instead of the LL_ADDR macro（[1d0fe85](https://github.com/tdyx87/libmini/commit/1d0fe857de61688a721ff76f42acc2373174b20d)）
+- Filter pseudo filesystems from macOS volumes（[9d04b15](https://github.com/tdyx87/libmini/commit/9d04b154829dd3c1170d125c4eafd652787aaaea)）
+
+#### 内部
+
+- Document startup/shutdown invariant and test it per transport（[7e71f7a](https://github.com/tdyx87/libmini/commit/7e71f7a560593f4a90740f5151a9bf3e6d0ffd00)）
+- Add CHANGELOG so release notes stop living only in commit history（[c8408c1](https://github.com/tdyx87/libmini/commit/c8408c1a1beac063794982c8e879fd0b21d3c1d1)）
+
+<!-- END generated:unreleased -->
+
+## [0.3.0] - 2026-10-04
+
 ### 新增
 
 - **hardware_info 模块**（`utils/hardware_info.h`）：机器硬件清单快照，
@@ -59,38 +95,14 @@
 ### 内部
 
 - 新增公开测试钩子 `RpcServer::set_test_bind_delay_ms()`（默认 0，上限 5000ms），
-  用来确定性复现下述 HTTP 停机竞态窗口。
+  用来确定性复现 0.2.1 记录的 HTTP 停机竞态窗口。
 - 启动 / 停机不变量成文写入 `rpc.h`，并按传输类型分别加了回归断言。
-
-<!-- BEGIN generated:unreleased -->
-
-> 本小节由 `ci/gen_changelog.py` 从 `git log` 生成，**勿手改**。
-> 提交信息首词决定分类；判错就在正文加一行 `Category: 修复`
-> （可选值：新增 / 变更 / 修复 / 内部），不想收录就加
-> `Changelog-Skip: yes`。改完提交信息后跑一次
-> `python ci/gen_changelog.py` 刷新。
-
-### 提交清单
-
-#### 新增
-
-- Add deterministic regression test for the HTTP bind/accept stop race（[7f03e1b](https://github.com/tdyx87/libmini/commit/7f03e1b78f50da3634673fe4099f6e974c92975a)）
-- Add hardware_info module: CPU, adapters, disks, volumes, BIOS inventory（[bdc686d](https://github.com/tdyx87/libmini/commit/bdc686d7c3803db3172eda7354bb9cc12fc8b469)）
-- Add RpcClient/RpcServer config snapshots with validate()（[245b9de](https://github.com/tdyx87/libmini/commit/245b9ded1b5828a818351c4c353186d3557c9619)）
-- Add machine_fingerprint: stable machine identity for license binding（[8a4a6e6](https://github.com/tdyx87/libmini/commit/8a4a6e636ccc4a2d7fe0ebc6310dc156b82dc65c)）
-
-#### 修复
-
-- Fix POSIX build of hardware_info: missing headers and unused helpers（[11d1d3b](https://github.com/tdyx87/libmini/commit/11d1d3bc0c7fb0225507849b6df69dfaac4774f8)）
-- Read the link-layer address directly instead of the LL_ADDR macro（[1d0fe85](https://github.com/tdyx87/libmini/commit/1d0fe857de61688a721ff76f42acc2373174b20d)）
-- Filter pseudo filesystems from macOS volumes（[9d04b15](https://github.com/tdyx87/libmini/commit/9d04b154829dd3c1170d125c4eafd652787aaaea)）
-
-#### 内部
-
-- Document startup/shutdown invariant and test it per transport（[7e71f7a](https://github.com/tdyx87/libmini/commit/7e71f7a560593f4a90740f5151a9bf3e6d0ffd00)）
-- Add CHANGELOG so release notes stop living only in commit history（[c8408c1](https://github.com/tdyx87/libmini/commit/c8408c1a1beac063794982c8e879fd0b21d3c1d1)）
-
-<!-- END generated:unreleased -->
+- **CHANGELOG 清单自动化**：`ci/gen_changelog.py` 从 `git log` 派生
+  未发布段的提交清单（只改 HTML 标记之间的内容），
+  分类由提交信息首词决定，可用 `Category:` / `Changelog-Skip:`
+  trailer 覆盖或跳过。CI 新增 `changelog` job（先跑生成器自测、再跑
+  `--check`），清单与提交历史不一致直接失败。流程见 README
+  「维护 CHANGELOG」。
 
 ## [0.2.1] - 2026-10-03
 
@@ -204,6 +216,7 @@ C++11 + CMake + Conan，静态 / 动态库均支持。
 - sqlite 的 `build_executable=False` 选项与平台相关的 64 位问题。
 
 [未发布]: https://github.com/tdyx87/libmini/compare/v0.2.1...HEAD
+[0.3.0]: https://github.com/tdyx87/libmini/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/tdyx87/libmini/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/tdyx87/libmini/compare/v0.1.2...v0.2.0
 [0.1.2]: https://github.com/tdyx87/libmini/compare/v0.1.1...v0.1.2

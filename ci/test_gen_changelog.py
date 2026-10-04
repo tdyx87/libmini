@@ -234,6 +234,8 @@ def case_non_utf8():
         r.git('add', '.')
         r.git('commit', '-qm', 'Init')
         r.git('tag', 'v1.0.0')
+        # HEAD 不能恰好落在 tag 上，否则工具会走「已冻结」跳过分支
+        r.commit('Add something else', 'b.txt')
         rc, out, err = r.run()
         assert rc == 2, (rc, err)
         assert 'UTF-8' in err and 'Traceback' not in err, err
@@ -301,6 +303,53 @@ def case_pr_merge_checkout():
         r.close()
 
 
+def case_head_on_tag():
+    """打 tag 的那一提交上，校验与刷新都应跳过。
+
+    那一刻「未发布」段已经被冻结成正式版本段落，区间起点就是 HEAD 自己，
+    任何清单都必然对不上——那是假漂移，不能让它把发布提交卡在红上。
+    """
+    r = Repo('gen-changelog-tag-')
+    try:
+        r.init()
+        with open(os.path.join(r.path, 'a.txt'), 'w',
+                  encoding='utf-8', newline='') as handle:
+            handle.write('x\n')
+        r.write('# 更新日志\n')
+        r.git('add', '.')
+        r.git('commit', '-qm', 'Init')
+        r.git('tag', 'v1.0.0')
+        r.commit('Add widget module')
+        # HEAD 就是这条提交，所以清单还不含它（固有一步延迟），此时是空的
+        r.sync()
+        assert '（暂无提交）' in r.read()
+        assert r.check()[0] == 0
+
+        # 人为把清单改坏，再打 tag
+        r.write(r.read().replace('（暂无提交）', '- tampered entry'))
+        assert 'tampered entry' in r.read(), '篡改必须真的生效'
+        r.git('add', '.')
+        r.git('commit', '-qm', 'Freeze release notes')
+        assert r.check()[0] == 1, '未打 tag 时仍应报漂移'
+
+        r.git('tag', 'v1.1.0')
+        rc, out, err = r.check()
+        assert rc == 0, ('HEAD 在 tag 上时应跳过校验', rc, err)
+        assert 'tag' in err, err
+        before = r.read()
+        rc, out, err = r.run()          # 刷新也必须跳过，不能改动已冻结内容
+        assert rc == 0 and r.read() == before, '刷新不应改动已冻结的清单'
+        assert 'tampered entry' in r.read()   # 仍是人为改坏的内容
+
+        # tag 之后再提交一个提交，闸门重新生效
+        r.commit('Add post-release work', 'b.txt')
+        assert r.check()[0] == 1, 'tag 之后必须恢复校验'
+        r.sync()
+        assert r.check()[0] == 0
+    finally:
+        r.close()
+
+
 def case_crlf_file():
     """core.autocrlf 把工作区文件写成 CRLF 时，--check 不能误报漂移。
 
@@ -347,6 +396,7 @@ def main():
     case_drift_gate()
     case_non_utf8()
     case_pr_merge_checkout()
+    case_head_on_tag()
     case_crlf_file()
     print('gen_changelog self-test: ALL OK')
 

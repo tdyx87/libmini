@@ -14,7 +14,8 @@ CHANGELOG 里手写的「未发布」段必然会和提交历史漂移：合并�
    要点（写清楚「为什么」，质量高、体量可控）和下面自动生成的提交清单（保证不
    漏、不重、顺序稳定）。发版时删掉清单小节即可。
 2. **只覆盖标记之间的内容。** 标记外的任何字符都不会被动，因此历史版本段落
-   （已冻结的散文）永不被改写。
+   （已冻结的散文）永不被改写。HEAD 恰落在某个 tag 上时（打 tag 的那一
+   提交）整个校验与刷新直接跳过：那一刻区间起点就是它自己，「漂移」是假的。
 3. **有一步固有延迟，且是刻意的。** 一条提交无法把自己写进 CHANGELOG，因此
    生成与校验都用同一个区间终点：`<tag>..<最新提交>~1`——「除最新一条外的
    所有提交都必须已收录」。两者共用终点很关键：否则每次「刷新完立刻校验」
@@ -132,6 +133,21 @@ def latest_tag(cwd):
     if not out:
         raise ChangelogError("仓库里还没有任何 tag，无法确定未发布区间")
     return out
+
+
+def head_is_tagged(cwd):
+    """HEAD 是否恰好落在某个 tag 上。
+
+    打 tag 的那一提交里，「未发布」段已经被冻结成正式版本段落，提交清单
+    对它不再有意义（区间起点就是它自己）。此时校验必然「漂移」，但那不是
+    真漂移；刷新也会改写已冻结的内容。所以 HEAD 在 tag 上时跳过校验与刷新，
+    等下一个提交自然重建。--print 是只读查看，不跳过。
+    """
+    try:
+        git(["describe", "--tags", "--exact-match", "HEAD"], cwd)
+    except ChangelogError:
+        return False
+    return True
 
 
 def content_tip(cwd):
@@ -382,6 +398,10 @@ def main(argv):
 
     cwd = os.path.dirname(os.path.abspath(args.path)) or "."
     try:
+        if head_is_tagged(cwd) and not args.print_only:
+            sys.stderr.write("gen_changelog: HEAD 落在 tag 上，"
+                             "未发布段已冻结为正式版本段落，跳过。\n")
+            return 0
         since = args.since or latest_tag(cwd)
         # 生成与校验必须用**同一个**区间终点，否则每次「刷新完就校验」
         # 都会误报漂移。终点固定为 content_tip~1：最新一条提交无法把自己
