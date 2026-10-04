@@ -100,3 +100,6 @@ Thumbs.db
 /smoke_msvc_build/
 /jobs*.json
 /log*.txt
+# Python 缓存（ci/gen_changelog*.py 被本地 import 时产生）
+__pycache__/
+*.pyc

@@ -149,3 +149,28 @@ jobs:
             [ -f "$dll" ] && cp "$dll" smoke/build/
           done
           ./smoke/build/consumer
+
+  # CHANGELOG 漂移闸门：未发布段的提交清单必须与 git log 一致。
+  # 与 build-test 分开跑：这是秒级的文档检查，不该和 8 个编译变体抢机器，
+  # 但 release.yml 的 ci-gate 要求本工作流**全部** job 全绿，所以它同样是门。
+  changelog:
+    name: changelog
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # 必须完整历史 + tag：区间是 <最近 tag>..HEAD~1，浅克隆拿不到 tag
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      # 先自测生成器本身：工具坏了的时候，--check 会报「CHANGELOG 漂移」，
+      # 那是个误导性结论（真正的原因是工具挂了）
+      - name: Self-test the generator
+        run: python ci/test_gen_changelog.py
+
+      - name: Unreleased section matches the commit log
+        run: python ci/gen_changelog.py --check

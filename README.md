@@ -4,6 +4,40 @@ Windows（MSVC 2017 / x86）下的 C++11 日常工具库：字符串、编码、
 
 版本历史与缺陷修复记录见 [CHANGELOG.md](CHANGELOG.md)（Keep a Changelog 格式）。
 
+## 维护 CHANGELOG
+
+`[CHANGELOG.md](CHANGELOG.md)` 的「未发布」段分两部分：**人工要点**（写清楚
+「为什么」，发版时冻结保留）与**提交清单**（由 `ci/gen_changelog.py` 从
+`git log` 生成，保证不漏不重）。改动代码后刷一次即可：
+
+```bat
+python ci/gen_changelog.py            :: 刷新清单（--print 只看不改）
+python ci/gen_changelog.py --check    :: 校验是否与历史一致（CI 用）
+python ci/test_gen_changelog.py       :: 生成器自测
+```
+
+分类由提交信息首词决定（`Add` → 新增，`Fix` → 修复，`Document`/`Bump` →
+内部，余下按关键词表落到「变更」）。表覆盖不到时在正文里加一行 trailer：
+
+```text
+Fix retry ceiling off-by-one
+
+Category: 修复          :: 也可用 新增 / 变更 / 修复 / 内部
+Changelog-Skip: yes     :: 完全不进清单
+```
+
+CI 的 `changelog` job 会在每次 push/PR 上跑自测 + `--check`，清单与提交历史
+不一致时直接失败，所以发布说明不会悄悄漏项。
+
+两条已知的**刻意**行为，避免误解：
+
+- **有一提交延迟**：一条提交无法把自己写进 CHANGELOG，因此生成与校验都用
+  区间终点 `<最近 tag>..<最新提交>~1`——「除最新一条外的所有提交都必须已收录」。
+  两者共用终点是刻意的，否则每次「刷新完立刻校验」都会误报。想连最新一条一起
+  看用 `--until HEAD`。
+- **只改 CHANGELOG.md 与 `ci/gen_changelog*.py` 的提交不进清单**：否则收录它们
+  会产生新提交、新提交又需要收录，闸门永远失败。
+
 ## 构建
 
 依赖通过 Conan 安装（zlib、gtest、nlohmann_json、spdlog、cpp-httplib、pugixml 等），首次构建先执行：
@@ -26,10 +60,11 @@ cmake --build --preset conan-debug
   导出面 = 公开头里标注 `LIBMINI_API` 的符号（宏定义见 `utils/export.h`，
   新增公开 API 必须标注，否则 DLL 不导出、消费者链接失败）
 - C++ 标准为 C++11（MSVC 2017 兼容），源码统一 `/utf-8` 编译
-- CI：`.github/workflows/ci.yml` —— 7 个变体 job：三平台 Release 基线、
-  Debug、Shared（DLL/SO 导出面）、warnings-strict（`-Wall -Wextra -Werror`），
-  全部走 conan + Ninja 构建、CTest 全套、安装后 `find_package` 冒烟
-  （`ci/smoke_consumer`）；push/PR 到 main 时自动运行
+- CI：`.github/workflows/ci.yml` —— 9 个 job：`build-test` 的 8 个变体
+  （三平台 Release 基线、Debug、Shared（DLL/SO 导出面）、warnings-strict
+  `-Wall -Wextra -Werror`）全部走 conan + Ninja 构建、CTest 全套、安装后
+  `find_package` 冒烟（`ci/smoke_consumer`），外加秒级的 `changelog`
+  文档闸门（见下）；push/PR 到 main 时自动运行
 - 发布：`.github/workflows/release.yml` —— tag 触发（`v*`），先以可复用
   工作流门禁重跑同提交的完整 CI（全绿才打包）；三平台 CPack 产物
   （ZIP/TGZ）逐包带 `.sha256` 并在 publish 阶段验证 artifact 传输完整性，

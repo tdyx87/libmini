@@ -13,6 +13,10 @@
 
 ## [未发布]
 
+本段分两部分：上面是**人工要点**（写清楚「为什么」，体量可控，发版时冻结保留），下面是**提交清单**（由
+`ci/gen_changelog.py` 从 `git log` 生成，保证不漏不重）。改了提交信息就跑一次
+`python ci/gen_changelog.py` 刷新清单；CI 会校验它是否与提交历史一致。
+
 ### 新增
 
 - **hardware_info 模块**（`utils/hardware_info.h`）：机器硬件清单快照，
@@ -57,6 +61,36 @@
 - 新增公开测试钩子 `RpcServer::set_test_bind_delay_ms()`（默认 0，上限 5000ms），
   用来确定性复现下述 HTTP 停机竞态窗口。
 - 启动 / 停机不变量成文写入 `rpc.h`，并按传输类型分别加了回归断言。
+
+<!-- BEGIN generated:unreleased -->
+
+> 本小节由 `ci/gen_changelog.py` 从 `git log` 生成，**勿手改**。
+> 提交信息首词决定分类；判错就在正文加一行 `Category: 修复`
+> （可选值：新增 / 变更 / 修复 / 内部），不想收录就加
+> `Changelog-Skip: yes`。改完提交信息后跑一次
+> `python ci/gen_changelog.py` 刷新。
+
+### 提交清单
+
+#### 新增
+
+- Add deterministic regression test for the HTTP bind/accept stop race（[7f03e1b](https://github.com/tdyx87/libmini/commit/7f03e1b78f50da3634673fe4099f6e974c92975a)）
+- Add hardware_info module: CPU, adapters, disks, volumes, BIOS inventory（[bdc686d](https://github.com/tdyx87/libmini/commit/bdc686d7c3803db3172eda7354bb9cc12fc8b469)）
+- Add RpcClient/RpcServer config snapshots with validate()（[245b9de](https://github.com/tdyx87/libmini/commit/245b9ded1b5828a818351c4c353186d3557c9619)）
+- Add machine_fingerprint: stable machine identity for license binding（[8a4a6e6](https://github.com/tdyx87/libmini/commit/8a4a6e636ccc4a2d7fe0ebc6310dc156b82dc65c)）
+
+#### 修复
+
+- Fix POSIX build of hardware_info: missing headers and unused helpers（[11d1d3b](https://github.com/tdyx87/libmini/commit/11d1d3bc0c7fb0225507849b6df69dfaac4774f8)）
+- Read the link-layer address directly instead of the LL_ADDR macro（[1d0fe85](https://github.com/tdyx87/libmini/commit/1d0fe857de61688a721ff76f42acc2373174b20d)）
+- Filter pseudo filesystems from macOS volumes（[9d04b15](https://github.com/tdyx87/libmini/commit/9d04b154829dd3c1170d125c4eafd652787aaaea)）
+
+#### 内部
+
+- Document startup/shutdown invariant and test it per transport（[7e71f7a](https://github.com/tdyx87/libmini/commit/7e71f7a560593f4a90740f5151a9bf3e6d0ffd00)）
+- Add CHANGELOG so release notes stop living only in commit history（[c8408c1](https://github.com/tdyx87/libmini/commit/c8408c1a1beac063794982c8e879fd0b21d3c1d1)）
+
+<!-- END generated:unreleased -->
 
 ## [0.2.1] - 2026-10-03
 
