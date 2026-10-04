@@ -127,6 +127,7 @@ target_link_libraries(app PRIVATE libmini::libmini)
 | sqlite | `utils/sqlite.h` | SQLite 封装：参数绑定（索引/命名）、事务 RAII、行遍历、带类型值读取，错误不抛异常 |
 | system_info | `utils/system_info.h` | 主机名/PID/可执行文件路径/CPU 数/物理内存/磁盘容量与剩余 |
 | hardware_info | `utils/hardware_info.h` | 硬件清单：CPU 型号与拓扑、网卡（MAC/IPv4/IPv6）、物理磁盘（型号/序列号/总线）、卷（盘符/文件系统/标识）、主板与 BIOS |
+| machine_fingerprint | `utils/machine_fingerprint.h` | 机器指纹（许可证绑定 / 席位去重）：主板序列号 + CPU 型号 + 物理网卡 MAC（+ 物理盘序列号）经占位符过滤与虚拟网卡排除后派生 SHA-256 标识；`FingerprintPolicy` 三档控制易变信号是否参与，`confidence` 标可信度，`signals` 暴露归一化中间层供跨版本迁移 |
 | http_client | `utils/http_client.h` | HttpClient：GET/POST/PUT/DELETE/通用方法、query 编码拼装、默认头、超时、重定向；headers 键统一小写；status=0 表示传输层错误 |
 | http_server | `utils/http_server.h` | HttpServer：路径参数（`:name`）/query 解析、前置过滤器、fallback、访问日志钩子、请求体上限、apply_config（port/max_body_bytes） |
 | log_facade | `utils/log_facade.h` | LogFacade：一行初始化 spdlog（控制台+滚动文件、级别、格式、可选异步），运行期调级，幂等 init/shutdown |
@@ -759,6 +760,48 @@ LOG_FMT("host={} pid={} cpu={} mem={}", hostname(), current_pid(),
 sha256_file_hex("download.zip");   // 大文件流式摘要，校验下载完整性
 write_file_atomic("config.json", new_json);  // 崩溃安全的配置落盘
 ```
+
+### 机器指纹
+
+```cpp
+using namespace libmini;
+const MachineFingerprint fp = machine_fingerprint();   // kBalanced 策略
+LOG_FMT("machine={} confidence={} source={} virtual={}",
+        fp.short_id, fp.confidence, fp.source, fp.is_virtual);
+
+// 许可证绑定用 kStable：换硬盘 / 换网卡后指纹不变
+const MachineFingerprint bound =
+    machine_fingerprint_with(FingerprintPolicy::kStable, "");
+if (bound.empty()) {            // 受限容器里可能一个信号都取不到
+    // 走软许可证激活（允许容器记录）或让用户手工引入
+} else if (bound.confidence < 60) {
+    LOG_FMT("weak fingerprint: {}", bound.confidence);
+    for (const std::string& why : bound.missing) { LOG_FMT("  missing {}", why); }
+}
+
+// 租户 / 产品线隔离：salt 只影响 id，不影响 signals
+std::string tenant_id =
+    machine_fingerprint_with(FingerprintPolicy::kBalanced, "tenant-a").id;
+
+// 纯函数，可单测：占位序列号过滤 / 虚拟化识别
+canonical_fingerprint_token("To Be Filled By O.E.M.");  // "" —— 判为不可用
+looks_like_virtual_machine("VMware Virtual Platform");   // true
+looks_like_virtual_adapter("vEthernet (WSL)");           // true
+```
+
+稳定性保证（这也是为什么不是一开始就把所有硬件字段掺进去）：
+
+- **占位序列号先过滤**。DMI/WMI 的 `product_serial` 在大量 OEM 机器上是
+  `"To Be Filled By O.E.M."`、`"Default string"` 这类模板值，不过滤就会让同厂
+  未填序列号的所有机器算出**同一个**指纹，许可证绑定立刻失效。
+- 虚拟 / 容器 / 隧道网卡的 MAC 与虚拟盘不参与。
+- 候选 MAC 取**字典序最小**者，不取第一枚——系统枚举顺序跨重启不保证；也**不要求
+  链路 UP**——合盖 / 拔线会让指纹突变。
+- 检出虚拟化环境时 `confidence` 强制压到 ≤20：快照克隆会「一指多机」，不适合
+  做授权。判定只看整机厂商/型号与虚拟化软件自带的网卡——容器/VPN 类网卡在大量
+  物理开发机上同样存在，拿它们判定会误伤。
+- `id` 的计算含 `machine_fingerprint_version()` 版本串；消费方需跨 libmini 版本
+  稳定时，请同时持久化 `signals`（已归一化、幂等）并自行派生。
 
 ### 分层配置门面
 

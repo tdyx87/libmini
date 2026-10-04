@@ -954,6 +954,341 @@ TEST(HardwareInfoTest, BiosInfoIsConsistent)
     }
 }
 
+// ------------------------------ machine_fingerprint ------------------------------
+
+namespace {
+
+// 从 signals 里筛出某类信号（形如 "board=..."）
+std::vector<std::string> signals_with_prefix(
+    const std::vector<std::string>& all, const std::string& prefix)
+{
+    std::vector<std::string> out;
+    for (std::size_t i = 0; i < all.size(); ++i) {
+        if (all[i].size() > prefix.size() &&
+            all[i].compare(0, prefix.size(), prefix) == 0) {
+            out.push_back(all[i]);
+        }
+    }
+    return out;
+}
+
+// 信号行的 "=" 之后部分
+std::string signal_value(const std::string& signal)
+{
+    const std::size_t pos = signal.find('=');
+    if (pos == std::string::npos) {
+        return std::string();
+    }
+    return signal.substr(pos + 1);
+}
+
+bool is_lower_hex(const std::string& s)
+{
+    if (s.empty()) {
+        return false;
+    }
+    for (std::size_t i = 0; i < s.size(); ++i) {
+        const char c = s[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+}  // namespace
+
+TEST(MachineFingerprintTest, CanonicalTokenRejectsUnfilledPlaceholders)
+{
+    using namespace libmini;
+    // DMI/WMI 里大量 OEM 没填序列号的模板值；不过滤会让同厂所有机器撞同一个
+    // 指纹，许可证绑定直接失效
+    const char* const kPlaceholders[] = {
+        "To Be Filled By O.E.M.",
+        "  to be filled by o.e.m.  ",
+        "Default string",
+        "System Serial Number",
+        "System Board",
+        "Base Board",
+        "Not Specified",
+        "Not Applicable",
+        "Not Available",
+        "Unknown",
+        "None",
+        "null",
+        "N/A",
+        "OEM string",
+        "0123456789",
+    };
+    for (std::size_t i = 0;
+         i < sizeof(kPlaceholders) / sizeof(kPlaceholders[0]); ++i) {
+        EXPECT_EQ(canonical_fingerprint_token(kPlaceholders[i]), std::string())
+            << "占位序列号必须被判为不可用: " << kPlaceholders[i];
+    }
+}
+
+TEST(MachineFingerprintTest, CanonicalTokenRejectsShortAndUniformValues)
+{
+    using namespace libmini;
+    // 有效字符不足 4 个：噪声
+    EXPECT_EQ(canonical_fingerprint_token(""), std::string());
+    EXPECT_EQ(canonical_fingerprint_token("   "), std::string());
+    EXPECT_EQ(canonical_fingerprint_token("O.E.M."), std::string());
+    EXPECT_EQ(canonical_fingerprint_token("abc"), std::string());
+    EXPECT_EQ(canonical_fingerprint_token("-1-"), std::string());
+    // 单一字符重复（忽略分隔符）：占位 MAC / 模板序列号
+    EXPECT_EQ(canonical_fingerprint_token("00000000"), std::string());
+    EXPECT_EQ(canonical_fingerprint_token("00:00:00:00:00:00"), std::string());
+    EXPECT_EQ(canonical_fingerprint_token("XX-XXXXXX"), std::string());
+    EXPECT_EQ(canonical_fingerprint_token("--------"), std::string());
+    // 冒烟：真实的全 0 MAC 是非法的，真实 MAC 不能被误伤
+    EXPECT_FALSE(canonical_fingerprint_token("AA:BB:CC:DD:EE:FF").empty());
+}
+
+TEST(MachineFingerprintTest, CanonicalTokenNormalizesRealValues)
+{
+    using namespace libmini;
+    // 去首尾空白 + 转大写
+    EXPECT_EQ(canonical_fingerprint_token("  cn-0abc1234  "), "CN-0ABC1234");
+    // 内部连续空白（含制表符）压成单空格
+    EXPECT_EQ(canonical_fingerprint_token("12th  Gen\tIntel Core"),
+              "12TH GEN INTEL CORE");
+    EXPECT_EQ(canonical_fingerprint_token("12th\r\n Gen\tIntel Core"),
+              "12TH GEN INTEL CORE");
+    // 幂等：再归一一次结果不变（signals 的稳定性依赖这一点）
+    const std::string once = canonical_fingerprint_token(" PF2ABCD1 ");
+    EXPECT_EQ(canonical_fingerprint_token(once), once);
+    EXPECT_FALSE(once.empty());
+}
+
+TEST(MachineFingerprintTest, LooksLikeVirtualMachineDetectsHypervisors)
+{
+    using namespace libmini;
+    EXPECT_TRUE(looks_like_virtual_machine("VMware Virtual Platform"));
+    EXPECT_TRUE(looks_like_virtual_machine("VMware, Inc."));
+    EXPECT_TRUE(looks_like_virtual_machine("VirtualBox"));
+    EXPECT_TRUE(looks_like_virtual_machine("innotek GmbH"));
+    EXPECT_TRUE(looks_like_virtual_machine("KVM"));
+    EXPECT_TRUE(looks_like_virtual_machine("QEMU Virtual Machine"));
+    EXPECT_TRUE(looks_like_virtual_machine("Microsoft Hyper-V Platform"));
+    EXPECT_TRUE(looks_like_virtual_machine("Parallels Virtual Machine"));
+    EXPECT_TRUE(looks_like_virtual_machine("Amazon EC2"));
+    // 真实机器不得误判
+    EXPECT_FALSE(looks_like_virtual_machine("Dell Inc."));
+    EXPECT_FALSE(looks_like_virtual_machine("TO BE FILLED BY O.E.M."));
+    EXPECT_FALSE(looks_like_virtual_machine("HUAWEI"));
+    EXPECT_FALSE(looks_like_virtual_machine("LENOVO"));
+    EXPECT_FALSE(looks_like_virtual_machine(""));
+}
+
+TEST(MachineFingerprintTest, LooksLikeVirtualAdapterDetectsTunnels)
+{
+    using namespace libmini;
+    EXPECT_TRUE(looks_like_virtual_adapter("vEthernet (WSL)"));
+    EXPECT_TRUE(looks_like_virtual_adapter("Docker Ethernet Adapter"));
+    EXPECT_TRUE(looks_like_virtual_adapter("VMware Network Adapter VMXH"));
+    EXPECT_TRUE(looks_like_virtual_adapter("Hyper-V Virtual Ethernet Adapter"));
+    EXPECT_TRUE(looks_like_virtual_adapter("TAP-Windows Adapter V9"));
+    EXPECT_TRUE(looks_like_virtual_adapter("Bluetooth Device (PAN)"));
+    EXPECT_TRUE(looks_like_virtual_adapter("veth1234"));
+    // 真实网卡不得误判
+    EXPECT_FALSE(looks_like_virtual_adapter("Intel(R) Ethernet Connection"));
+    EXPECT_FALSE(looks_like_virtual_adapter("Realtek PCIe GbE Family"));
+    EXPECT_FALSE(looks_like_virtual_adapter("en0"));
+    EXPECT_FALSE(looks_like_virtual_adapter(""));
+}
+
+TEST(MachineFingerprintTest, VersionStringIsStable)
+{
+    using namespace libmini;
+    const char* v = machine_fingerprint_version();
+    ASSERT_TRUE(v != nullptr);
+    EXPECT_EQ(std::string(v), "v1");
+    EXPECT_EQ(std::string(machine_fingerprint_version()), std::string(v));
+}
+
+TEST(MachineFingerprintTest, ShapeMatchesAvailableSignals)
+{
+    using namespace libmini;
+    const MachineFingerprint fp = machine_fingerprint();
+    if (fp.signals.empty()) {
+        // 受限容器里可能一个信号都取不到，这是合法结果
+        EXPECT_TRUE(fp.empty());
+        EXPECT_EQ(fp.confidence, 0);
+        EXPECT_TRUE(fp.short_id.empty());
+        EXPECT_TRUE(fp.source.empty());
+        EXPECT_FALSE(fp.missing.empty()) << "取不到信号时必须说明原因";
+        return;
+    }
+    EXPECT_FALSE(fp.empty());
+    EXPECT_EQ(fp.id.size(), 64u);
+    EXPECT_TRUE(is_lower_hex(fp.id)) << "id 必须是 64 位小写十六进制";
+    EXPECT_EQ(fp.short_id, fp.id.substr(0, 16));
+    EXPECT_FALSE(fp.source.empty());
+    EXPECT_GE(fp.confidence, 1);
+    EXPECT_LE(fp.confidence, 100);
+}
+
+TEST(MachineFingerprintTest, IsDeterministicAcrossCalls)
+{
+    using namespace libmini;
+    const MachineFingerprint a = machine_fingerprint();
+    const MachineFingerprint b = machine_fingerprint();
+    EXPECT_EQ(a.id, b.id);
+    EXPECT_EQ(a.source, b.source);
+    EXPECT_EQ(a.confidence, b.confidence);
+    EXPECT_EQ(a.is_virtual, b.is_virtual);
+    EXPECT_EQ(a.signals, b.signals);
+    EXPECT_EQ(a.missing, b.missing);
+}
+
+TEST(MachineFingerprintTest, StablePolicyExcludesVolatileSignals)
+{
+    using namespace libmini;
+    // kStable：换硬盘 / 换网卡后指纹必须不变
+    const MachineFingerprint fp =
+        machine_fingerprint_with(FingerprintPolicy::kStable, std::string());
+    EXPECT_TRUE(signals_with_prefix(fp.signals, "mac=").empty())
+        << "kStable 不该纳入 MAC";
+    EXPECT_TRUE(signals_with_prefix(fp.signals, "disk=").empty())
+        << "kStable 不该纳入盘序列号";
+    EXPECT_EQ(fp.policy, FingerprintPolicy::kStable);
+}
+
+TEST(MachineFingerprintTest, BalancedPolicyHasAtMostOneMacSignal)
+{
+    using namespace libmini;
+    // kBalanced 只取字典序最小的那枚，避免枚举顺序影响结果
+    const MachineFingerprint fp =
+        machine_fingerprint_with(FingerprintPolicy::kBalanced, std::string());
+    EXPECT_LE(signals_with_prefix(fp.signals, "mac=").size(), 1u);
+    EXPECT_EQ(fp.policy, FingerprintPolicy::kBalanced);
+    // 便捷入口就是 kBalanced
+    const MachineFingerprint quick = machine_fingerprint();
+    EXPECT_EQ(quick.signals, fp.signals);
+    EXPECT_EQ(quick.id, fp.id);
+}
+
+TEST(MachineFingerprintTest, StrictPolicyDiskSignalsAreSortedAndUnique)
+{
+    using namespace libmini;
+    const MachineFingerprint fp =
+        machine_fingerprint_with(FingerprintPolicy::kStrict, std::string());
+    EXPECT_EQ(fp.policy, FingerprintPolicy::kStrict);
+    const std::vector<std::string> disks =
+        signals_with_prefix(fp.signals, "disk=");
+    for (std::size_t i = 1; i < disks.size(); ++i) {
+        EXPECT_LT(disks[i - 1], disks[i]) << "盘信号必须升序且不重复";
+    }
+    // kStrict 的信号集合是 kBalanced 的超集
+    const MachineFingerprint balanced =
+        machine_fingerprint_with(FingerprintPolicy::kBalanced, std::string());
+    EXPECT_LE(balanced.signals.size(), fp.signals.size());
+}
+
+TEST(MachineFingerprintTest, SignalsAreAlreadyCanonical)
+{
+    using namespace libmini;
+    const FingerprintPolicy policies[3] = {FingerprintPolicy::kStable,
+                                           FingerprintPolicy::kBalanced,
+                                           FingerprintPolicy::kStrict};
+    for (int i = 0; i < 3; ++i) {
+        const MachineFingerprint fp = machine_fingerprint_with(policies[i], "");
+        std::size_t prev_rank = 0;
+        for (std::size_t j = 0; j < fp.signals.size(); ++j) {
+            const std::string& s = fp.signals[j];
+            EXPECT_TRUE(s.compare(0, 6, "board=") == 0 ||
+                        s.compare(0, 4, "cpu=") == 0 ||
+                        s.compare(0, 4, "mac=") == 0 ||
+                        s.compare(0, 5, "disk=") == 0)
+                << "信号前缀未登记: " << s;
+            const std::string value = signal_value(s);
+            EXPECT_FALSE(value.empty());
+            // 幂等 + 不含占位符：signals 是调用方做跨版本迁移的依据
+            EXPECT_EQ(canonical_fingerprint_token(value), value)
+                << "信号未归一化: " << s;
+            // 顺序固定：board -> cpu -> mac -> disk
+            std::size_t rank = 0;
+            if (s.compare(0, 6, "board=") == 0) {
+                rank = 1;
+            } else if (s.compare(0, 4, "cpu=") == 0) {
+                rank = 2;
+            } else if (s.compare(0, 4, "mac=") == 0) {
+                rank = 3;
+            } else {
+                rank = 4;
+            }
+            EXPECT_GE(rank, prev_rank) << "信号顺序不稳定: " << s;
+            prev_rank = rank;
+        }
+    }
+}
+
+TEST(MachineFingerprintTest, MissingSignalsExplainThemselves)
+{
+    using namespace libmini;
+    const MachineFingerprint fp =
+        machine_fingerprint_with(FingerprintPolicy::kStrict, std::string());
+    for (std::size_t i = 0; i < fp.missing.size(); ++i) {
+        const std::string& m = fp.missing[i];
+        EXPECT_FALSE(m.empty());
+        EXPECT_TRUE(m.compare(0, 6, "board=") == 0 ||
+                    m.compare(0, 4, "cpu=") == 0 ||
+                    m.compare(0, 4, "mac=") == 0 ||
+                    m.compare(0, 5, "disk=") == 0)
+            << "missing 条目未登记来源: " << m;
+        EXPECT_GT(m.size(), m.find('=') + 1) << "missing 条目必须带原因: " << m;
+    }
+}
+
+TEST(MachineFingerprintTest, SaltProducesADifferentId)
+{
+    using namespace libmini;
+    const MachineFingerprint plain =
+        machine_fingerprint_with(FingerprintPolicy::kBalanced, "");
+    const MachineFingerprint salted =
+        machine_fingerprint_with(FingerprintPolicy::kBalanced, "tenant-a");
+    // 信号集合不受 salt 影响，id 必须受影响
+    EXPECT_EQ(plain.signals, salted.signals);
+    if (!plain.empty()) {
+        EXPECT_NE(plain.id, salted.id);
+        EXPECT_EQ(plain.short_id, plain.id.substr(0, 16));
+    }
+    const MachineFingerprint salted2 =
+        machine_fingerprint_with(FingerprintPolicy::kBalanced, "tenant-b");
+    if (!salted.empty()) {
+        EXPECT_NE(salted.id, salted2.id);
+    }
+}
+
+TEST(MachineFingerprintTest, PoliciesDifferOnlyWhenExtraSignalsExist)
+{
+    using namespace libmini;
+    const MachineFingerprint stable =
+        machine_fingerprint_with(FingerprintPolicy::kStable, "");
+    const MachineFingerprint strict =
+        machine_fingerprint_with(FingerprintPolicy::kStrict, "");
+    if (stable.signals.size() == strict.signals.size()) {
+        // 没有可加的易变信号时三种策略应给出同一个 id
+        EXPECT_EQ(stable.id, strict.id);
+    } else {
+        EXPECT_FALSE(stable.empty());
+        EXPECT_FALSE(strict.empty());
+        EXPECT_NE(stable.id, strict.id);
+    }
+}
+
+TEST(MachineFingerprintTest, VirtualMachineCapsConfidence)
+{
+    using namespace libmini;
+    const MachineFingerprint fp = machine_fingerprint();
+    if (fp.is_virtual) {
+        EXPECT_LE(fp.confidence, 20)
+            << "虚机指纹不可用于授权，confidence 必须压到 20 以内";
+        EXPECT_GE(fp.confidence, 0);
+    }
+    EXPECT_EQ(fp.is_virtual, is_virtual_machine());
+}
 TEST(SystemInfoTest, ExecutablePathIsAbsolute)
 {
     using namespace libmini;

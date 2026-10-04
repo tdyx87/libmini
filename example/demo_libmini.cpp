@@ -1662,6 +1662,63 @@ LIBMINI_DEMO(hardware)
     }
 }
 
+LIBMINI_DEMO(machine_fingerprint)
+{
+    // ---- 便捷入口：kBalanced 策略、无 salt ----
+    const MachineFingerprint fp = machine_fingerprint();
+    std::cout << "机器指纹       : "
+              << (fp.empty() ? "(无可用信号)" : fp.short_id) << "\n";
+    if (!fp.empty()) {
+        std::cout << "  完整 id      : " << fp.id << "\n";
+        std::cout << "  信号版本     : " << machine_fingerprint_version() << "\n";
+    }
+    std::cout << "  主导信号     : " << (fp.source.empty() ? "(无)" : fp.source)
+              << "\n";
+    std::cout << "  可信度       : " << fp.confidence << " / 100"
+              << (fp.is_virtual ? "  [检出虚拟化环境，不可用于授权]" : "")
+              << "\n";
+
+    std::cout << "  参与哈希的信号:\n";
+    for (std::size_t i = 0; i < fp.signals.size(); ++i) {
+        std::cout << "    + " << fp.signals[i] << "\n";
+    }
+    if (!fp.missing.empty()) {
+        std::cout << "  取不到的信号（换更强硬件可改善）:\n";
+        for (std::size_t i = 0; i < fp.missing.size(); ++i) {
+            std::cout << "    - " << fp.missing[i] << "\n";
+        }
+    }
+
+    // ---- 三档策略：易变信号参与与否 ----
+    const FingerprintPolicy policies[3] = {FingerprintPolicy::kStable,
+                                           FingerprintPolicy::kBalanced,
+                                           FingerprintPolicy::kStrict};
+    const char* names[3] = {"kStable  ", "kBalanced", "kStrict  "};
+    std::cout << "  各策略对比（换盘/换网卡的影响）:\n";
+    for (int i = 0; i < 3; ++i) {
+        const MachineFingerprint p = machine_fingerprint_with(policies[i], "");
+        std::cout << "    " << names[i] << "  "
+                  << (p.empty() ? "(空)" : p.short_id) << "  信号 "
+                  << p.signals.size() << " 个  可信度 " << p.confidence << "\n";
+    }
+
+    // ---- 加 salt：租户 / 产品线隔离，防彩虹表反查序列号 ----
+    const MachineFingerprint salted =
+        machine_fingerprint_with(FingerprintPolicy::kBalanced, "tenant-a");
+    std::cout << "  加 salt 后    : " << (salted.empty() ? "(空)"
+                                                      : salted.short_id)
+              << "\n";
+    std::cout << "  is_virtual    : " << (fp.is_virtual ? "是" : "否") << "\n";
+
+    // ---- 归一化 / 虚拟化判定的纯函数，可直接复用 ----
+    std::cout << "  归一化示例    : \""
+              << canonical_fingerprint_token("  to be filled by o.e.m.  ")
+              << "\"（空 = 判为占位值，不可用）\n";
+    std::cout << "  虚拟化判定    : \"VMware Virtual Platform\" -> "
+              << (looks_like_virtual_machine("VMware Virtual Platform") ? "是"
+                                                                      : "否")
+              << "\n";
+}
 LIBMINI_DEMO(http_server)
 {
     using namespace libmini;

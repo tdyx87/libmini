@@ -23,6 +23,17 @@
   不抛异常、不提权：Windows 走宽字符注册表与卷 API（中文型号与卷标不乱码，
   卷 GUID 反查盘符），Linux 读 `/proc` 与 `/sys`（卷标识用文件系统 UUID），
   macOS 走 `system_profiler`。
+- **machine_fingerprint 模块**（`utils/machine_fingerprint.h`）：从 hardware_info
+  的硬件清单派生「这台机器是谁」的稳定标识，用于许可证单机绑定、席位去重上报、
+  设备聚合遥测。主板/整机序列号 + CPU 型号 + 物理网卡 MAC（+ 物理盘序列号）
+  经归一化后 SHA-256 成 64 位十六进制 id。`FingerprintPolicy` 三档控制易变信号是否
+  参与（`kStable` 换盘换网卡不变 / `kBalanced` 默认 / `kStrict` 熵最高），`confidence`
+  标可信度，`signals` 暴露归一化中间层供调用方跨版本迁移，`missing` 说明哪些信号
+  取不到及原因。三条稳定性设计：占位序列号过滤（`"To Be Filled By O.E.M."` 这类
+  OEM 模板值会让同厂所有未填机器算出同一个指纹，不过滤许可证绑定直接失效）、虚拟
+  /容器/隧道网卡 MAC 与虚拟盘排除、检出虚拟化环境时 confidence 强制压到 ≤20。
+  纯函数 `canonical_fingerprint_token()` / `looks_like_virtual_machine()` /
+  `looks_like_virtual_adapter()` 可直接单测与复用。
 - **RPC 配置自检**：`RpcClient::config()` / `RpcServer::config()` 导出配置快照，
   新增 `RpcClientConfig` / `RpcServerConfig` 两个 `LIBMINI_API` 结构与
   `validate()` 合法性自检（沿用 `TcpConfig::validate()` 的「逐条 warn +
