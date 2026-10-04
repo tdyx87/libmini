@@ -27,7 +27,9 @@
 
 ### 提交清单
 
-（暂无提交）
+#### 内部
+
+- Rebaseline the changelog after v0.3.0 and drop dead matrix config（[bfc6d7f](https://github.com/tdyx87/libmini/commit/bfc6d7f1cdb125460017a01a546a1324e081ec6a)）
 
 <!-- END generated:unreleased -->
 

@@ -136,6 +136,12 @@ jobs:
     needs: [ci-gate, package]
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
       - name: Download all package artifacts
         uses: actions/download-artifact@v4
         with:
@@ -162,12 +168,26 @@ jobs:
           sha256sum -c SHA256SUMS
           cat SHA256SUMS
 
+      - name: Compose release notes from CHANGELOG
+        # 发布页正文直接取 CHANGELOG 里对应版本段落：自动生成的说明只有一行
+        # "Full Changelog" 链接，看不出这个版本到底加了什么
+        run: |
+          ver="${{ github.ref_name }}"
+          if python ci/gen_changelog.py --notes "$ver" > notes.md; then
+            echo "release notes taken from CHANGELOG.md ($ver)"
+          else
+            echo "::warning::CHANGELOG.md 里没有 $ver 段落，退回极简说明"
+            printf '## %s\n\n完整变更说明见 [CHANGELOG.md](https://github.com/tdyx87/libmini/blob/%s/CHANGELOG.md)。\n' \
+              "$ver" "$ver" > notes.md
+          fi
+          head -5 notes.md
+
       - name: Create GitHub Release and upload packages
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
           name: ${{ github.ref_name }}
-          generate_release_notes: true
+          body_path: notes.md
           # 显式列出上架物：三平台 ZIP/TGZ + 校验和总清单。SHA256SUMS
           # 让消费者下载后可 sha256sum -c 核对完整性
           files: |

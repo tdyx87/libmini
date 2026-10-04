@@ -38,6 +38,18 @@ CHANGELOG 里手写的「未发布」段必然会和提交历史漂移：合并�
     python ci/gen_changelog.py --until HEAD # 连最新一条一起收录
     python ci/gen_changelog.py --since v0.2.0 --print
 
+发版时：
+
+    python ci/gen_changelog.py --release 0.3.1            # 冻结段落 + 打印发布说明
+    python ci/gen_changelog.py --release 0.3.1 --dry-run  # 只校验与打印
+    python ci/gen_changelog.py --notes 0.3.1 > notes.md   # 抽取已冻结段落
+    git tag -a v0.3.1 -m "..." && git push origin v0.3.1
+    python ci/gen_changelog.py                           # tag 之后重新基线清单
+
+--release 刻意**不动生成清单**：打完 tag 前，CI 的校验区间是
+<最近 tag>..HEAD~1，清单必须仍与那段历史一致；挪走或清空都会让发布提交当场
+变红。清单在 tag 之后的那次刷新里自然归零。
+
 退出码：0 一致 / 1 已漂移（仅 --check）/ 2 用法或环境错误。
 
 仅依赖 Python 3 标准库，Windows / Linux / macOS 通用。
@@ -67,6 +79,7 @@ CATEGORY_KEYWORDS = (
     ("内部", (
         "bump version", "ci ", "ci:", "changelog", "document", "docs",
         "readme", "chore", "refactor", "workflow", "test budget",
+        "rebaseline", "reword",
         "assertion", "flaky", "timing", "timeout budget", "test store",
     )),
     ("修复", (
@@ -95,6 +108,12 @@ SHORT_SHA_OVERRIDES = {
 BUMP_RE = re.compile(r"^bump version to (\d+\.\d+\.\d+)", re.IGNORECASE)
 
 CATEGORY_ORDER = ("新增", "变更", "修复", "内部")
+
+# 版本号格式与「## [x.y.z] - date」版本标题
+VERSION_RE = re.compile(r"^\d+\.\d+\.\d+$")
+VERSION_HEADING_RE = re.compile(r"^## \[(?P<version>[^\]]+)\]", re.M)
+UNRELEASED_HEADING = "## [未发布]"
+COMPARE_BASE = "https://github.com/tdyx87/libmini/compare"
 
 CATEGORY_ALIASES = {
     "新增": "新增", "add": "新增", "added": "新增", "new": "新增",
@@ -368,6 +387,99 @@ def current_block(text):
         text[begin:end + len(END_MARKER)]).strip()
 
 
+def find_version_heading(text):
+    """返回 [(版本号, 标题起点, 段落到下一个 '## ' 之前)]，按文件顺序。"""
+    matches = list(VERSION_HEADING_RE.finditer(text))
+    sections = []
+    for i, m in enumerate(matches):
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+        sections.append((m.group("version"), m.start(), end))
+    return sections
+
+
+def read_libmini_version(cwd):
+    """从 CMakeLists.txt 读 LIBMINI_VERSION，用于防止 CHANGELOG 与包名不一致。"""
+    path = os.path.join(cwd, "CMakeLists.txt")
+    if not os.path.isfile(path):
+        return None
+    try:
+        text = read_text(path)
+    except (IOError, OSError, UnicodeDecodeError):
+        return None
+    m = re.search(r"^set\(LIBMINI_VERSION\s+([0-9.]+)\)", text, re.M)
+    return m.group(1) if m else None
+
+
+def release_notes(text, version):
+    """抽出某个已冻结版本段落（发布页正文用）。找不到返回 None。"""
+    wanted = version[1:] if version.startswith("v") else version
+    for name, start, end in find_version_heading(text):
+        if name.lstrip("v") == wanted:
+            return text[start:end].rstrip() + "\n"
+    return None
+
+
+def do_release(text, version, date_str, cwd):
+    """把「未发布」段里的人工要点冻结成正式版本段落。
+
+    刻意**保留**生成清单原样不动：打完 tag 后清单才重新基线，而 tag 之前
+    CI 的校验区间是 <最近 tag>..HEAD~1，清单必须仍与那段历史一致。把清单
+    挪走或清空都会让发布提交当场变红。
+    """
+    if not VERSION_RE.match(version):
+        raise ChangelogError("版本号格式不对：%s（应为 x.y.z）" % version)
+
+    sections = find_version_heading(text)
+    if not sections or sections[0][0] != "未发布":
+        raise ChangelogError("文件顶部的版本段落不是「未发布」，无法冻结")
+    if any(name.lstrip("v") == version for name, _, _ in sections):
+        raise ChangelogError("版本 %s 已在 CHANGELOG 里" % version)
+
+    begin = text.find(BEGIN_MARKER)
+    end = text.find(END_MARKER)
+    if begin < 0 or end < 0 or end < begin:
+        raise ChangelogError("找不到生成标记，无法确定要点与清单的分界")
+    if begin > sections[0][2]:
+        raise ChangelogError("生成标记不在「未发布」段内，请检查文件结构")
+
+    prev_version = sections[1][0] if len(sections) > 1 else None
+    if not prev_version:
+        raise ChangelogError("没有更早的版本段落可比对，无法生成 compare 链接")
+
+    # 要点 = 未发布标题之后、生成标记之前的全部 '###' 小节
+    head = text[:begin]
+    i_prose = head.find("\n### ")
+    if i_prose < 0:
+        raise ChangelogError("「未发布」段里没有人工要点，只有生成清单")
+    note_part = head[:i_prose].rstrip("\n")
+    prose = head[i_prose:].strip("\n")
+
+    frozen = sections[1]
+    rest = text[frozen[1]:]
+    out = (note_part + "\n\n"
+           + text[begin:end + len(END_MARKER)] + "\n\n"
+           + "## [%s] - %s\n\n" % (version, date_str)
+           + prose + "\n\n"
+           + rest)
+
+    # compare 链接插在上一版本链接之前，保持倒序。tag 一律带 v 前缀：
+    # 版本标题里没有 v（## [0.3.1]），但 compare URL 用的是 tag 名。
+    link = "[%s]: %s/v%s...v%s\n" % (version, COMPARE_BASE, prev_version,
+                                    version)
+    idx = out.find("[%s]: " % prev_version)
+    if idx < 0:
+        out = out.rstrip("\n") + "\n" + link
+    else:
+        out = out[:idx] + link + out[idx:]
+
+    libmini_version = read_libmini_version(cwd)
+    if libmini_version and libmini_version != version:
+        raise ChangelogError(
+            "CHANGELOG 版本 %s 与 CMakeLists 的 LIBMINI_VERSION %s 不一致"
+            % (version, libmini_version))
+    return out
+
+
 def read_text(path):
     with open(path, "r", encoding="utf-8", newline="") as handle:
         return handle.read()
@@ -376,6 +488,49 @@ def read_text(path):
 def write_text(path, text):
     with open(path, "w", encoding="utf-8", newline="") as handle:
         handle.write(text)
+
+
+def run_release(args, cwd):
+    """--release：冻结段落 + 打印可当发布页正文的要点。"""
+    import datetime
+
+    date_str = args.date or datetime.date.today().isoformat()
+    if not re.match(r"^\d{4}-\d{2}-\d{2}$", date_str):
+        sys.stderr.write("gen_changelog: 日期格式应为 YYYY-MM-DD：%s\n" % date_str)
+        return 2
+    try:
+        text = read_text(args.path)
+        out = do_release(text, args.release, date_str, cwd)
+    except (IOError, OSError) as exc:
+        sys.stderr.write("gen_changelog: 读取 %s 失败：%s\n" % (args.path, exc))
+        return 2
+    except UnicodeDecodeError:
+        sys.stderr.write("gen_changelog: %s 不是 UTF-8 编码，无法处理\n"
+                         % args.path)
+        return 2
+    except ChangelogError as exc:
+        sys.stderr.write("gen_changelog: %s\n" % exc)
+        return 2
+
+    notes = release_notes(out, args.release)
+    if notes is None:
+        sys.stderr.write("gen_changelog: 冻结后找不到 %s 段落\n" % args.release)
+        return 2
+
+    if args.dry_run:
+        sys.stderr.write("gen_changelog: --dry-run，未写文件\n")
+        sys.stdout.write(notes)
+        return 0
+    try:
+        write_text(args.path, out)
+    except (IOError, OSError) as exc:
+        sys.stderr.write("gen_changelog: 写入 %s 失败：%s\n" % (args.path, exc))
+        return 2
+    sys.stderr.write("gen_changelog: 已冻结 %s（%s），生成清单保持原样；"
+                     "打完 tag 后再跑一次刷新即可重新基线\n"
+                     % (args.release, date_str))
+    sys.stdout.write(notes)
+    return 0
 
 
 def main(argv):
@@ -392,6 +547,15 @@ def main(argv):
                         help="校验清单是否与历史一致；不一致时退出码 1")
     parser.add_argument("--force", dest="force", action="store_true",
                         help="即使 HEAD 在 tag 上也照常处理（发版后重新基线用）")
+    parser.add_argument("--release", dest="release", default=None,
+                        metavar="X.Y.Z",
+                        help="把未发布段冻结成正式版本段落（发版前跑）")
+    parser.add_argument("--date", dest="date", default=None,
+                        help="版本段落日期 YYYY-MM-DD（--release 用，默认今天）")
+    parser.add_argument("--notes", dest="notes", default=None, metavar="X.Y.Z",
+                        help="只打印指定版本的段落（发布页正文用，不改文件）")
+    parser.add_argument("--dry-run", dest="dry_run", action="store_true",
+                        help="与 --release 搭配：只校验与打印，不写文件")
     args = parser.parse_args(argv)
 
     if hasattr(sys.stdout, "reconfigure"):
@@ -401,6 +565,17 @@ def main(argv):
 
     cwd = os.path.dirname(os.path.abspath(args.path)) or "."
     try:
+        if args.notes:
+            text = read_text(args.path)
+            body = release_notes(text, args.notes)
+            if body is None:
+                raise ChangelogError("CHANGELOG 里没有版本 %s 的段落" % args.notes)
+            sys.stdout.write(body)
+            return 0
+
+        if args.release:
+            return run_release(args, cwd)
+
         if head_is_tagged(cwd) and not args.print_only and not args.force:
             sys.stderr.write("gen_changelog: HEAD 落在 tag 上，"
                              "未发布段已冻结为正式版本段落，跳过。\n")

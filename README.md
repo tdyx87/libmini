@@ -35,6 +35,27 @@ CI 的 `changelog` job 会在每次 push/PR 上跑自测 + `--check`，清单与
   区间终点 `<最近 tag>..<最新提交>~1`——「除最新一条外的所有提交都必须已收录」。
   两者共用终点是刻意的，否则每次「刷新完立刻校验」都会误报。想连最新一条一起
   看用 `--until HEAD`。
+### 发版流程
+
+```bat
+set V=0.3.1
+python ci/gen_changelog.py --release %V%     :: 冻结未发布段 + 打印发布说明
+:: 把 libmini/lib/liblibmini.a 的版本也一起改了（CMakeLists 的 LIBMINI_VERSION，
+:: 工具会比对，不一致直接报错，避免 CHANGELOG 写 0.3.1、包名还是 0.3.0）
+python ci/gen_changelog.py                   :: 需要看清单时刷新
+git commit -am "Release %V%" && git push origin main
+git tag -a v%V% -m "Release %V%" && git push origin v%V%
+python ci/gen_changelog.py                   :: tag 之后重新基线清单
+```
+
+`--release` 刻意**不动生成清单**：打完 tag 前 CI 的校验区间是
+`<最近 tag>..HEAD~1`，清单必须仍与那段历史一致，挪走或清空都会让发布提交当场
+变红。清单在 tag 之后那次刷新里自然归零。
+
+发布页正文不再用 `generate_release_notes`（它只给一行 Full Changelog 链接），
+而是 publish 阶段跑 `ci/gen_changelog.py --notes <tag>` 取对应版本段落；
+段落不存在时退回极简说明，不阻断发布。
+
 - **只改 CHANGELOG.md 与 `ci/gen_changelog*.py` 的提交不进清单**：否则收录它们
   会产生新提交、新提交又需要收录，闸门永远失败。
 

@@ -398,6 +398,101 @@ def case_crlf_file():
         r.close()
 
 
+def case_release_mode():
+    """--release 冻结段落、--notes 抽取发布说明，以及各种前置校验。
+
+    这两个子命令不碰 git，只读写 CHANGELOG.md 与 CMakeLists.txt，所以这里
+    直接在临时目录里造文件，不必建仓库。
+    """
+    tmp = tempfile.mkdtemp(prefix='gen-changelog-release-')
+    try:
+        path = os.path.join(tmp, 'CHANGELOG.md')
+        original = (
+            u'# \u66f4\u65b0\u65e5\u5fd7\n\n'
+            u'## [\u672a\u53d1\u5e03]\n\n'
+            u'\u672c\u6bb5\u5206\u4e24\u90e8\u5206\u3002\n\n'
+            u'### \u65b0\u589e\n\n'
+            u'- \u8fd9\u6b21\u8981\u53d1\u5e03\u7684\u8981\u70b9\n\n'
+            u'<!-- BEGIN generated:unreleased -->\n\n'
+            u'### \u63d0\u4ea4\u6e05\u5355\n\n'
+            u'- Add something\n\n'
+            u'<!-- END generated:unreleased -->\n\n'
+            u'## [0.3.0] - 2026-10-04\n\n'
+            u'### \u65b0\u589e\n\n'
+            u'- \u4e0a\u4e00\u4e2a\u7248\u672c\u7684\u8981\u70b9\n\n'
+            u'## [0.2.1] - 2026-10-03\n\n'
+            u'### \u4fee\u590d\n\n'
+            u'- \u66f4\u65e7\u7684\u4fee\u590d\n\n'
+            u'[\u672a\u53d1\u5e03]: https://github.com/tdyx87/libmini'
+            u'/compare/v0.3.0...HEAD\n'
+            u'[0.3.0]: https://github.com/tdyx87/libmini'
+            u'/compare/v0.2.1...v0.3.0\n')
+        with open(path, 'w', encoding='utf-8', newline='') as handle:
+            handle.write(original)
+        with open(os.path.join(tmp, 'CMakeLists.txt'), 'w',
+                  encoding='utf-8', newline='') as handle:
+            handle.write('set(LIBMINI_VERSION 0.3.1)\n')
+
+        def run_tool(*args):
+            argv = [sys.executable, TOOL] + list(args) + ['--path', path]
+            proc = subprocess.run(argv, cwd=tmp, stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE)
+            return (proc.returncode, proc.stdout.decode('utf-8', 'replace'),
+                    proc.stderr.decode('utf-8', 'replace'))
+
+        def read_now():
+            with open(path, encoding='utf-8') as handle:
+                return handle.read()
+
+        # 版本号格式 / 与 CMakeLists 不一致
+        rc, out, err = run_tool('--release', '0.3')
+        assert rc == 2 and '格式' in err, (rc, err)
+        rc, out, err = run_tool('--release', '9.9.9')
+        assert rc == 2 and 'LIBMINI_VERSION' in err, (rc, err)
+        # 日期格式
+        rc, out, err = run_tool('--release', '0.3.1', '--date', '2026/10/05')
+        assert rc == 2 and 'YYYY-MM-DD' in err, (rc, err)
+        # dry-run 只打印不改文件
+        rc, out, err = run_tool('--release', '0.3.1', '--date', '2026-10-05',
+                                '--dry-run')
+        assert rc == 0, (rc, err)
+        assert '## [0.3.1] - 2026-10-05' in out, out
+        assert '- 这次要发布的要点' in out, out
+        assert 'Add something' not in out, '发布说明不应包含生成清单'
+        assert read_now() == original, 'dry-run 不得写文件'
+
+        # 真正冻结
+        rc, out, err = run_tool('--release', '0.3.1', '--date', '2026-10-05')
+        assert rc == 0, (rc, err)
+        text = read_now()
+        # 生成清单必须原样保留（CI 在 tag 之前还要用它校验）
+        assert '- Add something' in text, '清单不得被挪走或清空'
+        assert text.startswith('# \u66f4\u65b0\u65e5\u5fd7'), text[:40]
+        assert '- 这次要发布的要点' in text
+        assert '## [0.3.1] - 2026-10-05' in text
+        assert text.index('## [0.3.1]') < text.index('## [0.3.0]'), '新版本必须在旧版本之前'
+        assert '上一个版本的要点' in text
+        assert '更旧的修复' in text, '旧版本段落必须原样保留'
+        assert ('[0.3.1]: https://github.com/tdyx87/libmini/compare'
+                '/v0.3.0...v0.3.1') in text, '缺少 compare 链接'
+        assert text.count('BEGIN generated') == 1
+
+        # 重复冻结同一版本必须报错
+        rc, out, err = run_tool('--release', '0.3.1')
+        assert rc == 2 and '已在 CHANGELOG' in err, (rc, err)
+
+        # --notes 抽取（允许带 v 前缀）
+        rc, out, err = run_tool('--notes', '0.3.0')
+        assert rc == 0 and out.startswith('## [0.3.0]'), (rc, out)
+        assert '更早的修复' not in out, '不应溢出到下一个版本段落'
+        rc, out, err = run_tool('--notes', 'v0.3.1')
+        assert rc == 0 and out.startswith('## [0.3.1]'), (rc, out)
+        rc, out, err = run_tool('--notes', '9.9.9')
+        assert rc == 2 and '没有版本' in err, (rc, err)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def main():
     case_classification()
     case_idempotent_write()
@@ -405,6 +500,7 @@ def main():
     case_non_utf8()
     case_pr_merge_checkout()
     case_head_on_tag()
+    case_release_mode()
     case_crlf_file()
     print('gen_changelog self-test: ALL OK')
 
