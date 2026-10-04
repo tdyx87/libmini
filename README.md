@@ -2,6 +2,8 @@
 
 Windows（MSVC 2017 / x86）下的 C++11 日常工具库：字符串、编码、摘要、配置、调度、RPC 等常用能力开箱即用。CMake + Conan 构建，静态/动态库均支持。
 
+版本历史与缺陷修复记录见 [CHANGELOG.md](CHANGELOG.md)（Keep a Changelog 格式）。
+
 ## 构建
 
 依赖通过 Conan 安装（zlib、gtest、nlohmann_json、spdlog、cpp-httplib、pugixml 等），首次构建先执行：

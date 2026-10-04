@@ -1,0 +1,166 @@
+# 更新日志
+
+本文件记录 libmini 的用户可见变更（新增 API、行为变化、缺陷修复与平台差异）。
+格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循
+[语义化版本](https://semver.org/lang/zh-CN/)。
+
+约定：
+
+- **Added / 新增**：新增模块、头文件、公开 API。
+- **Changed / 变更**：已有 API 的签名或语义变化（含「更严格的非法值处理」）。
+- **Fixed / 修复**：缺陷修复。跨平台缺陷会标注影响平台。
+- 仅影响 CI、打包脚本与测试自身的改动归入「内部」，不对使用者构成影响。
+
+## [未发布]
+
+### 新增
+
+- **hardware_info 模块**（`utils/hardware_info.h`）：机器硬件清单快照，
+  与 `system_info` 的运行时指标分工。提供 CPU 型号与拓扑、网卡（MAC / IPv4 /
+  IPv6）、物理磁盘（型号 / 序列号 / 总线类型）、卷（盘符 / 文件系统 / 标识）、
+  主板与 BIOS 信息，以及 `primary_mac_address()` / `primary_ipv4_address()` /
+  `format_mac()` 便捷接口。平台能力差异以「空字段 + 错误说明字符串」表达，
+  不抛异常、不提权：Windows 走宽字符注册表与卷 API（中文型号与卷标不乱码，
+  卷 GUID 反查盘符），Linux 读 `/proc` 与 `/sys`（卷标识用文件系统 UUID），
+  macOS 走 `system_profiler`。
+- **RPC 配置自检**：`RpcClient::config()` / `RpcServer::config()` 导出配置快照，
+  新增 `RpcClientConfig` / `RpcServerConfig` 两个 `LIBMINI_API` 结构与
+  `validate()` 合法性自检（沿用 `TcpConfig::validate()` 的「逐条 warn +
+  整体判否」风格）。`apply_config()` 结束自动自检一次，让非法配置在第一次
+  请求之前就暴露。
+
+### 变更
+
+- RPC 客户端与服务端的所有 setter 对负的超时 / 等待预算统一**钳到 0 并记 warn**。
+  此前 `apply_config()` 的 `v >= 0` 守卫会**静默丢弃**负值，与直接调 setter 的
+  行为不一致；`set_retry_max_delay_ms()` 低于退避基数时抬到基数。
+
+### 修复
+
+- **RPC `max_retries` 传负值时请求根本不发**：重试循环写作
+  `attempt <= max_retries`，负值导致循环体一次都不进，`call()` 直接返回空串 +
+  `UNKNOWN`，表现得像服务器不可达。现被钳到 0，即「至少尝试一次」。
+
+### 内部
+
+- 新增公开测试钩子 `RpcServer::set_test_bind_delay_ms()`（默认 0，上限 5000ms），
+  用来确定性复现下述 HTTP 停机竞态窗口。
+- 启动 / 停机不变量成文写入 `rpc.h`，并按传输类型分别加了回归断言。
+
+## [0.2.1] - 2026-10-03
+
+### 修复
+
+- **HTTP 传输 `RpcServer::stop()` 挂死**（Windows）：cpp-httplib 0.28 的
+  `Server::stop()` 以 `is_running_` 为闸门，而该标志要到 `listen_after_bind()`
+  进入 accept 循环才置位；我们的 `bind_ok` 在 bind 完成即发布。停机若落在这个
+  窗口内，`stop()` 会静默变成空操作，accept 循环随后进入并永久阻塞，
+  `RpcServer::stop()` 里的 worker `join()` 无界等待。这是 CI 上 Windows
+  `rpc_test` 套件偶发 1200s 超时的系统性根因（每次挂的用例不同，都是 fixture
+  建立后立刻停机）。现在停机前按 `bind_done && bind_ok` 判断，有界轮询（5s 兜底）
+  等 `is_running_` 置位后再调 `stop()`；从未 bind 或 bind 失败的服务器跳过等待。
+- **跨单元断言求值顺序竞态**：`StopwatchTest` 的断言在求值顺序不确定时可能先读
+  被测值再触发 `restart()`，读到污染数据。
+
+### 内部
+
+- 新增形状四确定性回归用例 `StopInsideBindAcceptWindowIsDeterministic`，并保留
+  停机压力测试。
+
+## [0.2.0] - 2026-10-02
+
+### 新增
+
+- **msgpack 模块**（`utils/msgpack.h`）：复用 nlohmann 内置编解码（零新增依赖、
+  规范全兼容），提供 `JsonValue` 树与类型化封装，类型支持与 JSON 同一套。
+- **proto_buf 模块**（`utils/proto_buf.h`）：手写 proto3 wire format 编解码，
+  不引入 libprotobuf / protoc 但与官方实现字节级兼容；字段号键的 `JsonValue`
+  树，packed repeated 字段用 `unfold_packed` 展开（wire format 无法自描述）。
+  两者沿用 JSON / XML 后端的 `serialize_to_X` / `deserialize_from_X_or` 约定。
+- **TcpConfig 配置校验**：新增 `validate()`，并在 `tcp.h` 写明心跳语义。
+
+### 变更
+
+- TCP 客户端 PING 间隔不再被 poll 粒度拉长（心跳节拍失真）。
+- TCP poll 模式会话循环的等待上限改为自适应。
+- `RpcServer::is_running()` 与 `wait_until_ready()` 语义对齐（HTTP 传输）。
+- `TcpConfig` 加上 `LIBMINI_API` 导出（新增成员函数后必须导出，否则 DLL 消费者
+  链接失败）。
+
+### 修复
+
+- **重试抖动围栏错误**：等待时间可能正好等于退避上限，改为严格小于上限。
+
+## [0.1.2] - 2026-09-29
+
+### 新增
+
+- 发布流水线校验：artifact 逐包生成 `.sha256`，并额外产出 `SHA256SUMS` 总清单，
+  publish 阶段验证传输完整性，下载后 `sha256sum -c SHA256SUMS` 一键核对。
+
+### 修复
+
+- 重试抖动围栏错误（与 0.2.0 同批修复，此处为其首次进入发布分支的位置）。
+- `Stopwatch` restart 断言在慢速 CI 机器上不稳健。
+- 连接池排队用例的等待预算放宽，以适应慢速 macOS 门禁机器。
+
+## [0.1.1] - 2026-09-28
+
+### 修复
+
+- **两个仅 POSIX 触发的死锁**：曾导致整轮测试套件超时。
+- **UDS 连接线程生命周期**与 exports 中的 Threads 依赖。
+- **异步 executor 退休竞态**：表现为 `ubuntu-shared` job 上的回调停滞。
+- **DirWatcher 的重命名 / 删除竞态**，以及 POSIX 基线快照竞态与重命名事件契约。
+- `RunAfterExecutesOnce` 中一个「尚未触发」的时序断言。
+- CI 健壮性：日志行缓冲、Windows 创建事件等待、调度器轮询（消除 CI 上的间歇失败）。
+
+## [0.1.0] - 2026-09-28
+
+首个发布版本。Windows（MSVC 2017 / x86）为主，Linux 与 macOS 为 CI 验证平台。
+C++11 + CMake + Conan，静态 / 动态库均支持。
+
+### 新增
+
+- 基础设施：`string_utils` / `string_algo` / `lexical_cast`、`time_utils` /
+  `stopwatch`、`file_utils`（含 `write_file_atomic` 原子写与流式摘要）/
+  `path_utils`、`thread_utils`（线程池、`BlockingQueue`、`CountdownLatch`）、
+  `json_utils` / `xml_utils` / `serialization`。
+- 基础能力：`uuid`、`crc`、`encoding`（Base64 / Hex / URL）、`scope_guard`、
+  `optional`、`random_utils`、`env`、`digest`（MD5 / SHA-256）、`ini_config`、
+  `gzip`、`async`（延时调度器 + 令牌桶限流）、`args`、`file_lock`、`dir_watcher`、
+  `win_service`、`hmac`、`process`、`lru_cache`、`base32`、`console`。
+- 加密与存储：`aes_gcm`（Windows CNG / OpenSSL EVP）、`zip`（zlib，UTF-8 文件名）、
+  `sqlite`。
+- 网络与 RPC：`tcp`（帧协议 + 心跳保活，零第三方依赖）、`retry`、`rpc`
+  （JSON RPC，HTTP / Windows 命名管道 / POSIX UDS / 裸 TCP 帧四种传输一套 API；
+  可配置异步 executor、每调用超时、连接池、重试与抖动、过载保护、延迟分位、
+  队列监控、spdlog 日志）、`object_pool`。
+- 服务与工具模块：`http_client`、`http_server`（路径参数 / query 解析 / 前置
+  过滤器 / fallback / 访问日志钩子 / 请求体上限）、`system_info`、
+  `log_facade`、`config_facade`（默认值 → 文件 → 环境变量三层合并）、
+  `net_addr`、`timer_wheel`。
+- 文档：`docs/config_practices.md`、`docs/rpc_concurrency_guide.md`、
+  `docs/rpc_transport_guide.md`。
+- 基准：`benchmark/` 下 future-vs-callback 等对比用例。
+- CI：`.github/workflows/ci.yml` 三平台 Release 基线 + Debug + Shared +
+  warnings-strict（`-Wall -Wextra -Werror`）矩阵，全走 conan + Ninja，CTest 全套，
+  并做安装后 `find_package` 冒烟（`ci/smoke_consumer`）。
+- 发布：`.github/workflows/release.yml` tag 触发，三平台 CPack 产物（ZIP / TGZ）。
+
+### 修复
+
+- 首次 CI 打通三平台：win_service 与 RPC UDS 辅助函数的 POSIX 编译错误、
+  POSIX 帧辅助与 C++11 lambda 捕获、控制台 POSIX 分支、条件 OpenSSL 依赖、
+  冒烟工具链路径。
+- **管道连接竞态**：监听实例切换间隙客户端会命中 `ERROR_FILE_NOT_FOUND`。
+- 导出面：停用 `WINDOWS_EXPORT_ALL_SYMBOLS`，DLL 只导出 `LIBMINI_API` 标注的
+  符号（新增公开 API 必须标注）。
+- sqlite 的 `build_executable=False` 选项与平台相关的 64 位问题。
+
+[未发布]: https://github.com/tdyx87/libmini/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/tdyx87/libmini/compare/v0.2.0...v0.2.1
+[0.2.0]: https://github.com/tdyx87/libmini/compare/v0.1.2...v0.2.0
+[0.1.2]: https://github.com/tdyx87/libmini/compare/v0.1.1...v0.1.2
+[0.1.1]: https://github.com/tdyx87/libmini/compare/v0.1.0...v0.1.1
+[0.1.0]: https://github.com/tdyx87/libmini/releases/tag/v0.1.0
