@@ -20,6 +20,7 @@ set(LIBMINI_SOURCES
     utils/crc.cpp
     utils/encoding.cpp
     utils/random_utils.cpp
+    utils/secure_random.cpp
     utils/env.cpp    utils/digest.cpp
     utils/hmac.cpp
     utils/process.cpp    utils/base32.cpp

@@ -27,6 +27,7 @@
 #include "utils/scope_guard.h"
 #include "utils/optional.h"
 #include "utils/random_utils.h"
+#include "utils/secure_random.h"
 #include "utils/env.h"
 #include "utils/digest.h"
 #include "utils/ini_config.h"

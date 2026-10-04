@@ -1289,6 +1289,98 @@ TEST(MachineFingerprintTest, VirtualMachineCapsConfidence)
     }
     EXPECT_EQ(fp.is_virtual, is_virtual_machine());
 }
+// ------------------------------ secure_random ------------------------------
+
+TEST(SecureRandomTest, ProducesRequestedSizes)
+{
+    using namespace libmini;
+    // size 0 是合法的无操作
+    EXPECT_TRUE(secure_random_bytes(nullptr, 0));
+    char buffer[64] = {0};
+    EXPECT_TRUE(secure_random_bytes(buffer, sizeof(buffer)));
+    EXPECT_NE(secure_random_string(0), std::string("x"));
+    EXPECT_TRUE(secure_random_string(0).empty());
+    EXPECT_EQ(secure_random_string(100).size(), 100u);
+    // 空指针 + 非零长度必须被拒绝，不能崩也不能静默成功
+    EXPECT_FALSE(secure_random_bytes(nullptr, 8));
+}
+
+TEST(SecureRandomTest, ConsecutiveValuesDiffer)
+{
+    using namespace libmini;
+    // 概率性断言，但 2^-128 的碰撞率在任何 CI 上都不构成 flaky 风险
+    EXPECT_NE(secure_random_string(16), secure_random_string(16));
+    EXPECT_NE(secure_random_u64(), secure_random_u64());
+    EXPECT_NE(secure_random_hex(16), secure_random_hex(16));
+    EXPECT_NE(secure_token(), secure_token());
+    EXPECT_FALSE(Uuid::generate() == Uuid::generate());
+}
+
+TEST(SecureRandomTest, HexAndTokenHaveExpectedAlphabet)
+{
+    using namespace libmini;
+    const std::string hex = secure_random_hex(16);
+    ASSERT_EQ(hex.size(), 32u);
+    for (std::size_t i = 0; i < hex.size(); ++i) {
+        EXPECT_TRUE((hex[i] >= '0' && hex[i] <= '9') ||
+                    (hex[i] >= 'a' && hex[i] <= 'f'))
+            << "非小写十六进制: " << hex;
+    }
+    EXPECT_TRUE(secure_random_hex(0).empty());
+
+    // token 用 Base64url 字母表：JWT/URL 安全，可直接放进 header 或 URL
+    const std::string token = secure_token(24);
+    ASSERT_EQ(token.size(), 24u);
+    for (std::size_t i = 0; i < token.size(); ++i) {
+        const char c = token[i];
+        const bool ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                        (c >= '0' && c <= '9') || c == '-' || c == '_';
+        EXPECT_TRUE(ok) << "token 含非 Base64url 字符: " << token;
+    }
+}
+
+TEST(SecureRandomTest, CharsStayInsideAlphabetAndCoverIt)
+{
+    using namespace libmini;
+    EXPECT_TRUE(secure_random_chars(0, "abc").empty());
+    EXPECT_TRUE(secure_random_chars(8, "").empty());
+    // 字母表 > 256 无法逐字节无偏采样，直接拒绝而不是悄悄截断
+    EXPECT_TRUE(secure_random_chars(4, std::string(300, 'a')).empty());
+
+    const std::string alphabet = "abcdef";
+    const std::string sample = secure_random_chars(600, alphabet);
+    ASSERT_EQ(sample.size(), 600u);
+    bool seen[6] = {false, false, false, false, false, false};
+    for (std::size_t i = 0; i < sample.size(); ++i) {
+        const std::size_t pos = alphabet.find(sample[i]);
+        ASSERT_NE(pos, std::string::npos)
+            << "字符不在字母表内: " << sample[i];
+        seen[pos] = true;
+    }
+    for (int i = 0; i < 6; ++i) {
+        EXPECT_TRUE(seen[i]) << "字母表第 " << i << " 个字符一次都没出现";
+    }
+}
+
+TEST(SecureRandomTest, AlphabetSamplingIsNotVisiblyBiased)
+{
+    using namespace libmini;
+    // 6 个字符会让朴素取模出现约 1/86 的偏置（256 = 42*6 + 4，前 4 个余数
+    // 多一次机会）。拒绝采样消除它。这里只做粗粒度断言：拒绝采样下
+    // 各字符占比都在 1/6 附近。
+    const std::string alphabet = "abcdef";
+    const std::string sample = secure_random_chars(60000, alphabet);
+    ASSERT_EQ(sample.size(), 60000u);
+    std::size_t counts[6] = {0, 0, 0, 0, 0, 0};
+    for (std::size_t i = 0; i < sample.size(); ++i) {
+        ++counts[alphabet.find(sample[i])];
+    }
+    for (int i = 0; i < 6; ++i) {
+        // 期望 10000，取 ±12% 的宽松区间：足够抓住朴素取模的 1/86 偏置
+        EXPECT_GT(counts[i], 8800u);
+        EXPECT_LT(counts[i], 11200u);
+    }
+}
 TEST(SystemInfoTest, ExecutablePathIsAbsolute)
 {
     using namespace libmini;

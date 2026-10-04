@@ -27,6 +27,10 @@
 
 ### 提交清单
 
+#### 变更
+
+- Teach the changelog tool to freeze a release and feed the release page（[c52962e](https://github.com/tdyx87/libmini/commit/c52962e0237ff9d80f7e0ee816433ad5adb1f970)）
+
 #### 内部
 
 - Rebaseline the changelog after v0.3.0 and drop dead matrix config（[bfc6d7f](https://github.com/tdyx87/libmini/commit/bfc6d7f1cdb125460017a01a546a1324e081ec6a)）
@@ -45,6 +49,8 @@
   不抛异常、不提权：Windows 走宽字符注册表与卷 API（中文型号与卷标不乱码，
   卷 GUID 反查盘符），Linux 读 `/proc` 与 `/sys`（卷标识用文件系统 UUID），
   macOS 走 `system_profiler`。
+- **secure_random 模块**（`utils/secure_random.h`）：系统 CSPRNG 封装（Windows `BCryptGenRandom`、Linux `getrandom` 并退回 `/dev/urandom`、macOS `arc4random_buf`），提供随机字节 / 十六进制串 / Base64url 令牌；按字母表取样用**拒绝采样**消除取模偏置（直接 `%` 会让靠前字符多出最多 1/256 的权重，用作口令是可测的弱点）。熵源不可用时返回失败而非退化。
+  `Uuid::generate()` 随之改用它：此前用 `mt19937_64` + `random_device` 播种，而 Mersenne Twister 可预测（624 个 32 位输出即还原状态）、且 MSVC/MinGW 的 `std::random_device` 本身也不是密码学实现；熵源不可用时返回 nil UUID 并可由 `is_nil()` 发现。`random_utils` 保持原样并已在头文件注明只适用于「需要一点随机性」的场景。
 - **machine_fingerprint 模块**（`utils/machine_fingerprint.h`）：从 hardware_info
   的硬件清单派生「这台机器是谁」的稳定标识，用于许可证单机绑定、席位去重上报、
   设备聚合遥测。主板/整机序列号 + CPU 型号 + 物理网卡 MAC（+ 物理盘序列号）

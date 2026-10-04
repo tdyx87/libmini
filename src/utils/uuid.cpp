@@ -2,24 +2,22 @@
 
 #include <cstdio>
 #include <cstring>
-#include <mutex>
-#include <random>
+
+#include "secure_random.h"
 
 namespace libmini {
 
 Uuid Uuid::generate()
 {
-    // mt19937_64 不可拷贝；用函数内 static + mutex 保证多线程安全
-    static std::mutex mtx;
-    static std::mt19937_64 rng(std::random_device{}());
-
     Uuid u;
-    {
-        std::lock_guard<std::mutex> lock(mtx);
-        const std::uint64_t a = rng();
-        const std::uint64_t b = rng();
-        std::memcpy(u.bytes, &a, sizeof(a));
-        std::memcpy(u.bytes + 8, &b, sizeof(b));
+    // v4 的全部随机性来自这 16 字节。此前用 mt19937_64 + random_device 播种，
+    // 但 Mersenne Twister 是可预测的（624 个 32 位输出即可还原状态），而
+    // MSVC/MinGW 的 std::random_device 也不是密码学实现。UUID 经常被当作
+    // 会话 ID / 订单号 / 授权凭据使用，这些场景不该建立在可预测随机源上。
+    if (!secure_random_bytes(u.bytes, sizeof(u.bytes))) {
+        // 熵源不可用时返回 nil UUID 而不是伪造一个：调用方能凭 is_nil() 发现，
+        // 比拿到一个「看起来正常但随机性不足」的 UUID 更容易排查。
+        return nil();
     }
 
     // version 4：byte[6] 高 4 位 = 0100
