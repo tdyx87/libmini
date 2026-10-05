@@ -1886,6 +1886,288 @@ TEST(UuidTest, VersionAndVariantReflectBitLayout)
     EXPECT_EQ(parsed, v7);
 }
 
+// ------------------------------ csv ------------------------------
+
+TEST(CsvTest, ParsesRfc4180Basics)
+{
+    using namespace libmini;
+    std::vector<std::vector<std::string>> rows;
+    // 期望值与 Python csv 模块（RFC 4180 参考实现）逐条比对过
+    ASSERT_TRUE(csv_parse("a,b,c", rows));
+    ASSERT_EQ(rows.size(), 1u);
+    ASSERT_EQ(rows[0].size(), 3u);
+    EXPECT_EQ(rows[0][0], "a");
+    EXPECT_EQ(rows[0][1], "b");
+    EXPECT_EQ(rows[0][2], "c");
+
+    // 行尾：LF / CRLF / 裸 CR 都算一个换行，且不产生多余的末行
+    ASSERT_TRUE(csv_parse("a,b,c\n", rows));
+    EXPECT_EQ(rows.size(), 1u);
+    ASSERT_TRUE(csv_parse("a,b,c\r\n", rows));
+    EXPECT_EQ(rows.size(), 1u);
+    ASSERT_TRUE(csv_parse("a,b,c\r", rows));
+    EXPECT_EQ(rows.size(), 1u);
+    ASSERT_TRUE(csv_parse("a,b\nc,d\n", rows));
+    ASSERT_EQ(rows.size(), 2u);
+    EXPECT_EQ(rows[1][0], "c");
+
+    // 空文本 = 0 行；空行（依选项）
+    ASSERT_TRUE(csv_parse("", rows));
+    EXPECT_TRUE(rows.empty());
+
+    // 引号包裹的字段：分隔符、换行、引号本身
+    ASSERT_TRUE(csv_parse("a,\"b,c\",d", rows));
+    EXPECT_EQ(rows[0][1], "b,c");
+    ASSERT_TRUE(csv_parse("a,\"b\"\"q\",c", rows));
+    EXPECT_EQ(rows[0][1], "b\"q");
+    ASSERT_TRUE(csv_parse("\"multi\nline\",b", rows));
+    ASSERT_EQ(rows.size(), 1u);
+    EXPECT_EQ(rows[0][0], "multi\nline");
+    ASSERT_TRUE(csv_parse("\"multi\r\nline\",b", rows));
+    EXPECT_EQ(rows[0][0], "multi\r\nline");
+
+    // 首尾空格属于字段内容，不 trim（RFC 规则 5）
+    ASSERT_TRUE(csv_parse("a,  b  ,c", rows));
+    EXPECT_EQ(rows[0][1], "  b  ");
+    ASSERT_TRUE(csv_parse("\" leading\",b", rows));
+    EXPECT_EQ(rows[0][0], " leading");
+
+    // 空字段与全空行
+    ASSERT_TRUE(csv_parse("\"\"", rows));
+    ASSERT_EQ(rows.size(), 1u);
+    EXPECT_TRUE(rows[0][0].empty());
+    ASSERT_TRUE(csv_parse("a,\"\",b", rows));
+    EXPECT_EQ(rows[0][1], "");
+    ASSERT_TRUE(csv_parse("a,", rows));
+    ASSERT_EQ(rows[0].size(), 2u);
+    EXPECT_TRUE(rows[0][1].empty());
+
+    // 不做类型推断：前导零必须保留
+    ASSERT_TRUE(csv_parse("00123,1e5", rows));
+    EXPECT_EQ(rows[0][0], "00123");
+    EXPECT_EQ(rows[0][1], "1e5");
+
+    // 字段中间的引号是字面量，不是引号起始
+    ASSERT_TRUE(csv_parse("a\"b,c", rows));
+    EXPECT_EQ(rows[0][0], "a\"b");
+    ASSERT_TRUE(csv_parse("x,y\"z", rows));
+    EXPECT_EQ(rows[0][1], "y\"z");
+}
+
+TEST(CsvTest, ParsesBomBlankLinesAndRejectsBadInput)
+{
+    using namespace libmini;
+    std::vector<std::vector<std::string>> rows;
+
+    // UTF-8 BOM 跳过；不跳过时它会粘进第一个字段
+    ASSERT_TRUE(csv_parse("\xEF\xBB\xBF" "a,b\n", rows));
+    ASSERT_EQ(rows.size(), 1u);
+    EXPECT_EQ(rows[0][0], "a");
+    CsvOptions keep_bom;
+    keep_bom.skip_bom = false;
+    ASSERT_TRUE(csv_parse("\xEF\xBB\xBF" "a,b\n", rows, keep_bom));
+    EXPECT_EQ(rows[0][0].size(), 4u);  // 3 字节 BOM + "a"
+
+    // 空白行默认丢弃
+    ASSERT_TRUE(csv_parse("a,b\n\n\nc,d\n", rows));
+    EXPECT_EQ(rows.size(), 2u);
+    CsvOptions keep_blank;
+    keep_blank.skip_blank_lines = false;
+    ASSERT_TRUE(csv_parse("a,b\n\nc,d\n", rows, keep_blank));
+    EXPECT_EQ(rows.size(), 3u);
+    EXPECT_TRUE(rows[1].empty());
+
+    // 引号未闭合必须判否：截断的 CSV 与完整 CSV 长得一样，
+    // 悄悄通过等于把上游 bug 变成下游脏数据
+    EXPECT_FALSE(csv_parse("a,\"unterminated\n", rows));
+    EXPECT_FALSE(csv_parse("\"", rows));
+    EXPECT_FALSE(csv_parse("a,b\nc,\"dangling", rows));
+
+    // 参数非法
+    CsvOptions bad_delim;
+    bad_delim.delimiter = '\0';
+    EXPECT_FALSE(csv_parse("a,b", rows, bad_delim));
+    CsvOptions bad_quote;
+    bad_quote.quote = ',';
+    EXPECT_FALSE(csv_parse("a,b", rows, bad_quote));
+}
+
+TEST(CsvTest, ParseIsOrderAndQuoteFaithful)
+{
+    using namespace libmini;
+    std::vector<std::vector<std::string>> rows;
+
+    // 行序、列序必须与原文一致
+    ASSERT_TRUE(csv_parse("r0c0,r0c1\nr1c0,r1c1\nr2c0,r2c1\n", rows));
+    ASSERT_EQ(rows.size(), 3u);
+    for (std::size_t r = 0; r < 3; ++r) {
+        EXPECT_EQ(rows[r][0], "r" + std::to_string(r) + "c0");
+        EXPECT_EQ(rows[r][1], "r" + std::to_string(r) + "c1");
+    }
+
+    // 尾部逗号产生的空列不能被吞掉
+    ASSERT_TRUE(csv_parse("a,b,\n", rows));
+    ASSERT_EQ(rows[0].size(), 3u);
+    EXPECT_TRUE(rows[0][2].empty());
+
+    // 引号闭合后的脏数据按字面追加（Excel 的 `"a" ,b`）
+    ASSERT_TRUE(csv_parse("\"a\" x,b", rows));
+    EXPECT_EQ(rows[0][0], "a x");
+}
+
+TEST(CsvTest, SerializeQuotesOnlyWhenNeeded)
+{
+    using namespace libmini;
+    std::vector<std::vector<std::string>> rows;
+    rows.push_back({ "plain", "with,comma", "with\"quote", "with\nnewline" });
+    rows.push_back({ " leading", "trailing ", "00123", "" });
+
+    const std::string text = csv_serialize(rows);
+    // 只有真需要的字段加引号：空白环绕的字段不加（RFC 明确说空格是内容）
+    EXPECT_EQ(text,
+              "plain,\"with,comma\",\"with\"\"quote\",\"with\nnewline\"\n"
+              " leading,trailing ,00123,\n");
+
+    // CRLF 模式（RFC 规定的行结束符）
+    const std::string crlf = csv_serialize(rows, true);
+    EXPECT_NE(crlf.find("\r\n"), std::string::npos);
+    // 空行里没有多余的 CRLF
+    EXPECT_EQ(crlf[crlf.size() - 1], '\n');
+
+    // 非 ASCII 不受影响，UTF-8 原样透传
+    std::vector<std::vector<std::string>> uni;
+    uni.push_back({ "中文", "emoji" });
+    EXPECT_EQ(csv_serialize(uni), "中文,emoji\n");
+
+    // 非法选项返回空串
+    CsvOptions bad;
+    bad.delimiter = '\0';
+    EXPECT_TRUE(csv_serialize(rows, false, bad).empty());
+}
+
+TEST(CsvTest, RoundTripIsLossless)
+{
+    using namespace libmini;
+    std::vector<std::vector<std::string>> original;
+    original.push_back({ "a", "b,c", "d\"e", "f\ng" });
+    original.push_back({ " lead", "trail ", "", "h\ri" });
+    original.push_back({ "中文", "00123", "1e5", "a\r\nb" });
+
+    // 序列化 → 解析 必须完全还原，这是 CSV 模块存在的根本理由
+    std::vector<std::vector<std::string>> restored;
+    ASSERT_TRUE(csv_parse(csv_serialize(original), restored));
+    ASSERT_EQ(restored.size(), original.size());
+    for (std::size_t r = 0; r < original.size(); ++r) {
+        ASSERT_EQ(restored[r].size(), original[r].size())
+            << "行 " << r << " 字段数不一致";
+        for (std::size_t c = 0; c < original[r].size(); ++c) {
+            EXPECT_EQ(restored[r][c], original[r][c])
+                << "行 " << r << " 列 " << c;
+        }
+    }
+
+    // CRLF 模式同样无损
+    std::vector<std::vector<std::string>> restored_crlf;
+    ASSERT_TRUE(csv_parse(csv_serialize(original, true), restored_crlf));
+    ASSERT_EQ(restored_crlf.size(), original.size());
+    for (std::size_t r = 0; r < original.size(); ++r) {
+        ASSERT_EQ(restored_crlf[r].size(), original[r].size());
+        for (std::size_t c = 0; c < original[r].size(); ++c) {
+            EXPECT_EQ(restored_crlf[r][c], original[r][c])
+                << "CRLF 模式下行 " << r << " 列 " << c;
+        }
+    }
+
+    // 关闭引号解析时不做任何转义：分隔符仍分隔，其余原样
+    CsvOptions no_quote;
+    no_quote.quote = '\0';
+    std::vector<std::vector<std::string>> raw;
+    ASSERT_TRUE(csv_parse("a,\"b\",c", raw, no_quote));
+    ASSERT_EQ(raw[0].size(), 3u);
+    EXPECT_EQ(raw[0][1], "\"b\"");
+    // 关闭引号后不做任何转义：字段里的 " 就是字面数据，原样写出。
+    // （若在这里期望输出里没有引号，等于要求转义——那就等于没关闭引号。）
+    EXPECT_EQ(csv_serialize(raw, false, no_quote), "a,\"b\",c\n");
+}
+
+TEST(CsvTest, CustomDelimiterAndHeaderHelpers)
+{
+    using namespace libmini;
+    CsvOptions semi;
+    semi.delimiter = ';';
+    std::vector<std::vector<std::string>> rows;
+    ASSERT_TRUE(csv_parse("a;b;\"c;d\"", rows, semi));
+    ASSERT_EQ(rows[0].size(), 3u);
+    EXPECT_EQ(rows[0][2], "c;d");
+    // 换分隔符后逗号是普通字符
+    ASSERT_TRUE(csv_parse("a,b;c", rows, semi));
+    EXPECT_EQ(rows[0][0], "a,b");
+
+    std::vector<std::vector<std::string>> src;
+    src.push_back({ "id", "name", "score" });
+    src.push_back({ "1", "张三", "90" });
+    src.push_back({ "2", "李四", "85" });
+
+    const std::string path = unique_temp_path("csv_hdr_");
+    ASSERT_TRUE(csv_write_file(path, src));
+
+    std::vector<std::string> header;
+    std::vector<std::vector<std::string>> data;
+    ASSERT_TRUE(csv_read_file_with_header(path, header, data));
+    ASSERT_EQ(header.size(), 3u);
+    EXPECT_EQ(header[0], "id");
+    EXPECT_EQ(header[1], "name");
+    // 表头不重复出现在数据里
+    ASSERT_EQ(data.size(), 2u);
+    EXPECT_EQ(data[0][1], "张三");
+
+    EXPECT_EQ(csv_column_index(header, "name"), 1);
+    EXPECT_EQ(csv_column_index(header, "missing"), -1);
+    // 大小写敏感（不做规范化）
+    EXPECT_EQ(csv_column_index(header, "Name"), -1);
+
+    // 不带表头的读法拿到的仍是全部行
+    std::vector<std::vector<std::string>> all;
+    ASSERT_TRUE(csv_read_file(path, all));
+    EXPECT_EQ(all.size(), 3u);
+
+    // 文件不存在时返回 false，且不留垃圾数据
+    std::vector<std::vector<std::string>> missing;
+    std::vector<std::string> missing_header;
+    EXPECT_FALSE(csv_read_file_with_header(std::string("no_such_dir_9x7y/x.csv"),
+                                           missing_header, missing));
+    EXPECT_TRUE(missing.empty());
+    EXPECT_TRUE(missing_header.empty());
+
+    // 读回来再写回去，数据必须一致
+    const std::string path2 = unique_temp_path("csv_hdr2_");
+    ASSERT_TRUE(csv_write_file(path2, all));
+    std::vector<std::vector<std::string>> again;
+    ASSERT_TRUE(csv_read_file(path2, again));
+    ASSERT_EQ(again.size(), all.size());
+    EXPECT_EQ(again[1][1], "张三");
+
+    remove_file(path);
+    remove_file(path2);
+}
+
+TEST(CsvTest, RaggedRowsArePreservedNotRejected)
+{
+    using namespace libmini;
+    // 现实中的 CSV 常见缺列/多列。RFC 规则 6 要求字段数一致，
+    // 但照做会让模块在真实数据上直接不可用——对齐是调用方的语义问题。
+    std::vector<std::vector<std::string>> rows;
+    ASSERT_TRUE(csv_parse("a,b,c\n1,2\n1,2,3,4\n", rows));
+    ASSERT_EQ(rows.size(), 3u);
+    EXPECT_EQ(rows[0].size(), 3u);
+    EXPECT_EQ(rows[1].size(), 2u);
+    EXPECT_EQ(rows[2].size(), 4u);
+
+    // 空行与空文件都不算错
+    ASSERT_TRUE(csv_parse("\n\n\n", rows));
+    EXPECT_TRUE(rows.empty());
+}
+
 TEST(SystemInfoTest, ExecutablePathIsAbsolute)
 {
     using namespace libmini;

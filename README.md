@@ -166,6 +166,7 @@ target_link_libraries(app PRIVATE libmini::libmini)
 | env | `utils/env.h` | 环境变量读写与 `%VAR%` 展开（W 版 API，UTF-8） |
 | digest | `utils/digest.h` | MD5 / SHA-1 / SHA-256 / SHA-512（增量计算）——MD5 与 SHA-1 仅供老协议与历史指纹兼容，新代码请用 SHA-2 |
 | ini_config | `utils/ini_config.h` | INI 读写：注释/引号/类型化取值/往返保存 |
+| csv | `utils/csv.h` | RFC 4180 CSV 解析与序列化：引号转义、字段内换行、LF/CRLF/裸 CR 三种行尾、UTF-8 BOM、ragged 行原样保留；序列化 → 解析严格无损往返，另带表头读写与列名查找 |
 | gzip | `utils/gzip.h` | gzip 压缩解压（返回 optional） |
 | async | `utils/async.h` | 延时/周期任务调度器 + 令牌桶限流器 |
 | args | `utils/args.h` | 命令行解析：--key=value、flag、位置参数、自动 usage |
