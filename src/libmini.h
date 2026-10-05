@@ -36,6 +36,7 @@
 #include "utils/async.h"
 #include "utils/args.h"
 #include "utils/csv.h"
+#include "utils/glob.h"
 #include "utils/file_lock.h"
 #include "utils/dir_watcher.h"
 #include "utils/win_service.h"

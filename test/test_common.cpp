@@ -2168,6 +2168,219 @@ TEST(CsvTest, RaggedRowsArePreservedNotRejected)
     EXPECT_TRUE(rows.empty());
 }
 
+// ------------------------------ glob ------------------------------
+
+TEST(GlobTest, MatchWildcardsAgainstPythonFnmatch)
+{
+    using namespace libmini;
+    // 期望值逐条取自 Python fnmatch.fnmatchcase（POSIX 语义，大小写敏感）。
+    // Windows 上本库大小写不敏感，故这些断言里的字母用例在 Windows 上
+    // 同样为真（模式与名字本来就一致），不存在分歧。
+    EXPECT_TRUE(glob_match("*.cpp", "main.cpp"));
+    EXPECT_FALSE(glob_match("*.cpp", "main.cxx"));
+
+    EXPECT_TRUE(glob_match("*", "abc"));
+    EXPECT_TRUE(glob_match("*", ""));   // * 匹配空串
+    EXPECT_TRUE(glob_match("", ""));   // 空模式匹配空名
+
+    EXPECT_TRUE(glob_match("?.txt", "a.txt"));
+    EXPECT_FALSE(glob_match("?.txt", "ab.txt"));
+    EXPECT_FALSE(glob_match("?.txt", ".txt"));  // ? 必须匹配恰好一个字符
+
+    // 多个 * 需要正确回溯：贪心吃掉全部后要能退回来
+    EXPECT_TRUE(glob_match("a*b*c", "abc"));
+    EXPECT_TRUE(glob_match("a*b*c", "axxbyyc"));
+    EXPECT_FALSE(glob_match("a*b*c", "acb"));
+    EXPECT_TRUE(glob_match("*.tar.gz", "a.tar.gz"));
+    EXPECT_TRUE(glob_match("*/*", "a/b"));
+    EXPECT_TRUE(glob_match("**", "a/b"));
+}
+
+TEST(GlobTest, MatchCharacterClasses)
+{
+    using namespace libmini;
+    EXPECT_TRUE(glob_match("[abc]x", "ax"));
+    EXPECT_FALSE(glob_match("[abc]x", "dx"));
+    EXPECT_TRUE(glob_match("[a-c]x", "bx"));
+    EXPECT_FALSE(glob_match("[a-c]x", "dx"));
+    EXPECT_TRUE(glob_match("[!abc]x", "dx"));   // 取反
+    EXPECT_FALSE(glob_match("[!abc]x", "ax"));
+    EXPECT_TRUE(glob_match("[^abc]x", "dx"));   // ^ 同样表示取反
+    EXPECT_TRUE(glob_match("file[0-9].txt", "file3.txt"));
+    EXPECT_FALSE(glob_match("file[0-9].txt", "filea.txt"));
+    EXPECT_FALSE(glob_match("file[!0-9].txt", "file3.txt"));
+    EXPECT_TRUE(glob_match("file[!0-9].txt", "filea.txt"));
+
+    // 不规范的集合不能把整个匹配判否——真实文件名里确实有 [ 和 ]
+    EXPECT_TRUE(glob_match("[[]", "["));
+    EXPECT_TRUE(glob_match("a[bc.txt", "a[bc.txt"));
+    EXPECT_FALSE(glob_match("[]", "x"));
+
+    // 集合里混合具体字符与区间
+    EXPECT_TRUE(glob_match("[a-cx]y", "xy"));
+    EXPECT_TRUE(glob_match("[a-cx]y", "by"));
+    EXPECT_FALSE(glob_match("[a-cx]y", "dy"));
+}
+
+TEST(GlobTest, MatchEscapesAndLiterals)
+{
+    using namespace libmini;
+    // \x 转义下一个字符（Windows 风格；Python fnmatch 不支持这一条）
+    EXPECT_TRUE(glob_match("a\\*b", "a*b"));
+    EXPECT_FALSE(glob_match("a\\*b", "axb"));
+    EXPECT_TRUE(glob_match("a\\?b", "a?b"));
+    EXPECT_FALSE(glob_match("a\\?b", "axb"));
+
+    // 非通配字符按字面量匹配（含正则元字符，它们在 glob 里无特殊含义）
+    EXPECT_TRUE(glob_match("a.b", "a.b"));
+    EXPECT_FALSE(glob_match("a.b", "axb"));
+    EXPECT_TRUE(glob_match("a+b", "a+b"));
+    EXPECT_TRUE(glob_match("(a)", "(a)"));
+
+    // 超长 pattern 不应栈溢出（迭代式匹配而非递归）
+    const std::string long_pattern(5000, '*');
+    EXPECT_TRUE(glob_match(long_pattern, "abc"));
+    // 末尾没有 b，必须判否：回溯再熟练也不能把模式尾部「忘掉」
+    EXPECT_FALSE(glob_match("*a*a*a*a*a*b", "aaaaaaaac"));
+    EXPECT_TRUE(glob_match("*a*a*a*a*a*b", "aaaaaaaab"));
+}
+
+TEST(GlobTest, GlobSingleDirectory)
+{
+    using namespace libmini;
+    const std::string root = unique_temp_path("glob_");
+    ASSERT_TRUE(make_directories(path_join(root, "sub")));
+    ASSERT_TRUE(write_file(path_join(root, "a.cpp"), "x"));
+    ASSERT_TRUE(write_file(path_join(root, "b.txt"), "x"));
+    ASSERT_TRUE(write_file(path_join(root, "sub/c.cpp"), "x"));
+    ASSERT_TRUE(write_file(path_join(root, ".hidden.cpp"), "x"));
+
+    // 只看当前层：sub/c.cpp 在下一层，绝不能出现
+    std::vector<std::string> found = glob(root, "*.cpp");
+    ASSERT_EQ(found.size(), 1u);
+    EXPECT_EQ(found[0], path_join(root, "a.cpp"));
+
+    // 隐藏项默认排除
+    found = glob(root, "*");
+    std::vector<std::string> names;
+    for (std::size_t i = 0; i < found.size(); ++i) {
+        names.push_back(basename(found[i]));
+    }
+    EXPECT_EQ(names.size(), 2u);  // a.cpp + b.txt，.hidden.cpp 与 sub 都不含
+    EXPECT_EQ(std::find(names.begin(), names.end(), ".hidden.cpp"), names.end());
+    EXPECT_EQ(std::find(names.begin(), names.end(), "sub"), names.end());
+
+    GlobOptions with_hidden;
+    with_hidden.include_hidden = true;
+    found = glob(root, "*", with_hidden);
+    EXPECT_EQ(found.size(), 3u);  // 多出 .hidden.cpp；sub 是目录，不计入
+
+    // 目录默认不出现在结果里
+    GlobOptions with_dirs;
+    with_dirs.include_directories = true;
+    found = glob(root, "*", with_dirs);
+    EXPECT_EQ(std::find(found.begin(), found.end(), path_join(root, "sub")) !=
+              found.end(), true);
+
+    // 指定一层子目录
+    found = glob(root, "sub/*.cpp");
+    ASSERT_EQ(found.size(), 1u);
+    // glob 返回**原生分隔符**的规范路径（Windows 上是反斜杠）；
+    // path_absolute 返回的是通用形式（正斜杠），比较前要转回原生
+    EXPECT_EQ(found[0],
+              path_to_native(path_join(root, "sub/c.cpp")));
+
+    // 结果稳定排序：连查两次必须一致
+    EXPECT_EQ(glob(root, "*"), glob(root, "*"));
+
+    // 不存在的 root 返回空，不崩
+    EXPECT_TRUE(glob(path_join(root, "nope"), "*").empty());
+
+    remove_tree(root);
+}
+
+TEST(GlobTest, GlobRecursiveWalksWholeTree)
+{
+    using namespace libmini;
+    const std::string root = unique_temp_path("globr_");
+    ASSERT_TRUE(make_directories(path_join(root, "a/b/c")));
+    ASSERT_TRUE(write_file(path_join(root, "top.cpp"), "x"));
+    ASSERT_TRUE(write_file(path_join(root, "a/one.cpp"), "x"));
+    ASSERT_TRUE(write_file(path_join(root, "a/b/two.cpp"), "x"));
+    ASSERT_TRUE(write_file(path_join(root, "a/b/c/three.cpp"), "x"));
+    ASSERT_TRUE(write_file(path_join(root, "a/b/note.md"), "x"));
+
+    // 递归找到全部 4 个 cpp，深度不同都要覆盖
+    std::vector<std::string> found = glob_recursive(root, "*.cpp");
+    EXPECT_EQ(found.size(), 4u);
+
+    // "**/*.cpp" 前缀写法与 "*.cpp" 等价
+    EXPECT_EQ(glob_recursive(root, "**/*.cpp"), found);
+
+    // 深度上限
+    // max_depth 以 root 为 0 计：1 = root + 下一层，2 = 再下一层。
+    // 树形：top.cpp(depth 0)、a/one.cpp(1)、a/b/two.cpp(2)、a/b/c/three.cpp(3)
+    GlobOptions shallow;
+    shallow.max_depth = 1;
+    found = glob_recursive(root, "*.cpp", shallow);
+    EXPECT_EQ(found.size(), 2u);  // top + a/one
+
+    GlobOptions deeper;
+    deeper.max_depth = 2;
+    found = glob_recursive(root, "*.cpp", deeper);
+    EXPECT_EQ(found.size(), 3u);  // 再加 a/b/two
+
+    GlobOptions very_deep;
+    very_deep.max_depth = 3;
+    EXPECT_EQ(glob_recursive(root, "*.cpp", very_deep).size(), 4u);
+
+    // max_depth = 0 表示不限（而不是只看 root，否则调用方无法表达「全部」）
+    GlobOptions unlimited;
+    unlimited.max_depth = 0;
+    EXPECT_EQ(glob_recursive(root, "*.cpp", unlimited).size(), 4u);
+
+    // 结果上限：失控的 "**" 不该把进程撑爆
+    GlobOptions capped;
+    capped.max_results = 2;
+    EXPECT_EQ(glob_recursive(root, "*.cpp", capped).size(), 2u);
+
+    // 按扩展名的便捷版
+    found = glob_files_by_extension(root, ".cpp");
+    EXPECT_EQ(found.size(), 4u);
+    found = glob_files_by_extension(root, ".md");
+    EXPECT_EQ(found.size(), 1u);
+    EXPECT_TRUE(glob_files_by_extension(root, ".rs").empty());
+
+    // 隐藏目录内部仍会被遍历，只是目录自身不出现在结果里
+    ASSERT_TRUE(make_directories(path_join(root, ".git")));
+    ASSERT_TRUE(write_file(path_join(root, ".git/keep.cpp"), "x"));
+    found = glob_recursive(root, "*.cpp");
+    EXPECT_EQ(found.size(), 5u);  // .git/keep.cpp 找到了；.git 本身不是文件
+
+    remove_tree(root);
+}
+
+TEST(GlobTest, GlobResultPathsAreUsable)
+{
+    using namespace libmini;
+    const std::string root = unique_temp_path("globp_");
+    ASSERT_TRUE(make_directories(path_join(root, "d")));
+    ASSERT_TRUE(write_file(path_join(root, "d/real.cpp"), "content"));
+
+    const std::vector<std::string> found = glob_files_by_extension(root, ".cpp");
+    ASSERT_EQ(found.size(), 1u);
+    // 返回的必须是能直接用的完整路径，而不是只给文件名
+    EXPECT_TRUE(file_exists(found[0]));
+    EXPECT_EQ(read_file(found[0]), "content");
+    EXPECT_FALSE(is_directory(found[0]));
+    // 返回的是**原生**分隔符路径（Windows 上是 '\'），可直接交给
+    // file_* 系列 API，不必再转换
+    EXPECT_TRUE(found[0].find(char(92)) != std::string::npos ||
+                found[0].find('/') != std::string::npos);
+
+    remove_tree(root);
+}
+
 TEST(SystemInfoTest, ExecutablePathIsAbsolute)
 {
     using namespace libmini;

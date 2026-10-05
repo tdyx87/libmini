@@ -33,6 +33,7 @@
 - Add kdf: turn passwords into keys without a new dependency（[49af0b8](https://github.com/tdyx87/libmini/commit/49af0b8ebbb4294eef9486227f500d489a6bff04)）
 - Add SHA-1 and SHA-512 to the digest module（[5c95416](https://github.com/tdyx87/libmini/commit/5c95416904bee1ded1d7e16aad5bdef5ecb14dda)）
 - Add time-ordered v7 and namespace-derived v5 UUIDs（[9d6741b](https://github.com/tdyx87/libmini/commit/9d6741b4e6687029c6facbb6932e6eb7c773f832)）
+- Add an RFC 4180 CSV reader and writer（[2734f3f](https://github.com/tdyx87/libmini/commit/2734f3f77faae68ebddea02556ca10d91a6abf29)）
 
 #### 变更
 
@@ -56,6 +57,7 @@
   不抛异常、不提权：Windows 走宽字符注册表与卷 API（中文型号与卷标不乱码，
   卷 GUID 反查盘符），Linux 读 `/proc` 与 `/sys`（卷标识用文件系统 UUID），
   macOS 走 `system_profiler`。
+- **glob 模块**（`utils/glob.h`）：fnmatch 风格通配匹配 + 单层/递归查找。匹配是纯字符串算法（不碰文件系统，可单测、可内嵌），遍历是文件系统相关，两层分开避免语义漂移。匹配器用迭代式贪心回溯（不递归，长 pattern 不爆栈）；**边界检查必须先于取值** —— `pattern[p]` 越界读到的字节若恰是 `*`，回溯会把游标继续后推、在堆内存里一路向前扫，表现为「匹配一个长 pattern 把进程挂死」。`?` 分支必须自己推进游标，只置 `matched` 会让末尾的 continue 回到同一状态而死循环。`[a-z]` 区间的上界在 `i+2`（中间 `-` 只是连接符），读错位置会让区间退化成单字符。`glob()` 只看当前层（`sub/*.cpp` 支持字面目录前缀，多层通配归 `glob_recursive`），判定通配有无要看 **dir_part** 而非 file_part——判反会让所有带目录的 pattern 静默落回单层遍历并返回空。结果统一排序：文件系统遍历顺序不保证稳定，「同一目录两次列出顺序不同」会让调用方无法 diff。隐藏目录内部仍会被遍历，只是目录自身不出现在结果里。
 - **csv 模块**（`utils/csv.h`）：RFC 4180 CSV 解析与序列化。引号只在**字段起始处**才被当作引号（字段中间的 `"` 是字面量），分隔符必须重置这个状态——否则本行第二个及之后字段的引号全部退化成字面量。行尾同时接受 LF / CRLF / 裸 CR（只认 CRLF 的解析器在 Unix 工具链产出的文件上会得到「整份文件一行」）；闭合引号后的脏数据（Excel 的 `"a" ,b`）按字面追加而不是判否。空行产出**零字段行**（与 Python csv 一致），否则调用方的列数判断会在尾随空行处突然 +1。序列化每行都带行尾（含最后一行），拼接两个 CSV 不会把末行与首行粘在一起。刻意不做类型推断（`"00123"` 必须保持字符串）也不 trim 字段内空格（RFC 规则 5）。刻意**不**校验各行字段数一致（RFC 规则 6），ragged 行原样保留——对齐是调用方的语义问题，照做会让模块在真实数据上不可用。文件不存在时 `csv_read_file` 返回 false 而非「读到 0 行」。
 - **uuid 扩展**（`utils/uuid.h`）：新增 v7 时间有序 UUID（RFC 9562 §5.7）与 v5 命名空间派生 UUID（RFC 4122 §4.3，内部用上一轮补的 `Sha1`）。v7 前 48 位是 Unix 毫秒，毫秒内用进程内计数器（12 位 rand_a）递增，**单进程内严格单调递增**——这正是它相对 v4 的价值：v4 当主键时插入位置随机，写入放大与索引体积都随数据量劣化。单毫秒配额（4096 个）用尽时把内部时间戳 +1ms 而非让计数器回绕；此时内部时钟会领先真实时钟，故判断新毫秒必须用 `now > last_ms` 而非 `!=`，否则内部时钟回退会产出更小的 ID（时钟回拨同理）。另新增 `version()` / `variant()` / `timestamp_ms()` 与四个预定义命名空间。
 - **digest 扩展**（`utils/digest.h`）：新增 `Sha1`（RFC 3174）与 `Sha512`（FIPS 180-4），与既有 `Md5`/`Sha256` 同构（增量 `update` + 一次性 `hex`），纯 C++ 实现、三个平台逐字节一致，不引入平台相关的系统加密库差异。SHA-1 的碰撞已被攻破，头文件里写明它只用于兼容场景。SHA-512 的长度字段是 128 位，实现上显式维护高低 64 位并在低位回绕时补高位——直接 `+=` 会在超过 2^61 字节后静默算出错误摘要。

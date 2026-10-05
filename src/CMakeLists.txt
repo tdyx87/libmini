@@ -34,6 +34,7 @@ set(LIBMINI_SOURCES
     utils/async.cpp
     utils/args.cpp
     utils/csv.cpp
+    utils/glob.cpp
     utils/sqlite.cpp
     utils/system_info.cpp
     utils/hardware_info.cpp
