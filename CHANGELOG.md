@@ -27,6 +27,10 @@
 
 ### 提交清单
 
+#### 新增
+
+- Add secure_random: a real CSPRNG, and move UUID v4 onto it（[71a2c97](https://github.com/tdyx87/libmini/commit/71a2c97a0f0a82394bae3dbbfde88c40bc2e3904)）
+
 #### 变更
 
 - Teach the changelog tool to freeze a release and feed the release page（[c52962e](https://github.com/tdyx87/libmini/commit/c52962e0237ff9d80f7e0ee816433ad5adb1f970)）
@@ -49,6 +53,7 @@
   不抛异常、不提权：Windows 走宽字符注册表与卷 API（中文型号与卷标不乱码，
   卷 GUID 反查盘符），Linux 读 `/proc` 与 `/sys`（卷标识用文件系统 UUID），
   macOS 走 `system_profiler`。
+- **kdf 模块**（`utils/kdf.h`）：PBKDF2-HMAC-SHA256 密钥派生（RFC 2898，零新增依赖，建在既有 `HmacSha256` 之上）+ 版本化口令密封。密封格式自带 magic / 版本号 / 算法 ID，可平滑迁移到 Argon2id；**头部（迭代次数、盐、nonce）整体进 GCM 的 AAD**，否则攻击者把迭代次数改成 1 就能让密钥退化成一次哈希。迭代次数在文件头里属于攻击者可控输入，故 `open` 对超出 `[kMinIterations, kMaxIterations]` 的值直接判否，而不是照着算——否则一次 `open` 就是 CPU DoS 开关。明文前置域分隔标记以区分「解密失败返回空」与「明文本来就空」。顺带给 `Aes256Gcm` 的三个 `static constexpr` 常量补了 C++11 外部定义：它们原先在消费者写 `EXPECT_EQ(x.size(), Aes256Gcm::kNonceSize)` 这类绑定到 const 引用的用法下会链接失败。
 - **secure_random 模块**（`utils/secure_random.h`）：系统 CSPRNG 封装（Windows `BCryptGenRandom`、Linux `getrandom` 并退回 `/dev/urandom`、macOS `arc4random_buf`），提供随机字节 / 十六进制串 / Base64url 令牌；按字母表取样用**拒绝采样**消除取模偏置（直接 `%` 会让靠前字符多出最多 1/256 的权重，用作口令是可测的弱点）。熵源不可用时返回失败而非退化。
   `Uuid::generate()` 随之改用它：此前用 `mt19937_64` + `random_device` 播种，而 Mersenne Twister 可预测（624 个 32 位输出即还原状态）、且 MSVC/MinGW 的 `std::random_device` 本身也不是密码学实现；熵源不可用时返回 nil UUID 并可由 `is_nil()` 发现。`random_utils` 保持原样并已在头文件注明只适用于「需要一点随机性」的场景。
 - **machine_fingerprint 模块**（`utils/machine_fingerprint.h`）：从 hardware_info

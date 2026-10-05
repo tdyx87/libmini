@@ -20,6 +20,14 @@
 
 namespace libmini {
 
+// C++11 里 static constexpr 数据成员被 ODR-use（如绑定到 const 引用、
+// 取地址）时必须另有外部定义，否则链接期报 undefined reference。
+// 库内原有用法都是按值取，故一直没人碰到；一旦消费者写了
+// EXPECT_EQ(x.size(), Aes256Gcm::kNonceSize) 就会炸，这里补齐。
+constexpr std::size_t Aes256Gcm::kKeySize;
+constexpr std::size_t Aes256Gcm::kNonceSize;
+constexpr std::size_t Aes256Gcm::kTagSize;
+
 #ifdef _WIN32
 
 namespace {

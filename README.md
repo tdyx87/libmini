@@ -162,6 +162,7 @@ target_link_libraries(app PRIVATE libmini::libmini)
 | optional | `utils/optional.h` | C++11 版 optional（value_or / emplace） |
 | random_utils | `utils/random_utils.h` | 随机整数/浮点/字符串/挑选 |
 | secure_random | `utils/secure_random.h` | 密码学安全随机源（Windows BCrypt / Linux getrandom / macOS arc4random_buf）：随机字节、十六进制串、Base64url 令牌；按字母表取样用拒绝采样消除取模偏置；熵源不可用时返回失败而不是退化成弱随机 |
+| kdf | `utils/kdf.h` | PBKDF2-HMAC-SHA256 密钥派生（零新增依赖，迭代次数带上下限钳制防 CPU DoS）+ 版本化口令密封（口令 → PBKDF2 → AES-256-GCM，自带 magic/版本/算法 ID 的落盘格式，迭代次数与盐进 AAD 防篡改降级）；另含常量时间比较 `constant_time_equals` |
 | env | `utils/env.h` | 环境变量读写与 `%VAR%` 展开（W 版 API，UTF-8） |
 | digest | `utils/digest.h` | MD5 / SHA-256（增量计算） |
 | ini_config | `utils/ini_config.h` | INI 读写：注释/引号/类型化取值/往返保存 |

@@ -23,6 +23,7 @@ set(LIBMINI_SOURCES
     utils/secure_random.cpp
     utils/env.cpp    utils/digest.cpp
     utils/hmac.cpp
+    utils/kdf.cpp
     utils/process.cpp    utils/base32.cpp
     utils/console.cpp
     utils/tcp.cpp

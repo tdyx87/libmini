@@ -1381,6 +1381,187 @@ TEST(SecureRandomTest, AlphabetSamplingIsNotVisiblyBiased)
         EXPECT_LT(counts[i], 11200u);
     }
 }
+// ------------------------------ kdf ------------------------------
+
+TEST(KdfTest, Pbkdf2MatchesKnownAnswerVectors)
+{
+    using namespace libmini;
+    // RFC 7914 §11 / draft-josefsson PBKDF2-HMAC-SHA256 官方向量。
+    // 用 16384 与 80000 两组：迭代次数够高不会被 kMinIterations 钳位影响，
+    // 且两组 key_bytes 都取 64（= 2 个 32B 块），顺带覆盖跨块拼接与
+    // 末块截断逻辑——只测 c=1 / dkLen=32 的向量覆盖不到这两条路径。
+    const std::string k1 =
+        Pbkdf2HmacSha256::derive("pleaseletmein", "SodiumChloride",
+                                 16384, 64);
+    ASSERT_EQ(k1.size(), 64u);
+    EXPECT_EQ(Hex::encode(k1, /*lower_case=*/true),
+              "e5d7c03e11ae5b90b6669755fd90930259ec77f7f643b3d71d2633043"
+              "58e528a679f2ef40a2306882becc93d7f3f38f213304971033ad47eb34"
+              "21d72ad20e77c");
+
+    // 第二组刻意换口令与迭代次数：KAT 的价值在于「任一环节错位就不同」，
+    // 只测一组的话，实现里写死输出同样能过。
+    const std::string k2 =
+        Pbkdf2HmacSha256::derive("Password", "SodiumChloride", 80000, 32);
+    ASSERT_EQ(k2.size(), 32u);
+    EXPECT_EQ(Hex::encode(k2, /*lower_case=*/true),
+              "d0b42e8836b6b0a3b9ff522197a62265a48d27bdc012d73261add71499"
+              "3b05ae");
+}
+
+TEST(KdfTest, Pbkdf2RejectsBadParametersAndClampsIterations)
+{
+    using namespace libmini;
+    const std::string salt = "0123456789abcdef";
+
+    EXPECT_TRUE(Pbkdf2HmacSha256::derive("pw", salt, 16384, 0).empty());
+    // 盐短于 8 字节：拒绝而不是默默补齐
+    EXPECT_TRUE(Pbkdf2HmacSha256::derive("pw", "short", 16384, 32).empty());
+    EXPECT_FALSE(Pbkdf2HmacSha256::derive("pw", "12345678", 16384, 32).empty());
+
+    // 迭代次数钳位：低于下限抬到下限，超上限降到上限。
+    // 关键性质是「仍然产出合法密钥」而不是「等于某个具体值」。
+    const std::string clamped_low =
+        Pbkdf2HmacSha256::derive("pw", salt, 1, 32);
+    ASSERT_FALSE(clamped_low.empty());
+    EXPECT_EQ(clamped_low,
+              Pbkdf2HmacSha256::derive("pw", salt,
+                                       Pbkdf2HmacSha256::kMinIterations, 32));
+    EXPECT_FALSE(Pbkdf2HmacSha256::derive("pw", salt,
+                                          Pbkdf2HmacSha256::kMaxIterations,
+                                          32).empty());
+
+    // derive_hex 与 derive 一致，长度 = key_bytes*2
+    const std::string hex =
+        Pbkdf2HmacSha256::derive_hex("pw", salt, 16384, 16);
+    ASSERT_EQ(hex.size(), 32u);
+    EXPECT_EQ(hex, Hex::encode(Pbkdf2HmacSha256::derive("pw", salt, 16384, 16),
+                               /*lower_case=*/true));
+    EXPECT_TRUE(Pbkdf2HmacSha256::derive_hex("pw", "x", 16384, 16).empty());
+}
+
+TEST(KdfTest, Pbkdf2VerifyAndConstantTimeEquals)
+{
+    using namespace libmini;
+    const std::string salt = "0123456789abcdef";
+    const std::string key = Pbkdf2HmacSha256::derive("correct horse", salt, 16384, 32);
+
+    EXPECT_TRUE(Pbkdf2HmacSha256::verify("correct horse", salt, 16384, key));
+    EXPECT_FALSE(Pbkdf2HmacSha256::verify("correct hors", salt, 16384, key));
+    EXPECT_FALSE(Pbkdf2HmacSha256::verify("", salt, 16384, key));
+    // 期望值非法（空）时必须判否，而不是让 derive 返回空后误判成功
+    EXPECT_FALSE(Pbkdf2HmacSha256::verify("correct horse", salt, 16384, ""));
+
+    EXPECT_TRUE(constant_time_equals("abc", "abc"));
+    EXPECT_TRUE(constant_time_equals("", ""));
+    EXPECT_FALSE(constant_time_equals("abc", "abd"));
+    EXPECT_FALSE(constant_time_equals("abc", "ab"));
+    EXPECT_FALSE(constant_time_equals("abc", "abcd"));
+    // 含 NUL 也要逐字节比较，std::string 比较同样如此，这里确认一致性
+    EXPECT_FALSE(constant_time_equals(std::string("a\0b", 3), std::string("a\0c", 3)));
+    EXPECT_TRUE(constant_time_equals(std::string("a\0b", 3), std::string("a\0b", 3)));
+
+    const std::string random_salt = Pbkdf2HmacSha256::random_salt();
+    EXPECT_EQ(random_salt.size(), Pbkdf2HmacSha256::kSaltSize);
+    EXPECT_NE(random_salt, Pbkdf2HmacSha256::random_salt());
+    EXPECT_TRUE(Pbkdf2HmacSha256::random_salt(0).empty());
+}
+
+TEST(KdfTest, PasswordSealRoundTrip)
+{
+    using namespace libmini;
+    const std::string plaintext = "database password = hunter2";
+
+    const std::string sealed = PasswordSeal::seal("s3cret", plaintext);
+    ASSERT_FALSE(sealed.empty());
+    // 密文里不能出现明文
+    EXPECT_EQ(sealed.find(plaintext), std::string::npos);
+
+    std::string opened;
+    ASSERT_TRUE(PasswordSeal::open("s3cret", sealed, opened));
+    EXPECT_EQ(opened, plaintext);
+    EXPECT_EQ(PasswordSeal::open_or_empty("s3cret", sealed), plaintext);
+
+    // 同样输入两次必须产出不同密文（盐与 nonce 都随机）
+    EXPECT_NE(sealed, PasswordSeal::seal("s3cret", plaintext));
+}
+
+TEST(KdfTest, PasswordSealRejectsWrongPasswordTamperingAndGarbage)
+{
+    using namespace libmini;
+    const std::string sealed = PasswordSeal::seal("pw", "payload", "ctx");
+
+    std::string opened;
+    EXPECT_FALSE(PasswordSeal::open("nope", sealed, opened));
+    EXPECT_FALSE(PasswordSeal::open("", sealed, opened));
+    // aad 参与认证：不匹配即失败
+    EXPECT_FALSE(PasswordSeal::open("pw", sealed, opened, "other"));
+    // 密文被改一位 → tag 校验失败
+    std::string tampered = sealed;
+    tampered[tampered.size() - 1] = static_cast<char>(tampered[tampered.size() - 1] ^ 0x01);
+    EXPECT_FALSE(PasswordSeal::open("pw", tampered, opened));
+    // 头部被改：迭代次数被攻击者压到 1 也不能让 open 变快
+    std::string iter_tampered = sealed;
+    iter_tampered[7] = '\x01';
+    EXPECT_FALSE(PasswordSeal::open("pw", iter_tampered, opened));
+    EXPECT_FALSE(PasswordSeal::open("pw", "", opened));
+    EXPECT_FALSE(PasswordSeal::open("pw", "LMPS", opened));
+    EXPECT_FALSE(PasswordSeal::open("pw", std::string("\0\0\0\0", 4), opened));
+
+    // aad 正确时同一份密文可解
+    ASSERT_TRUE(PasswordSeal::open("pw", sealed, opened, "ctx"));
+    EXPECT_EQ(opened, "payload");
+
+    // 空明文：往返必须成功且真的为空（open 与 open_or_empty 语义不同，
+    // 这一点单靠返回值看不出来，所以用返回 bool 的 open 断言）
+    const std::string empty_sealed = PasswordSeal::seal("pw", "");
+    ASSERT_FALSE(empty_sealed.empty());
+    ASSERT_TRUE(PasswordSeal::open("pw", empty_sealed, opened));
+    EXPECT_TRUE(opened.empty());
+
+    // 空口令拒绝密封：产出「看起来有保护其实没有」的文件比失败更糟
+    EXPECT_TRUE(PasswordSeal::seal("", "payload").empty());
+}
+
+TEST(KdfTest, PasswordSealInspectAndNeedsReseal)
+{
+    using namespace libmini;
+    const std::string sealed = PasswordSeal::seal("pw", "payload", "", 16384);
+
+    PasswordSeal::Info info;
+    ASSERT_TRUE(PasswordSeal::inspect(sealed, info));
+    EXPECT_EQ(info.version, 1u);
+    EXPECT_EQ(info.kdf_id, 1u);
+    EXPECT_EQ(info.iterations, 16384u);
+    EXPECT_EQ(info.salt.size(), Pbkdf2HmacSha256::kSaltSize);
+    EXPECT_EQ(info.nonce.size(), Aes256Gcm::kNonceSize);
+    // 明文 "payload"(7) + 域分隔标记(1) + GCM tag(16)
+    EXPECT_EQ(info.ciphertext_size, 7u + 1u + Aes256Gcm::kTagSize);
+
+    // 阈值等于当前迭代次数不算「需要重算」——inspect 是给迁移用的，
+    // 边界语义必须是 >= 才算达标，否则每次自检都会要求重写文件。
+    EXPECT_FALSE(PasswordSeal::needs_reseal(sealed, 16384));
+    EXPECT_TRUE(PasswordSeal::needs_reseal(sealed, 16385));
+    EXPECT_FALSE(PasswordSeal::needs_reseal(sealed, 16383));
+    // 认不出来的格式一律建议重新 seal
+    EXPECT_TRUE(PasswordSeal::needs_reseal("garbage"));
+    EXPECT_TRUE(PasswordSeal::needs_reseal(""));
+
+    PasswordSeal::Info bad;
+    EXPECT_FALSE(PasswordSeal::inspect("garbage", bad));
+
+    // 版本号不认识 → 解析失败，绝不猜结构
+    std::string future = sealed;
+    future[4] = '\x63';
+    EXPECT_FALSE(PasswordSeal::inspect(future, bad));
+
+    // salt_len 字段被改成超长（65535）→ 按损坏处理，不按它分配
+    std::string huge_salt = sealed;
+    huge_salt[10] = '\xff';
+    huge_salt[11] = '\xff';
+    EXPECT_FALSE(PasswordSeal::inspect(huge_salt, bad));
+}
+
 TEST(SystemInfoTest, ExecutablePathIsAbsolute)
 {
     using namespace libmini;
