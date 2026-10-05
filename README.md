@@ -155,7 +155,7 @@ target_link_libraries(app PRIVATE libmini::libmini)
 | msgpack | `utils/msgpack.h` | MsgPack 二进制序列化（nlohmann 内置编解码，规范全兼容）：JsonValue 树/类型化封装，与 JSON 同套类型支持 |
 | proto_buf | `utils/proto_buf.h` | ProtoBuf proto3 wire format 编解码（零依赖手写，与官方字节级兼容）：字段号键的 JsonValue 树、packed 展开工具 |
 | rpc | `utils/rpc.h` | JSON RPC（HTTP / Windows 命名管道 / POSIX UDS / 裸 TCP 帧四种传输，一套 API）：客户端连接池/重试/抖动/日志，服务端过载保护（立即拒绝或排队背压）/延迟分位/队列监控/spdlog 日志；`config()` 导出配置快照 + `validate()` 非法值自检 |
-| uuid | `utils/uuid.h` | RFC 4122 v4 生成与解析 |
+| uuid | `utils/uuid.h` | v4 随机生成与解析；**v7 时间有序**（RFC 9562，前 48 位 Unix 毫秒 + 进程内计数器，单进程内严格单调递增，写密集场景当主键时索引体积与写入放大远优于 v4）；**v5 命名空间派生**（含 DNS/URL/OID/X500 四个预定义命名空间，同输入恒等输出）；另有 `version()` / `variant()` / `timestamp_ms()` |
 | crc | `utils/crc.h` | CRC-32（zlib）/ CRC-16 Modbus / CRC-64 XZ / Adler-32，均支持增量计算 |
 | encoding | `utils/encoding.h` | Base64 / Hex / URL 编解码 |
 | scope_guard | `utils/scope_guard.h` | RAII 作用域守卫（dismiss / 可移动） |

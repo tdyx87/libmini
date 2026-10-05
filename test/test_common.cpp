@@ -1698,6 +1698,194 @@ TEST(DigestTest, Sha1AndSha512CoverEmbeddingLengths)
     EXPECT_EQ(Sha512::hex(data).size(), 128u);
 }
 
+// ------------------------------ uuid v7 / v5 ------------------------------
+
+TEST(UuidTest, V7HasCorrectLayoutAndTimestamp)
+{
+    using namespace libmini;
+    // 显式时间戳版本必须逐字节符合 RFC 9562 §5.7 的位布局，
+    // 否则下游按字节切分时间戳的解析器会全线错位。
+    const std::int64_t ms = 1645557742000LL;  // 2022-02-22 19:22:22 UTC
+    const Uuid u = Uuid::generate_v7(ms);
+
+    EXPECT_EQ(u.version(), 7);
+    EXPECT_EQ(u.variant(), 2);              // RFC 4122
+    EXPECT_EQ(u.timestamp_ms(), ms);
+    EXPECT_FALSE(u.is_nil());
+
+    // 前 48 位是时间戳（大端），逐字节核对
+    EXPECT_EQ(u.bytes[0], 0x01);
+    EXPECT_EQ(u.bytes[1], 0x7F);
+    EXPECT_EQ(u.bytes[2], 0x22);
+    EXPECT_EQ(u.bytes[3], 0xE2);
+    EXPECT_EQ(u.bytes[4], 0x79);
+    EXPECT_EQ(u.bytes[5], 0xB0);
+
+    // RFC 9562 附录 A.3 的示例 UUID 是 017F22E2-79B0-7CC3-98C4-DC0C0C07398F，
+    // 其时间戳字段 0x017F22E279B0 = 1645557742000ms。逐位比对其固定部分：
+    // 版本/变体各占字节的高位，随机位不同所以只比掩码后的值。
+    const Uuid sample = Uuid::generate_v7(0x017F22E279B0LL);
+    EXPECT_EQ(sample.bytes[0], 0x01);
+    EXPECT_EQ(sample.bytes[1], 0x7F);
+    EXPECT_EQ(sample.bytes[2], 0x22);
+    EXPECT_EQ(sample.bytes[3], 0xE2);
+    EXPECT_EQ(sample.bytes[4], 0x79);
+    EXPECT_EQ(sample.bytes[5], 0xB0);
+    EXPECT_EQ(sample.bytes[6] & 0xF0, 0x70);      // version 7
+    EXPECT_EQ(sample.bytes[8] & 0xC0, 0x80);      // variant 2
+    EXPECT_EQ(sample.version(), 7);
+    EXPECT_EQ(sample.timestamp_ms(), 0x017F22E279B0LL);
+
+    // epoch 与边界
+    EXPECT_EQ(Uuid::generate_v7(0).timestamp_ms(), 0);
+    // 越界/负值落到 epoch，而不是回绕成别的年份
+    EXPECT_EQ(Uuid::generate_v7(-1).timestamp_ms(), 0);
+    EXPECT_EQ(Uuid::generate_v7(0xFFFFFFFFFFFFLL).timestamp_ms(), 0xFFFFFFFFFFFFLL);
+    EXPECT_EQ(Uuid::generate_v7(0x1000000000000LL).timestamp_ms(), 0);
+
+    // 非 v7 取不到时间戳
+    EXPECT_EQ(Uuid::generate().timestamp_ms(), 0);
+}
+
+TEST(UuidTest, V7IsStrictlyMonotonicWithinProcess)
+{
+    using namespace libmini;
+    // 单调性是 v7 相对 v4 的核心价值：同一毫秒内的 ID 也必须有确定顺序，
+    // 否则前缀聚簇的收益会打折。
+    const std::size_t count = 5000;  // 刻意 > 单毫秒 4096 个的上限
+    std::vector<Uuid> ids;
+    ids.reserve(count);
+    for (std::size_t i = 0; i < count; ++i) {
+        ids.push_back(Uuid::generate_v7());
+    }
+
+    for (std::size_t i = 1; i < count; ++i) {
+        // operator< 已经是逐字节字典序（uuid.cpp 既有实现），直接用
+        EXPECT_TRUE(ids[i - 1] < ids[i])
+            << "v7 在第 " << i << " 个丢失单调性: "
+            << ids[i - 1].to_string() << " >= " << ids[i].to_string();
+    }
+
+    // 时间戳非递减，且不会偏离真实时间太多（允许时钟回拨的小幅抖动）
+    const std::int64_t now = current_timestamp_ms();
+    EXPECT_GE(ids.front().timestamp_ms(), now - 60000);
+    EXPECT_LE(ids.back().timestamp_ms(), now + 60000);
+    for (std::size_t i = 1; i < count; ++i) {
+        EXPECT_LE(ids[i - 1].timestamp_ms(), ids[i].timestamp_ms());
+    }
+}
+
+TEST(UuidTest, V7IsUniqueUnderConcurrentGeneration)
+{
+    using namespace libmini;
+    // 单调性靠 mutex 保护；并发下验证既不重复也不崩。
+    // 16 个线程 × 200 个 = 3200 个，跨线程收集后整体校验有序。
+    const int kThreads = 16;
+    const int kPerThread = 200;
+    std::vector<std::vector<Uuid>> per_thread(kThreads);
+
+    std::vector<std::thread> threads;
+    threads.reserve(kThreads);
+    for (int t = 0; t < kThreads; ++t) {
+        // C++11 只允许捕获「自动变量」，不捕获 const int kPerThread；
+        // 按值捕获常量在 MinGW/GCC 下能编过，MSVC 直接报 C3493。
+        const int per_thread_count = kPerThread;
+        threads.emplace_back([t, &per_thread, per_thread_count]() {
+            per_thread[static_cast<std::size_t>(t)].reserve(
+                static_cast<std::size_t>(per_thread_count));
+            for (int i = 0; i < per_thread_count; ++i) {
+                per_thread[static_cast<std::size_t>(t)].push_back(
+                    Uuid::generate_v7());
+            }
+        });
+    }
+    for (std::size_t i = 0; i < threads.size(); ++i) {
+        threads[i].join();
+    }
+
+    std::vector<Uuid> all;
+    for (int t = 0; t < kThreads; ++t) {
+        all.insert(all.end(), per_thread[static_cast<std::size_t>(t)].begin(),
+                   per_thread[static_cast<std::size_t>(t)].end());
+    }
+    ASSERT_EQ(all.size(), static_cast<std::size_t>(kThreads * kPerThread));
+
+    std::sort(all.begin(), all.end(),
+              [](const Uuid& a, const Uuid& b) { return a < b; });
+    for (std::size_t i = 1; i < all.size(); ++i) {
+        EXPECT_NE(all[i], all[i - 1])
+            << "并发下产生重复 v7: " << all[i].to_string();
+    }
+}
+
+TEST(UuidTest, V5MatchesRfcVectors)
+{
+    using namespace libmini;
+    // RFC 4122 附录 / Python uuid 模块的公认结果。命名空间常量与
+    // SHA-1(namespace || name) 取前 16 字节这两处任一写错都会偏离。
+    EXPECT_EQ(Uuid::v5(Uuid::namespace_dns(), "python.org").to_string(),
+              "886313e1-3b8a-5372-9b90-0c9aee199e5d");
+    EXPECT_EQ(Uuid::v5(Uuid::namespace_url(), "https://example.com").to_string(),
+              "4fd35a71-71ef-5a55-a9d9-aa75c889a6d0");
+    EXPECT_EQ(Uuid::v5(Uuid::namespace_oid(), "1.3.6.1.4.1.343").to_string(),
+              "6aab0456-7392-582a-b92a-ba5a7096945d");
+    EXPECT_EQ(Uuid::v5(Uuid::namespace_x500(), "CN=Test").to_string(),
+              "5e2003ce-30b7-5e3b-8c3a-a164acc5b21e");
+
+    // 四个预定义命名空间的前缀（RFC 4122 §4.1.3），各自最后一个字节不同
+    EXPECT_EQ(Uuid::namespace_dns().to_string(), "6ba7b810-9dad-11d1-80b4-00c04fd430c8");
+    EXPECT_EQ(Uuid::namespace_url().to_string(), "6ba7b811-9dad-11d1-80b4-00c04fd430c8");
+    EXPECT_EQ(Uuid::namespace_oid().to_string(), "6ba7b812-9dad-11d1-80b4-00c04fd430c8");
+    EXPECT_EQ(Uuid::namespace_x500().to_string(), "6ba7b814-9dad-11d1-80b4-00c04fd430c8");
+
+    // 确定性：同输入同输出，且与生成顺序无关
+    const Uuid again = Uuid::v5(Uuid::namespace_dns(), "python.org");
+    EXPECT_EQ(again.to_string(), "886313e1-3b8a-5372-9b90-0c9aee199e5d");
+    // 不同命名空间 → 不同结果
+    EXPECT_NE(Uuid::v5(Uuid::namespace_url(), "python.org").to_string(),
+              Uuid::v5(Uuid::namespace_dns(), "python.org").to_string());
+    // 大小写敏感（name 是字节串，不做规范化）
+    EXPECT_NE(Uuid::v5(Uuid::namespace_dns(), "Python.org").to_string(),
+              Uuid::v5(Uuid::namespace_dns(), "python.org").to_string());
+    // 空 name 合法，不崩溃
+    EXPECT_EQ(Uuid::v5(Uuid::namespace_dns(), "").version(), 5);
+}
+
+TEST(UuidTest, VersionAndVariantReflectBitLayout)
+{
+    using namespace libmini;
+    EXPECT_EQ(Uuid::generate().version(), 4);
+    EXPECT_EQ(Uuid::generate_v7().version(), 7);
+    EXPECT_EQ(Uuid::v5(Uuid::namespace_dns(), "x").version(), 5);
+    // 所有生成路径都必须落在 RFC 4122 变体上
+    EXPECT_EQ(Uuid::generate().variant(), 2);
+    EXPECT_EQ(Uuid::generate_v7().variant(), 2);
+    EXPECT_EQ(Uuid::v5(Uuid::namespace_dns(), "x").variant(), 2);
+
+    // 全零是 variant 0（NCS）的特例，不是 v4
+    EXPECT_EQ(Uuid::nil().variant(), 0);
+    EXPECT_EQ(Uuid::nil().version(), 0);
+
+    // 手工构造的变体：byte[8] 高 2 位决定结果
+    Uuid u = Uuid::nil();
+    u.bytes[8] = 0xC0;
+    EXPECT_EQ(u.variant(), 6);  // Microsoft
+    u.bytes[8] = 0xE0;
+    EXPECT_EQ(u.variant(), 7);  // 未来保留
+    u.bytes[8] = 0x00;
+    EXPECT_EQ(u.variant(), 0);  // NCS
+
+    // v7/v5 经 parse/to_string 往返后信息不丢
+    const Uuid v7 = Uuid::generate_v7();
+    Uuid parsed;
+    ASSERT_TRUE(Uuid::parse(v7.to_string(), parsed));
+    EXPECT_EQ(parsed, v7);
+    EXPECT_EQ(parsed.version(), 7);
+    EXPECT_EQ(parsed.timestamp_ms(), v7.timestamp_ms());
+    EXPECT_TRUE(Uuid::parse(v7.to_hex_string(), parsed));
+    EXPECT_EQ(parsed, v7);
+}
+
 TEST(SystemInfoTest, ExecutablePathIsAbsolute)
 {
     using namespace libmini;

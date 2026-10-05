@@ -31,6 +31,7 @@
 
 - Add secure_random: a real CSPRNG, and move UUID v4 onto it（[71a2c97](https://github.com/tdyx87/libmini/commit/71a2c97a0f0a82394bae3dbbfde88c40bc2e3904)）
 - Add kdf: turn passwords into keys without a new dependency（[49af0b8](https://github.com/tdyx87/libmini/commit/49af0b8ebbb4294eef9486227f500d489a6bff04)）
+- Add SHA-1 and SHA-512 to the digest module（[5c95416](https://github.com/tdyx87/libmini/commit/5c95416904bee1ded1d7e16aad5bdef5ecb14dda)）
 
 #### 变更
 
@@ -54,6 +55,7 @@
   不抛异常、不提权：Windows 走宽字符注册表与卷 API（中文型号与卷标不乱码，
   卷 GUID 反查盘符），Linux 读 `/proc` 与 `/sys`（卷标识用文件系统 UUID），
   macOS 走 `system_profiler`。
+- **uuid 扩展**（`utils/uuid.h`）：新增 v7 时间有序 UUID（RFC 9562 §5.7）与 v5 命名空间派生 UUID（RFC 4122 §4.3，内部用上一轮补的 `Sha1`）。v7 前 48 位是 Unix 毫秒，毫秒内用进程内计数器（12 位 rand_a）递增，**单进程内严格单调递增**——这正是它相对 v4 的价值：v4 当主键时插入位置随机，写入放大与索引体积都随数据量劣化。单毫秒配额（4096 个）用尽时把内部时间戳 +1ms 而非让计数器回绕；此时内部时钟会领先真实时钟，故判断新毫秒必须用 `now > last_ms` 而非 `!=`，否则内部时钟回退会产出更小的 ID（时钟回拨同理）。另新增 `version()` / `variant()` / `timestamp_ms()` 与四个预定义命名空间。
 - **digest 扩展**（`utils/digest.h`）：新增 `Sha1`（RFC 3174）与 `Sha512`（FIPS 180-4），与既有 `Md5`/`Sha256` 同构（增量 `update` + 一次性 `hex`），纯 C++ 实现、三个平台逐字节一致，不引入平台相关的系统加密库差异。SHA-1 的碰撞已被攻破，头文件里写明它只用于兼容场景。SHA-512 的长度字段是 128 位，实现上显式维护高低 64 位并在低位回绕时补高位——直接 `+=` 会在超过 2^61 字节后静默算出错误摘要。
 - **kdf 模块**（`utils/kdf.h`）：PBKDF2-HMAC-SHA256 密钥派生（RFC 2898，零新增依赖，建在既有 `HmacSha256` 之上）+ 版本化口令密封。密封格式自带 magic / 版本号 / 算法 ID，可平滑迁移到 Argon2id；**头部（迭代次数、盐、nonce）整体进 GCM 的 AAD**，否则攻击者把迭代次数改成 1 就能让密钥退化成一次哈希。迭代次数在文件头里属于攻击者可控输入，故 `open` 对超出 `[kMinIterations, kMaxIterations]` 的值直接判否，而不是照着算——否则一次 `open` 就是 CPU DoS 开关。明文前置域分隔标记以区分「解密失败返回空」与「明文本来就空」。顺带给 `Aes256Gcm` 的三个 `static constexpr` 常量补了 C++11 外部定义：它们原先在消费者写 `EXPECT_EQ(x.size(), Aes256Gcm::kNonceSize)` 这类绑定到 const 引用的用法下会链接失败。
 - **secure_random 模块**（`utils/secure_random.h`）：系统 CSPRNG 封装（Windows `BCryptGenRandom`、Linux `getrandom` 并退回 `/dev/urandom`、macOS `arc4random_buf`），提供随机字节 / 十六进制串 / Base64url 令牌；按字母表取样用**拒绝采样**消除取模偏置（直接 `%` 会让靠前字符多出最多 1/256 的权重，用作口令是可测的弱点）。熵源不可用时返回失败而非退化。
