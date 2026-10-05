@@ -1562,6 +1562,142 @@ TEST(KdfTest, PasswordSealInspectAndNeedsReseal)
     EXPECT_FALSE(PasswordSeal::inspect(huge_salt, bad));
 }
 
+// ------------------------------ digest: SHA-1 / SHA-512 ------------------------------
+
+TEST(DigestTest, Sha1MatchesKnownAnswerVectors)
+{
+    using namespace libmini;
+    // 空串与 "abc" 是 RFC 3174 的两组基准值；长串（56 字节，正好卡在
+    // 单块填充边界之后）与 100 万 'a'（官方百万测试向量）用来覆盖
+    // 消息展开与多块路径——只测 "abc" 的话，块处理写错也能过。
+    EXPECT_EQ(Sha1::hex(""),
+              "da39a3ee5e6b4b0d3255bfef95601890afd80709");
+    EXPECT_EQ(Sha1::hex("abc"),
+              "a9993e364706816aba3e25717850c26c9cd0d89d");
+    EXPECT_EQ(Sha1::hex("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"),
+              "84983e441c3bd26ebaae4aa1f95129e5e54670f1");
+    EXPECT_EQ(Sha1::hex(std::string(1000000, 'a')),
+              "34aa973cd4c4daa4f61eeb2bdbad27316534016f");
+    // 43 字节 = 未满一块
+    EXPECT_EQ(Sha1::hex("The quick brown fox jumps over the lazy dog"),
+              "2fd4e1c67a2d28fced849ee1bb76e7391b93eb12");
+
+    EXPECT_EQ(Sha1::hex("").size(), 40u);
+    Sha1 s;
+    EXPECT_EQ(s.finish().size(), 20u);
+}
+
+TEST(DigestTest, Sha1StreamingMatchesOneShot)
+{
+    using namespace libmini;
+    // 分片喂入的边界是这类实现最容易错的地方：每次切片都从
+    // 块边界上切开，任何一处的 off-by-one 都会让结果与一次性算法不符
+    const std::string data =
+        "The quick brown fox jumps over the lazy dog and keeps on running "
+        "until it reaches exactly one hundred and twelve bytes of text.";
+
+    for (std::size_t chunk = 1; chunk <= 40; chunk += 7) {
+        Sha1 streaming;
+        for (std::size_t i = 0; i < data.size(); i += chunk) {
+            streaming.update(data.data() + i,
+                             (i + chunk < data.size()) ? chunk
+                                                      : data.size() - i);
+        }
+        EXPECT_EQ(Hex::encode(streaming.finish(), true), Sha1::hex(data))
+            << "chunk = " << chunk;
+    }
+
+    // reset 后复用必须回到初始状态，否则上一条数据的尾巴会漏进下一次
+    Sha1 reused;
+    reused.update("garbage-that-must-not-leak");
+    reused.reset();
+    reused.update("abc");
+    EXPECT_EQ(Hex::encode(reused.finish(), true), Sha1::hex("abc"));
+
+    // 空 update 是无操作
+    Sha1 empty_update;
+    empty_update.update("", 0);
+    empty_update.update(nullptr, 0);
+    EXPECT_EQ(Hex::encode(empty_update.finish(), true), Sha1::hex(""));
+}
+
+TEST(DigestTest, Sha512MatchesKnownAnswerVectors)
+{
+    using namespace libmini;
+    EXPECT_EQ(Sha512::hex(""),
+              "cf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9ce"
+              "47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e");
+    EXPECT_EQ(Sha512::hex("abc"),
+              "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d3"
+              "9a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca4"
+              "9f");
+    EXPECT_EQ(Sha512::hex("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"),
+              "204a8fc6dda82f0a0ced7beb8e08a41657c16ef468b228a8279be331a703c3"
+              "3596fd15c13b1b07f9aa1d3bea57789ca031ad85c7a71dd70354ec631238ca3"
+              "445");
+    EXPECT_EQ(Sha512::hex(std::string(1000000, 'a')),
+              "e718483d0ce769644e2e42c7bc15b4638e1f98b13b2044285632a803afa973e"
+              "bde0ff244877ea60a4cb0432ce577c31beb009c5c2c49aa2e4eadb217ad8cc09b");
+    EXPECT_EQ(Sha512::hex("The quick brown fox jumps over the lazy dog"),
+              "07e547d9586f6a73f73fbac0435ed76951218fb7d0c8d788a309d785436bbb6"
+              "42e93a252a954f23912547d1e8a3b5ed6e1bfd7097821233fa0538f3db854fee6");
+
+    EXPECT_EQ(Sha512::hex("").size(), 128u);
+    Sha512 s;
+    EXPECT_EQ(s.finish().size(), 64u);
+}
+
+TEST(DigestTest, Sha512PaddingBoundaryAround112And128)
+{
+    using namespace libmini;
+    // SHA-512 的填充要到 112 mod 128，这几个长度分别落在填充边界的
+    // 两侧与两侧之后：111/112 卡在边界，127/128 卡在块边界。
+    // 填充算错时这几组会最先崩。
+    const std::size_t lengths[] = { 111, 112, 113, 127, 128, 129, 255, 256 };
+    for (std::size_t i = 0; i < sizeof(lengths) / sizeof(lengths[0]); ++i) {
+        const std::string data(lengths[i], 'x');
+        Sha512 one_shot;
+        one_shot.update(data);
+        EXPECT_EQ(Hex::encode(one_shot.finish(), true), Sha512::hex(data))
+            << "length = " << lengths[i];
+
+        // 分两片喂入同样长度，确认跨块拼接与一次性一致
+        Sha512 split;
+        const std::size_t cut = lengths[i] / 2;
+        split.update(data.data(), cut);
+        split.update(data.data() + cut, lengths[i] - cut);
+        EXPECT_EQ(Hex::encode(split.finish(), true), Sha512::hex(data))
+            << "split length = " << lengths[i];
+    }
+
+    Sha512 reused;
+    reused.update("garbage-that-must-not-leak");
+    reused.reset();
+    reused.update("abc");
+    EXPECT_EQ(Hex::encode(reused.finish(), true), Sha512::hex("abc"));
+
+    Sha512 empty_update;
+    empty_update.update(nullptr, 0);
+    EXPECT_EQ(Hex::encode(empty_update.finish(), true), Sha512::hex(""));
+}
+
+TEST(DigestTest, Sha1AndSha512CoverEmbeddingLengths)
+{
+    using namespace libmini;
+    // 64 位计数器在超过 2^61 字节时才会回绕，这里无法真的喂进去，
+    // 但「同一段数据用 SHA-1 与 SHA-512 都能处理」本身要保证：
+    // 短于一个块、恰好一块、比一块多一字节都要能算。
+    Sha1 s1;
+    Sha512 s512;
+    const std::string data(300, 'q');
+    s1.update(data);
+    s512.update(data);
+    EXPECT_EQ(Hex::encode(s1.finish(), true), Sha1::hex(data));
+    EXPECT_EQ(Hex::encode(s512.finish(), true), Sha512::hex(data));
+    EXPECT_EQ(Sha1::hex(data).size(), 40u);
+    EXPECT_EQ(Sha512::hex(data).size(), 128u);
+}
+
 TEST(SystemInfoTest, ExecutablePathIsAbsolute)
 {
     using namespace libmini;
