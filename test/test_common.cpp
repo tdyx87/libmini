@@ -924,7 +924,9 @@ TEST(FileUtilsExtensionTest, DirectorySizeSymlinkNotFollowed)
     EXPECT_EQ(directory_size(dir, false), 0u);
     EXPECT_EQ(directory_size(dir, true), 0u);
 #else
-    if (!create_symlink(target_dir, dir + "/link", true)) {
+    // 目标写成相对链接所在目录的 "../target"：POSIX 把相对目标解析为
+    // 基于链接父目录，写成 CWD 相对路径会指向 dir/ 下不存在的路径
+    if (!create_symlink("../" + target_dir, dir + "/link", true)) {
         GTEST_SKIP() << "create_symlink (directory) failed (sandbox may forbid symlinks)";
     }
     // 不跟随符号链接时，目录大小不应包含目标目录中的文件

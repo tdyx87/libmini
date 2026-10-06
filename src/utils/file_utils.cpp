@@ -677,6 +677,7 @@ bool create_symlink(const std::string& target,
     const BOOL ok = ::CreateSymbolicLinkW(wlink.c_str(), wtarget.c_str(), flags);
     return ok != FALSE;
 #else
+    (void)directory;  // POSIX symlink() 对文件/目录一视同仁，无需区分
     return ::symlink(target.c_str(), link_path.c_str()) == 0;
 #endif
 }
@@ -735,35 +736,54 @@ bool set_file_permissions(const std::string& path, std::uint32_t mode)
 
 // ------------------ 目录占用 ------------------
 
-std::uint64_t directory_size(const std::string& path, bool follow_symlinks)
+namespace {
+
+// follow_symlinks 下每跳一个符号链接 hops+1；上限用于防
+// dir/link -> .. 这类自引用环无限递归（对齐 POSIX MAXSYMLINKS 常见值）
+constexpr int kMaxSymlinkHops = 40;
+
+std::uint64_t directory_size_impl(const std::string& path,
+                                  bool follow_symlinks, int hops)
 {
     if (!file_exists(path) || !is_directory(path)) {
         return 0;
     }
     std::uint64_t total = 0;
-    std::vector<DirEntry> entries = list_directory_detailed(path);
+    const std::vector<DirEntry> entries = list_directory_detailed(path);
     for (std::size_t i = 0; i < entries.size(); ++i) {
         const std::string child = join_with(path, entries[i].name);
         if (entries[i].kind == EntryKind::Directory) {
-            total += directory_size(child, follow_symlinks);
+            total += directory_size_impl(child, follow_symlinks, hops);
         } else if (entries[i].kind == EntryKind::File) {
             total += entries[i].size;
-        } else if (entries[i].kind == EntryKind::Symlink) {
-            if (follow_symlinks) {
-                std::string resolved = read_symlink(child);
-                if (!resolved.empty()) {
-                    const std::string abs_target =
-                        path_is_absolute(resolved)
-                            ? resolved
-                            : path_absolute(resolved, dirname(child));
-                    if (!is_directory(abs_target)) {
-                        total += file_size(abs_target);
-                    }
-                }
+        } else if (entries[i].kind == EntryKind::Symlink && follow_symlinks &&
+                   hops < kMaxSymlinkHops) {
+            // 目标不解引用时链接算 0；跟随时按 POSIX 语义解析
+            //（相对目标基于链接所在目录），指向目录则递归计入
+            const std::string resolved = read_symlink(child);
+            if (resolved.empty()) {
+                continue;  // 读不到目标（平台不支持/已失效）→ 计 0
+            }
+            const std::string abs_target =
+                path_is_absolute(resolved)
+                    ? resolved
+                    : path_absolute(resolved, dirname(child));
+            if (is_directory(abs_target)) {
+                total += directory_size_impl(abs_target, follow_symlinks,
+                                             hops + 1);
+            } else {
+                total += file_size(abs_target);  // 悬空链接 stat 失败 → 0
             }
         }
     }
     return total;
+}
+
+}  // namespace
+
+std::uint64_t directory_size(const std::string& path, bool follow_symlinks)
+{
+    return directory_size_impl(path, follow_symlinks, 0);
 }
 
 // ------------------ 作用域临时目录 ------------------
