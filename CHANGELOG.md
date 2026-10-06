@@ -38,6 +38,7 @@
 - Add file_utils extensions: symlink, permissions, directory_size, temp_directory（[dac8430](https://github.com/tdyx87/libmini/commit/dac843049e01f6cd33ad6e0d8048d5e400e620fe)）
 - Add thread sync primitives: Semaphore, Event, OnceFlag, CancellationToken（[72353e0](https://github.com/tdyx87/libmini/commit/72353e060c8e84f1e7c2280d21b82f84dbe90151)）
 - Add Base64url codec (RFC 4648 §5) with optional padding（[638c4b0](https://github.com/tdyx87/libmini/commit/638c4b0d3b9bf686091f3435f3bb26ee2401eb99)）
+- Add ISO-8601 / RFC-3339 formatting and parsing to time_utils（[78dd430](https://github.com/tdyx87/libmini/commit/78dd43037f4fb369aebd93c146537c7255793cf8)）
 
 #### 变更
 
