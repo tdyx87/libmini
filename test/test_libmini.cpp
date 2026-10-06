@@ -2315,6 +2315,133 @@ TEST(ZipTest, CorruptDataFailsGracefully)
     EXPECT_FALSE(bad.open("not a zip"));
 }
 
+// ------------------------------ tar (ustar) ------------------------------
+
+TEST(TarTest, RoundTripTextBinaryUtf8)
+{
+    libmini::TarWriter tw;
+    ASSERT_TRUE(tw.add_file("hello.txt", "hello tar world"));
+    std::string bin;
+    for (int i = 0; i < 5000; ++i) {
+        bin.push_back(static_cast<char>(i & 0xff));
+    }
+    ASSERT_TRUE(tw.add_file("data/bin.dat", bin));
+    ASSERT_TRUE(tw.add_file(u8"\xE4\xB8\xAD\xE6\x96\x87.md", u8"# 中文\n"));
+    ASSERT_TRUE(tw.add_file("empty.txt", ""));
+    const std::string bytes = tw.finish();
+    EXPECT_EQ(bytes.size() % 512, 0u);  // 块对齐
+    EXPECT_EQ(tw.count(), 0u);          // finish 后重置
+
+    libmini::TarReader tr;
+    ASSERT_TRUE(tr.open(bytes));
+    ASSERT_EQ(tr.entries().size(), 4u);
+    EXPECT_TRUE(tr.contains("hello.txt"));
+    EXPECT_EQ(tr.extract("hello.txt"), "hello tar world");
+    EXPECT_EQ(tr.extract("data/bin.dat"), bin);
+    EXPECT_EQ(tr.extract(u8"\xE4\xB8\xAD\xE6\x96\x87.md"), u8"# 中文\n");
+    EXPECT_TRUE(tr.extract("empty.txt").empty());
+    EXPECT_TRUE(tr.last_error().empty());
+
+    // 条目元数据
+    const libmini::TarEntryInfo& e = tr.entries()[0];
+    EXPECT_EQ(e.type, libmini::TarType::Regular);
+    EXPECT_EQ(e.size, 15u);
+    EXPECT_EQ(e.mode, 0644u);
+
+    // extract_at 与顺序
+    EXPECT_EQ(tr.extract_at(1), bin);
+    EXPECT_TRUE(tr.extract_at(99).empty());
+    EXPECT_FALSE(tr.last_error().empty());
+    // 不存在的条目
+    EXPECT_TRUE(tr.extract("missing.txt").empty());
+    EXPECT_FALSE(tr.last_error().empty());
+}
+
+TEST(TarTest, LongPathSplitAcrossPrefixName)
+{
+    // >100 字节：应拆进 prefix/name 两个字段并能还原
+    const std::string deep =
+        "a_very_long_directory_name_segment_number_one/"
+        "another_quite_long_intermediate_directory_name/"
+        "final_file_name_that_pushes_past_100_bytes.txt";
+    ASSERT_GT(deep.size(), 100u);
+    ASSERT_LE(deep.size(), 255u);
+
+    libmini::TarWriter tw;
+    ASSERT_TRUE(tw.add_file(deep, "long path content"));
+    const std::string bytes = tw.finish();
+
+    libmini::TarReader tr;
+    ASSERT_TRUE(tr.open(bytes)) << tr.last_error();
+    ASSERT_EQ(tr.entries().size(), 1u);
+    EXPECT_EQ(tr.entries()[0].name, deep);
+    EXPECT_EQ(tr.extract(deep), "long path content");
+
+    // 超过 255 字节：拒绝
+    libmini::TarWriter too_long;
+    EXPECT_FALSE(too_long.add_file(std::string(300, 'x') + ".txt", "v"));
+    EXPECT_FALSE(too_long.last_error().empty());
+}
+
+TEST(TarTest, DirAndSymlink)
+{
+    libmini::TarWriter tw;
+    ASSERT_TRUE(tw.add_dir("docs"));                 // 自动补 '/'
+    ASSERT_TRUE(tw.add_file("docs/readme.md", "# doc"));
+    ASSERT_TRUE(tw.add_symlink("link", "docs/readme.md"));
+    const std::string bytes = tw.finish();
+
+    libmini::TarReader tr;
+    ASSERT_TRUE(tr.open(bytes)) << tr.last_error();
+    ASSERT_EQ(tr.entries().size(), 3u);
+    EXPECT_EQ(tr.entries()[0].name, "docs/");
+    EXPECT_EQ(tr.entries()[0].type, libmini::TarType::Directory);
+    EXPECT_EQ(tr.entries()[2].type, libmini::TarType::Symlink);
+    EXPECT_EQ(tr.entries()[2].link_target, "docs/readme.md");
+    EXPECT_EQ(tr.entries()[2].size, 0u);
+    EXPECT_TRUE(tr.contains("docs/"));
+    EXPECT_FALSE(tr.contains("docs"));  // 精确匹配含尾部 '/'
+    // 目录/链接无载荷：extract 返回空且不报错
+    EXPECT_TRUE(tr.extract("docs/").empty());
+    EXPECT_TRUE(tr.last_error().empty());
+    EXPECT_EQ(tr.extract("docs/readme.md"), "# doc");
+}
+
+TEST(TarTest, CorruptAndTruncatedFailGracefully)
+{
+    libmini::TarWriter tw;
+    ASSERT_TRUE(tw.add_file("f.txt", "some tar content"));
+    std::string bytes = tw.finish();
+
+    // 篡改头部 name 首字节 → checksum 不匹配
+    std::string corrupt = bytes;
+    corrupt[0] = 'X';
+    libmini::TarReader tr;
+    EXPECT_FALSE(tr.open(corrupt));
+    EXPECT_FALSE(tr.last_error().empty());
+
+    // 截断数据区 → 条目被截断（只剩头部，数据/EOF 都没了）
+    libmini::TarReader tr2;
+    EXPECT_FALSE(tr2.open(bytes.substr(0, 512)));
+    EXPECT_FALSE(tr2.last_error().empty());
+    // 只到头部+半个数据块
+    EXPECT_FALSE(tr2.open(bytes.substr(0, 512 + 8)));
+
+    // 空输入
+    libmini::TarReader tr3;
+    EXPECT_FALSE(tr3.open(""));
+
+    // 长度非 512 倍数
+    libmini::TarReader tr4;
+    EXPECT_FALSE(tr4.open(bytes + "xx"));
+
+    // magic 篡改
+    std::string nomagic = bytes;
+    nomagic[257] = 'U';
+    libmini::TarReader tr5;
+    EXPECT_FALSE(tr5.open(nomagic));
+}
+
 // ---------------- AES-256-GCM ----------------
 
 TEST(AesGcmTest, RoundTripAndAad)

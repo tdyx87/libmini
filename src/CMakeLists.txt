@@ -28,6 +28,7 @@ set(LIBMINI_SOURCES
     utils/console.cpp
     utils/tcp.cpp
     utils/zip.cpp
+    utils/tar.cpp
     utils/aes_gcm.cpp
     utils/ini_config.cpp
     utils/gzip.cpp

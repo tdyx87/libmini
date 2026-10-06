@@ -43,6 +43,7 @@
 #include "utils/tcp.h"
 #include "utils/retry.h"
 #include "utils/zip.h"
+#include "utils/tar.h"
 #include "utils/object_pool.h"
 #include "utils/aes_gcm.h"
 #include "utils/console.h"

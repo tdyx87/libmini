@@ -183,6 +183,7 @@ target_link_libraries(app PRIVATE libmini::libmini)
 | retry | `utils/retry.h` | poll_until 指数退避轮询（抖动防风暴、deadline 变体） |
 | object_pool | `utils/object_pool.h` | 线程安全对象池：RAII Lease 借出归还、工厂创建、归还重置钩子 |
 | zip | `utils/zip.h` | ZIP 包读写（zlib deflate/store，UTF-8 文件名，CRC 校验），零新增依赖 |
+| tar | `utils/tar.h` | tar（ustar）读写：文件/目录/符号链接，prefix 拆支持 255 字节长路径，头部 checksum 校验，零新增依赖 |
 | aes_gcm | `utils/aes_gcm.h` | AES-256-GCM 认证加密（Windows CNG / OpenSSL EVP），seal/open 落盘格式 |
 | sqlite | `utils/sqlite.h` | SQLite 封装：参数绑定（索引/命名）、事务 RAII、行遍历、带类型值读取，错误不抛异常 |
 | system_info | `utils/system_info.h` | 主机名/PID/可执行文件路径/CPU 数/物理内存/磁盘容量与剩余 |
@@ -625,6 +626,16 @@ const std::string zip_bytes = zw.finish();
 ZipReader zr;
 if (zr.open(zip_bytes)) {
     std::string back = zr.extract("doc.txt");  // CRC 校验，篡改返回空
+}
+
+// tar（ustar）：与系统 tar / Python tarfile 互读
+TarWriter tw;
+tw.add_file("docs/a.md", text);
+tw.add_symlink("latest", "docs/a.md");
+std::string tar_bytes = tw.finish();         // 512 字节块对齐 + 1024 零块 EOF
+TarReader tr;
+if (tr.open(tar_bytes)) {
+    std::string back = tr.extract("docs/a.md");  // 长路径经 prefix/name 还原
 }
 
 // AES-256-GCM：本地敏感数据落盘（seal = 随机 nonce||密文||tag）
