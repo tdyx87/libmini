@@ -118,10 +118,11 @@ EntryKind classify(const PathInfo& info)
 
 }  // namespace
 
+// ------------------ 基本文件操作 ------------------
+
 bool file_exists(const std::string& path)
 {
 #ifdef _WIN32
-    // W 版 API：路径按 UTF-8 解释，中文/非代码页字符无问题
     const DWORD attrs = GetFileAttributesW(internal::utf8_to_wide(path).c_str());
     return attrs != INVALID_FILE_ATTRIBUTES;
 #else
@@ -294,16 +295,14 @@ bool make_directories(const std::string& path)
     if (file_exists(path)) {
         return is_directory(path);
     }
-    // 逐级补齐父目录：跳过根、盘符、UNC 前缀
     const std::string generic = path_to_generic(path);
     std::size_t pos = 0;
     if (!generic.empty() && generic[0] == '/') {
         pos = 1;
 #ifdef _WIN32
-        if (generic.size() >= 2 && generic[1] == '/') {  // UNC //server/share
+        if (generic.size() >= 2 && generic[1] == '/') {
             pos = generic.find('/', 2);
-            pos = pos == std::string::npos ? generic.size()
-                                           : pos + 1;  // share 之后才可创建
+            pos = pos == std::string::npos ? generic.size() : pos + 1;
         }
 #endif
     }
@@ -344,7 +343,6 @@ bool make_directories(const std::string& path)
 bool copy_file(const std::string& from, const std::string& to)
 {
 #ifdef _WIN32
-    // COPY_EXISTING = 目标已存在时覆盖
     return ::CopyFileW(internal::utf8_to_wide(from).c_str(),
                        internal::utf8_to_wide(to).c_str(), FALSE) != 0;
 #else
@@ -366,7 +364,6 @@ bool copy_tree(const std::string& from, const std::string& to)
     if (!src.is_dir) {
         return copy_file(from, to);
     }
-    // 目标已存在且为目录 → 复制为 to/basename(from)
     std::string dst = to;
     if (file_exists(dst) && is_directory(dst)) {
         dst = join_with(dst, basename(path_to_generic(from)));
@@ -387,7 +384,6 @@ bool copy_tree(const std::string& from, const std::string& to)
                 return false;
             }
         }
-        // 符号链接与其他类型跳过
     }
     return true;
 }
@@ -409,13 +405,11 @@ bool move_path(const std::string& from, const std::string& to)
         return false;
     }
     if (file_exists(to)) {
-        return false;  // 目标已存在：不覆盖（与 rename_path 语义一致）
+        return false;
     }
-    // 先尝试原子 rename（Windows 版 MOVEFILE_COPY_ALLOWED 已能跨盘符）
     if (rename_path(from, to)) {
         return true;
     }
-    // 回退：复制 + 删除
     if (!copy_tree(from, to)) {
         return false;
     }
@@ -551,7 +545,7 @@ std::string temp_directory_path()
     if (n > 0 && n < MAX_PATH) {
         std::wstring w(buf, n);
         if (!w.empty() && (w[w.size() - 1] == L'\\' || w[w.size() - 1] == L'/')) {
-            w.erase(w.size() - 1);  // 去掉结尾分隔符，交给调用方拼
+            w.erase(w.size() - 1);
         }
         return internal::wide_to_utf8(w);
     }
@@ -567,9 +561,6 @@ std::string temp_directory_path()
 
 std::string unique_temp_path(const std::string& prefix, const std::string& dir)
 {
-    // 进程级递增计数 + 周期计数，避免同进程内名字碰撞。
-    // 计时源按平台取：Windows GetTickCount；POSIX 用 CLOCK_MONOTONIC
-    //（它无 Windows 依赖，必须放在平台分支之外编译）
     static unsigned long long counter = 0;
 #ifdef _WIN32
     const unsigned long long tick =
@@ -589,7 +580,6 @@ std::string unique_temp_path(const std::string& prefix, const std::string& dir)
 
 bool write_file_atomic(const std::string& path, const std::string& content)
 {
-    // 临时文件放目标同目录：保证与目标同卷，替换才是原子的
     const std::size_t sep = path.find_last_of("/\\");
     const std::string dir = (sep == std::string::npos) ? std::string(".")
                                                        : path.substr(0, sep);
@@ -607,14 +597,13 @@ bool write_file_atomic(const std::string& path, const std::string& content)
                   : WriteFile(hFile, content.data(),
                               static_cast<DWORD>(content.size()), &written, NULL);
     if (ok && !FlushFileBuffers(hFile)) {
-        ok = FALSE;  // 数据落盘失败：绝不进入替换步骤
+        ok = FALSE;
     }
     CloseHandle(hFile);
     if (!ok || (!content.empty() && written != content.size())) {
         DeleteFileW(wtmp.c_str());
         return false;
     }
-    // 原子替换已有目标；WRITE_THROUGH 让替换本身也尽量落盘
     if (!MoveFileExW(wtmp.c_str(), internal::utf8_to_wide(path).c_str(),
                      MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
         DeleteFileW(wtmp.c_str());
@@ -657,11 +646,157 @@ bool write_file_atomic(const std::string& path, const std::string& content)
 #endif
 }
 
-namespace {
+// ------------------ 符号链接 ------------------
 
-// 流式文件摘要的共用骨架：64KB 分块喂给更新器，内存占用恒定
-std::string digest_file_hex(const std::string& path,
-                            bool want_sha256)
+std::string read_symlink(const std::string& path)
+{
+#ifndef _WIN32
+    char buf[4096];
+    const ssize_t n = ::readlink(path.c_str(), buf, sizeof(buf));
+    if (n < 0) {
+        return std::string();
+    }
+    return std::string(buf, static_cast<std::size_t>(n));
+#else
+    (void)path;
+    return std::string();
+#endif
+}
+
+bool create_symlink(const std::string& target,
+                    const std::string& link_path,
+                    bool directory)
+{
+#ifdef _WIN32
+    const std::wstring wtarget = internal::utf8_to_wide(target);
+    const std::wstring wlink = internal::utf8_to_wide(link_path);
+    DWORD flags = SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE;
+    if (directory) {
+        flags |= SYMBOLIC_LINK_FLAG_DIRECTORY;
+    }
+    const BOOL ok = ::CreateSymbolicLinkW(wlink.c_str(), wtarget.c_str(), flags);
+    return ok != FALSE;
+#else
+    return ::symlink(target.c_str(), link_path.c_str()) == 0;
+#endif
+}
+
+bool remove_symlink(const std::string& path)
+{
+#ifdef _WIN32
+    if (!file_exists(path)) {
+        return false;
+    }
+    const DWORD attrs = GetFileAttributesW(
+        internal::utf8_to_wide(path).c_str());
+    if (attrs == INVALID_FILE_ATTRIBUTES) {
+        return false;
+    }
+    if ((attrs & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+        return RemoveDirectoryW(
+            internal::utf8_to_wide(path).c_str()) != 0;
+    }
+    return DeleteFileW(
+        internal::utf8_to_wide(path).c_str()) != 0;
+#else
+    return ::unlink(path.c_str()) == 0;
+#endif
+}
+
+// ------------------ 文件权限 ------------------
+
+bool file_permissions(const std::string& path, std::uint32_t& mode)
+{
+#ifndef _WIN32
+    struct stat st;
+    if (::stat(path.c_str(), &st) != 0) {
+        return false;
+    }
+    mode = static_cast<std::uint32_t>(
+        st.st_mode & (S_IRWXU | S_IRWXG | S_IRWXO));
+    return true;
+#else
+    (void)path;
+    mode = 0;
+    return false;
+#endif
+}
+
+bool set_file_permissions(const std::string& path, std::uint32_t mode)
+{
+#ifndef _WIN32
+    return ::chmod(path.c_str(),
+                   static_cast<mode_t>(mode)) == 0;
+#else
+    (void)path; (void)mode;
+    return false;
+#endif
+}
+
+// ------------------ 目录占用 ------------------
+
+std::uint64_t directory_size(const std::string& path, bool follow_symlinks)
+{
+    if (!file_exists(path) || !is_directory(path)) {
+        return 0;
+    }
+    std::uint64_t total = 0;
+    std::vector<DirEntry> entries = list_directory_detailed(path);
+    for (std::size_t i = 0; i < entries.size(); ++i) {
+        const std::string child = join_with(path, entries[i].name);
+        if (entries[i].kind == EntryKind::Directory) {
+            total += directory_size(child, follow_symlinks);
+        } else if (entries[i].kind == EntryKind::File) {
+            total += entries[i].size;
+        } else if (entries[i].kind == EntryKind::Symlink) {
+            if (follow_symlinks) {
+                std::string resolved = read_symlink(child);
+                if (!resolved.empty()) {
+                    const std::string abs_target =
+                        path_is_absolute(resolved)
+                            ? resolved
+                            : path_absolute(resolved, dirname(child));
+                    if (!is_directory(abs_target)) {
+                        total += file_size(abs_target);
+                    }
+                }
+            }
+        }
+    }
+    return total;
+}
+
+// ------------------ 作用域临时目录 ------------------
+
+std::string unique_temp_directory(const std::string& prefix,
+                                  const std::string& dir)
+{
+    static unsigned long long counter = 0;
+#ifdef _WIN32
+    const unsigned long long tick =
+        static_cast<unsigned long long>(::GetTickCount()) & 0xFFFULL;
+#else
+    struct ::timespec ts;
+    ::clock_gettime(CLOCK_MONOTONIC, &ts);
+    const unsigned long long tick =
+        static_cast<unsigned long long>(ts.tv_nsec / 1000000) & 0xFFFULL;
+#endif
+    const unsigned long long id = (++counter << 12) ^ tick;
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "%llx",
+                  static_cast<unsigned long long>(id));
+    const std::string base = dir.empty() ? temp_directory_path() : dir;
+    const std::string path = join_with(base, prefix + buf);
+    if (make_directory(path)) {
+        return path;
+    }
+    return std::string();
+}
+
+// ------------------ 流式文件摘要 ------------------
+
+namespace {
+std::string digest_file_hex(const std::string& path, bool want_sha256)
 {
 #ifdef _WIN32
     FILE* f = nullptr;
@@ -693,7 +828,6 @@ std::string digest_file_hex(const std::string& path,
     return want_sha256 ? Hex::encode(sha.finish(), true)
                        : Hex::encode(md5.finish(), true);
 }
-
 }  // namespace
 
 std::string sha256_file_hex(const std::string& path)

@@ -693,6 +693,210 @@ TEST(FileUtilsTest, EmptyWriteAndDirectoryListing)
     EXPECT_FALSE(list_directory(".").empty());
 }
 
+// ------------------ file_utils 扩展：符号链接 / 权限 / 目录占用 / 临时目录 ------------------
+
+TEST(FileUtilsExtensionTest, SymlinkReadEmptyOnWindows)
+{
+    using namespace libmini;
+    // Windows 下 read_symlink 始终返回空（无法获取未解引用的目标）。
+    // 此测试在 Windows 上仅断言返回空；在 POSIX 下创建一个符号链接并读取。
+#ifdef _WIN32
+    EXPECT_TRUE(read_symlink("nonexistent_link_9x7").empty());
+#else
+    const std::string target = "target_file_9x7.txt";
+    const std::string link = "link_to_target_9x7.txt";
+    // 创建目标文件
+    ASSERT_TRUE(write_file(target, "hello"));
+    // 创建符号链接
+    ASSERT_TRUE(create_symlink(target, link));
+    // 读取符号链接目标
+    EXPECT_EQ(read_symlink(link), target);
+    // 清理
+    remove_symlink(link);
+    remove_file(target);
+#endif
+}
+
+TEST(FileUtilsExtensionTest, CreateSymlinkFile)
+{
+    using namespace libmini;
+    // 创建文件符号链接
+    const std::string target = "symlink_target_9x7.txt";
+    const std::string link = "symlink_link_9x7.txt";
+    ASSERT_TRUE(write_file(target, "test content"));
+    // 在 Windows 上，创建符号链接可能需要权限；接受失败
+#ifdef _WIN32
+    // 尝试创建符号链接（可能因权限失败）
+    const bool created = create_symlink(target, link);
+    if (created) {
+        EXPECT_TRUE(file_exists(link));
+        EXPECT_EQ(read_file(link), "test content");  // 跟随符号链接读取
+        // 删除符号链接
+        EXPECT_TRUE(remove_symlink(link));
+        EXPECT_FALSE(file_exists(link));
+    }
+#else
+    ASSERT_TRUE(create_symlink(target, link));
+    EXPECT_TRUE(file_exists(link));
+    EXPECT_EQ(read_symlink(link), target);
+    EXPECT_EQ(read_file(link), "test content");
+    remove_symlink(link);
+#endif
+    remove_file(target);
+}
+
+TEST(FileUtilsExtensionTest, RemoveSymlink)
+{
+    using namespace libmini;
+    const std::string target = "rmsym_target_9x7.txt";
+    const std::string link = "rmsym_link_9x7.txt";
+    ASSERT_TRUE(write_file(target, "data"));
+#ifdef _WIN32
+    // Windows 下可能创建失败，跳过测试
+    if (!create_symlink(target, link)) {
+        remove_file(target);
+        return;
+    }
+#else
+    ASSERT_TRUE(create_symlink(target, link));
+#endif
+    EXPECT_TRUE(file_exists(link));
+    EXPECT_TRUE(remove_symlink(link));
+    EXPECT_FALSE(file_exists(link));
+    // 原目标仍存在
+    EXPECT_TRUE(file_exists(target));
+    remove_file(target);
+}
+
+TEST(FileUtilsExtensionTest, FilePermissionsPlatformDifference)
+{
+    using namespace libmini;
+    const std::string fname = "perm_test_9x7.txt";
+    ASSERT_TRUE(write_file(fname, "test"));
+    std::uint32_t mode = 0;
+#ifdef _WIN32
+    // Windows 下 file_permissions 始终返回 false
+    EXPECT_FALSE(file_permissions(fname, mode));
+    EXPECT_EQ(mode, 0u);
+#else
+    ASSERT_TRUE(file_permissions(fname, mode));
+    EXPECT_GT(mode, 0u);
+    // 修改权限为 0600
+    ASSERT_TRUE(set_file_permissions(fname, 0600));
+    std::uint32_t new_mode = 0;
+    ASSERT_TRUE(file_permissions(fname, new_mode));
+    EXPECT_EQ(new_mode & (S_IRWXU | S_IRWXG | S_IRWXO), 0600u);
+    // 恢复权限为 0644
+    ASSERT_TRUE(set_file_permissions(fname, 0644));
+#endif
+    remove_file(fname);
+}
+
+TEST(FileUtilsExtensionTest, DirectorySizeEmptyDirectory)
+{
+    using namespace libmini;
+    const std::string dir = "dirsize_empty_9x7";
+    ASSERT_TRUE(make_directory(dir));
+    EXPECT_EQ(directory_size(dir), 0u);
+    remove_directory(dir);
+}
+
+TEST(FileUtilsExtensionTest, DirectorySizeWithFile)
+{
+    using namespace libmini;
+    const std::string dir = "dirsize_withfile_9x7";
+    ASSERT_TRUE(make_directory(dir));
+    const std::string fname = dir + "/test.txt";
+    const std::string content = "hello";
+    ASSERT_TRUE(write_file(fname, content));
+    EXPECT_EQ(directory_size(dir), content.size());
+    remove_tree(dir);
+}
+
+TEST(FileUtilsExtensionTest, DirectorySizeRecursive)
+{
+    using namespace libmini;
+    const std::string dir = "dirsize_recursive_9x7";
+    ASSERT_TRUE(make_directories(dir + "/a/b"));
+    ASSERT_TRUE(write_file(dir + "/a/b/c.txt", "deep"));
+    ASSERT_TRUE(write_file(dir + "/a/d.txt", "shallow"));
+    // 所有文件大小之和："deep" 為 4 字元，"shallow" 為 7 字元
+    EXPECT_EQ(directory_size(dir), 4u + 7u);
+    remove_tree(dir);
+}
+
+TEST(FileUtilsExtensionTest, DirectorySizeSymlinkNotFollowed)
+{
+    using namespace libmini;
+    const std::string dir = "dirsize_sym_9x7";
+    const std::string target_dir = "dirsize_sym_target_9x7";
+    ASSERT_TRUE(make_directory(dir));
+    ASSERT_TRUE(make_directory(target_dir));
+    ASSERT_TRUE(write_file(target_dir + "/big.txt", std::string(1000, 'x')));
+#ifdef _WIN32
+    // Windows 下创建目录符号链接可能需要权限；若失败则跳过
+    if (!create_symlink(target_dir, dir + "/link", true)) {
+        remove_tree(dir);
+        remove_tree(target_dir);
+        return;
+    }
+    // Windows 下 read_symlink 返回空，无法解析符号链接目标，
+    // 因此 follow_symlinks = true 时也无法追踪，返回 0。
+    EXPECT_EQ(directory_size(dir, false), 0u);
+    EXPECT_EQ(directory_size(dir, true), 0u);
+#else
+    ASSERT_TRUE(create_symlink(target_dir, dir + "/link", true));
+    // 不跟随符号链接时，目录大小不应包含目标目录中的文件
+    EXPECT_EQ(directory_size(dir, false), 0u);
+    // 跟随符号链接时，包含目标目录中的文件
+    EXPECT_EQ(directory_size(dir, true), 1000u);
+#endif
+    remove_tree(dir);
+    remove_tree(target_dir);
+}
+
+TEST(FileUtilsExtensionTest, UniqueTempDirectoryCreation)
+{
+    using namespace libmini;
+    const std::string tmpdir = unique_temp_directory("libmini_test_");
+    ASSERT_FALSE(tmpdir.empty());
+    EXPECT_TRUE(file_exists(tmpdir));
+    EXPECT_TRUE(is_directory(tmpdir));
+    // 创建临时文件于其中
+    const std::string fname = tmpdir + "/test.txt";
+    ASSERT_TRUE(write_file(fname, "temp"));
+    EXPECT_EQ(read_file(fname), "temp");
+    // 清理整个临时目录
+    remove_tree(tmpdir);
+    EXPECT_FALSE(file_exists(tmpdir));
+}
+
+TEST(FileUtilsExtensionTest, UniqueTempDirectoryWithCustomPrefix)
+{
+    using namespace libmini;
+    const std::string tmpdir = unique_temp_directory("custom_prefix_");
+    ASSERT_FALSE(tmpdir.empty());
+    EXPECT_TRUE(file_exists(tmpdir));
+    EXPECT_TRUE(is_directory(tmpdir));
+    // 路径应包含自定义前缀
+    EXPECT_EQ(tmpdir.find("custom_prefix_") != std::string::npos, true);
+    remove_tree(tmpdir);
+}
+
+TEST(FileUtilsExtensionTest, UniqueTempDirectoryInCustomDir)
+{
+    using namespace libmini;
+    const std::string base = "temp_base_9x7";
+    ASSERT_TRUE(make_directory(base));
+    const std::string tmpdir = unique_temp_directory("sub_", base);
+    ASSERT_FALSE(tmpdir.empty());
+    EXPECT_TRUE(file_exists(tmpdir));
+    EXPECT_TRUE(is_directory(tmpdir));
+    // 路径应包含自定义目录
+    EXPECT_EQ(tmpdir.find(base) != std::string::npos, true);
+    remove_tree(base);
+}
+
 // ------------------------------- format 辅助 ------------------------------
 
 TEST(FormatHelpersTest, FormatBytes)
