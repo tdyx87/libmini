@@ -22,6 +22,7 @@ class LibminiConan(ConanFile):
         self.requires("spdlog/1.14.1")
         self.requires("cpp-httplib/0.28.0")
         self.requires("sqlite3/3.46.1")
+        self.requires("zstd/1.5.6")
         if self.settings.os != "Windows":
             self.requires("openssl/3.0.17")
 

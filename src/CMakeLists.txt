@@ -29,6 +29,7 @@ set(LIBMINI_SOURCES
     utils/tcp.cpp
     utils/zip.cpp
     utils/tar.cpp
+    utils/zstd.cpp
     utils/aes_gcm.cpp
     utils/ini_config.cpp
     utils/gzip.cpp
@@ -110,12 +111,14 @@ if(TARGET httplib::httplib)
 endif()
 find_package(ZLIB REQUIRED)
 find_package(SQLite3 REQUIRED)
+find_package(zstd REQUIRED)
 target_link_libraries(libmini PUBLIC
     nlohmann_json::nlohmann_json
     pugixml::pugixml
     spdlog::spdlog    httplib::httplib
     ZLIB::ZLIB
     SQLite::SQLite3
+    zstd::libzstd_static
 )
 
 if(WIN32)

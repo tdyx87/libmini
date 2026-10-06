@@ -389,6 +389,81 @@ TEST(GzipTest, DecompressRejectsGarbage)
     EXPECT_FALSE(gzip_decompress(std::string("\x1f\x8b\x08\x00trunc", 9)).has_value());
 }
 
+// --------------------------------- zstd -----------------------------------
+
+TEST(ZstdTest, RoundTrip)
+{
+    using namespace libmini;
+    const std::vector<std::string> cases = {
+        "",
+        "a",
+        "hello hello hello hello hello hello hello hello hello",
+        std::string(100000, 'z'),
+        std::string("binary\x00\x01\xff data", 15),
+        std::string("binary\x00\x01\xff data", 7)};
+
+    for (std::size_t i = 0; i < cases.size(); ++i) {
+        const optional<std::string> packed = zstd_compress(cases[i]);
+        ASSERT_TRUE(packed.has_value()) << "case " << i;
+        const optional<std::string> raw = zstd_decompress(*packed);
+        ASSERT_TRUE(raw.has_value()) << "case " << i;
+        EXPECT_EQ(*raw, cases[i]) << "case " << i;
+    }
+}
+
+TEST(ZstdTest, FrameMagicAndCompressionRatio)
+{
+    using namespace libmini;
+    const std::string payload(50000, 'q');
+    const optional<std::string> packed = zstd_compress(payload, 19);
+    ASSERT_TRUE(packed.has_value());
+
+    // zstd 帧魔数：28 B5 2F FD（小端）
+    ASSERT_GE(packed->size(), 4u);
+    EXPECT_EQ(static_cast<unsigned char>((*packed)[0]), 0x28);
+    EXPECT_EQ(static_cast<unsigned char>((*packed)[1]), 0xB5);
+    EXPECT_EQ(static_cast<unsigned char>((*packed)[2]), 0x2F);
+    EXPECT_EQ(static_cast<unsigned char>((*packed)[3]), 0xFD);
+    // 高压缩比下输出远小于输入
+    EXPECT_LT(packed->size(), payload.size() / 100);
+
+    const optional<std::string> out = zstd_decompress(*packed);
+    ASSERT_TRUE(out.has_value());
+    EXPECT_EQ(*out, payload);
+}
+
+TEST(ZstdTest, DecompressRejectsGarbageAndBombs)
+{
+    using namespace libmini;
+    EXPECT_FALSE(zstd_decompress("").has_value());
+    EXPECT_FALSE(zstd_decompress("not zstd at all").has_value());
+    // 截断的合法帧
+    const optional<std::string> packed = zstd_compress(std::string(5000, 'x'));
+    ASSERT_TRUE(packed.has_value());
+    EXPECT_FALSE(zstd_decompress(packed->substr(0, packed->size() / 2)).has_value());
+
+    // 声明体积超过 max_output：不解压直接拒绝
+    EXPECT_FALSE(zstd_decompress(*packed, 10).has_value());
+    // 正常体积在上限内：成功
+    EXPECT_TRUE(zstd_decompress(*packed, 100000).has_value());
+    // max_output=0 表示不限制
+    EXPECT_TRUE(zstd_decompress(*packed, 0).has_value());
+}
+
+TEST(ZstdTest, CompressRejectsBadLevel)
+{
+    using namespace libmini;
+    EXPECT_FALSE(zstd_compress("x", 999).has_value());
+    // 快速模式下限是 -131072（ZSTD_minCLevel），再小才非法
+    EXPECT_FALSE(zstd_compress("x", -200000).has_value());
+    // 合法边界不报错（1..22 之外的具体值取决于 zstd 版本，只验证往返）
+    const optional<std::string> p = zstd_compress("level edge", 1);
+    ASSERT_TRUE(p.has_value());
+    const optional<std::string> r = zstd_decompress(*p);
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(*r, "level edge");
+}
+
 // -------------------------------- async ----------------------------------
 
 TEST(AsyncSchedulerTest, RunAfterExecutesOnce)

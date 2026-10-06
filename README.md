@@ -169,6 +169,7 @@ target_link_libraries(app PRIVATE libmini::libmini)
 | csv | `utils/csv.h` | RFC 4180 CSV 解析与序列化：引号转义、字段内换行、LF/CRLF/裸 CR 三种行尾、UTF-8 BOM、ragged 行原样保留；序列化 → 解析严格无损往返，另带表头读写与列名查找 |
 | glob | `utils/glob.h` | fnmatch 风格通配匹配（`*` `?` `[a-z]` `[!x]` `\x` 转义，Windows 大小写不敏感 / POSIX 敏感）+ 单层与递归查找；结果排序稳定可直接 diff，支持深度上限、结果数上限、隐藏项与符号链接开关 |
 | gzip | `utils/gzip.h` | gzip 压缩解压（返回 optional） |
+| zstd | `utils/zstd.h` | zstd 压缩解压（level 1..22，防炸弹上限 max_output，返回 optional；新增 conan 依赖 zstd） |
 | async | `utils/async.h` | 延时/周期任务调度器 + 令牌桶限流器 |
 | args | `utils/args.h` | 命令行解析：--key=value、flag、位置参数、自动 usage |
 | file_lock | `utils/file_lock.h` | 跨进程文件锁：独占/共享（读多写少）双模式，try_lock / 超时等待 / RAII Guard |
@@ -546,6 +547,8 @@ std::string expanded = env_expand("%APP_HOME%\\logs");
 ```cpp
 optional<std::string> z = gzip_compress(big_text, 9);     // 失败返回 nullopt
 optional<std::string> raw = gzip_decompress(*z);          // 兼容 gzip/zlib 流
+optional<std::string> p = zstd_compress(big_text, 19);     // zstd：更高压缩比
+optional<std::string> back = zstd_decompress(*p);          // 默认 1 GiB 防炸弹上限
 ```
 
 ### SQLite（另见 utils/sqlite.h）

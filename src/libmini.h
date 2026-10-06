@@ -33,6 +33,7 @@
 #include "utils/digest.h"
 #include "utils/ini_config.h"
 #include "utils/gzip.h"
+#include "utils/zstd.h"
 #include "utils/async.h"
 #include "utils/args.h"
 #include "utils/csv.h"
