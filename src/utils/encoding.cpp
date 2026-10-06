@@ -130,6 +130,65 @@ bool Base64::decode(const std::string& text, std::string& out)
     return true;
 }
 
+// ------------------------------ Base64Url -----------------------------
+
+std::string Base64Url::encode(const void* data, std::size_t size, bool padded)
+{
+    // 复用标准 Base64，再做字母表替换；url-safe 字母表不含 '+'/'/'
+    std::string out = Base64::encode(data, size);
+    for (std::size_t i = 0; i < out.size(); ++i) {
+        if (out[i] == '+') {
+            out[i] = '-';
+        } else if (out[i] == '/') {
+            out[i] = '_';
+        }
+    }
+    if (!padded) {
+        // 去掉尾部 '='（每 4 个字符至多 2 个）
+        std::size_t end = out.size();
+        while (end > 0 && out[end - 1] == '=') --end;
+        out.erase(end);
+    }
+    return out;
+}
+
+std::string Base64Url::encode(const std::string& raw, bool padded)
+{
+    return encode(raw.data(), raw.size(), padded);
+}
+
+std::string Base64Url::encode(const char* raw, bool padded)
+{
+    const std::string s = raw ? raw : "";
+    return encode(s.data(), s.size(), padded);
+}
+
+bool Base64Url::decode(const std::string& text, std::string& out)
+{
+    // 先把 url-safe 字符换回标准字母表，再补齐 '=' 填充，复用严格解码。
+    // 解码器本身已拒绝非法字符与非末尾的 '='。
+    std::string norm;
+    norm.reserve(text.size() + 2);
+    for (std::size_t i = 0; i < text.size(); ++i) {
+        const char c = text[i];
+        if (c == '-') {
+            norm += '+';
+        } else if (c == '_') {
+            norm += '/';
+        } else {
+            norm += c;
+        }
+    }
+    const std::size_t rem = norm.size() % 4;
+    if (rem == 1) {
+        return false;  // 4k+1 不是合法的 Base64 长度
+    }
+    if (rem != 0) {
+        norm.append(4 - rem, '=');
+    }
+    return Base64::decode(norm, out);
+}
+
 // ------------------------------ Hex ---------------------------------
 
 std::string Hex::encode(const void* data, std::size_t size, bool lower_case)

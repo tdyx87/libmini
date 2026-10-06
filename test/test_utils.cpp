@@ -245,6 +245,54 @@ TEST(Base64Test, RoundTripAndKnownVectors)
     EXPECT_FALSE(Base64::decode("Zm=v", bad));      // '=' 不在末尾
 }
 
+TEST(Base64UrlTest, RoundTripAndKnownVectors)
+{
+    using namespace libmini;
+    // RFC 4648 §5 已知向量：默认无填充
+    EXPECT_EQ(Base64Url::encode(""), "");
+    EXPECT_EQ(Base64Url::encode("f"), "Zg");
+    EXPECT_EQ(Base64Url::encode("fo"), "Zm8");
+    EXPECT_EQ(Base64Url::encode("foo"), "Zm9v");
+    EXPECT_EQ(Base64Url::encode("foobar"), "Zm9vYmFy");
+    // 带填充与标准 Base64 一致（无 '+'/'/' 时）；字面量走 const char* 重载
+    EXPECT_EQ(Base64Url::encode("f", true), "Zg==");    // 产生 url-safe 特有字符的输入：0xFB 0xFF 0xBF 标准为 "+/+/"，url-safe 为 "-_-_"
+    const std::string bytes("\xFB\xFF\xBF", 3);
+    const std::string b64 = Base64::encode(bytes);
+    const std::string url = Base64Url::encode(bytes);
+    EXPECT_EQ(b64, "+/+/" );
+    EXPECT_NE(url, b64);
+    EXPECT_EQ(url.find_first_of("+/"), std::string::npos);
+    EXPECT_NE(url.find_first_of('-'), std::string::npos);
+    EXPECT_NE(url.find_first_of('_'), std::string::npos);
+    EXPECT_EQ(url, "-_-_" );
+
+    // 无填充解码
+    std::string out;
+    ASSERT_TRUE(Base64Url::decode("Zm9vYmFy", out));
+    EXPECT_EQ(out, "foobar");
+    ASSERT_TRUE(Base64Url::decode("Zg", out));              // 无填充
+    EXPECT_EQ(out, "f");
+    ASSERT_TRUE(Base64Url::decode("Zg==", out));            // 带填充也接受
+    EXPECT_EQ(out, "f");
+    // url-safe 字符
+    ASSERT_TRUE(Base64Url::decode("-_-_", out));
+    EXPECT_EQ(out, bytes);
+
+    // 往返（含二进制）
+    std::string binary;
+    for (int i = 0; i < 256; ++i) {
+        binary += static_cast<char>(i);
+    }
+    ASSERT_TRUE(Base64Url::decode(Base64Url::encode(binary), out));
+    EXPECT_EQ(out, binary);
+
+    // 非法输入
+    std::string bad;
+    EXPECT_FALSE(Base64Url::decode("Zm9v!", bad));   // 非法字符
+    EXPECT_FALSE(Base64Url::decode("Z", bad));       // 4k+1 长度
+    EXPECT_FALSE(Base64Url::decode("Zm=v", bad));    // '=' 不在末尾
+}
+
 TEST(HexTest, RoundTrip)
 {
     using namespace libmini;
