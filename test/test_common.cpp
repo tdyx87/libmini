@@ -2736,8 +2736,8 @@ TEST(ThreadPoolIdleTest, WaitIdleDrainsAllTasks)
     pool.wait_idle();
     EXPECT_EQ(done.load(), 100);   // wait_idle 返回时全部任务已完成
 
-    // wait_idle 后线程池仍可用
-    auto f = pool.submit([] { return 42; });
+    // wait_idle 后线程池仍可用；顺带覆盖 submit_int 非模板入口
+    auto f = pool.submit_int([] { return 42; });
     EXPECT_EQ(f.get(), 42);
 }
 
@@ -2750,7 +2750,7 @@ TEST(ThreadPoolIdleTest, PendingTasksCountsQueue)
         while (!release.load()) std::this_thread::yield();
     });
     for (int i = 0; i < 5; ++i) {
-        pool.submit([] {});
+        pool.submit_void([] {});   // 顺带覆盖 submit_void 非模板入口
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
     EXPECT_GE(pool.pending_tasks(), 1u);   // 任务在队列里（≥1，时序宽裕）
