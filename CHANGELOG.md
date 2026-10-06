@@ -40,6 +40,7 @@
 - Add Base64url codec (RFC 4648 §5) with optional padding（[638c4b0](https://github.com/tdyx87/libmini/commit/638c4b0d3b9bf686091f3435f3bb26ee2401eb99)）
 - Add ISO-8601 / RFC-3339 formatting and parsing to time_utils（[78dd430](https://github.com/tdyx87/libmini/commit/78dd43037f4fb369aebd93c146537c7255793cf8)）
 - Add in-memory tar (ustar) reader and writer（[e0a7892](https://github.com/tdyx87/libmini/commit/e0a7892dc5c1450b1501abe0db2f0dd8aff53017)）
+- Add zstd compression wrapper with decompression bomb guard（[828b5e4](https://github.com/tdyx87/libmini/commit/828b5e434cb8aae564ccf9a0114f346f8aef91f7)）
 
 #### 变更
 
