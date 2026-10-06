@@ -36,10 +36,13 @@
 - Add an RFC 4180 CSV reader and writer（[2734f3f](https://github.com/tdyx87/libmini/commit/2734f3f77faae68ebddea02556ca10d91a6abf29)）
 - Add glob matching and recursive file lookup（[7d2a09e](https://github.com/tdyx87/libmini/commit/7d2a09e6691e9d192198204e925e83b65b2e6204)）
 - Add file_utils extensions: symlink, permissions, directory_size, temp_directory（[dac8430](https://github.com/tdyx87/libmini/commit/dac843049e01f6cd33ad6e0d8048d5e400e620fe)）
+- Add thread sync primitives: Semaphore, Event, OnceFlag, CancellationToken（[72353e0](https://github.com/tdyx87/libmini/commit/72353e060c8e84f1e7c2280d21b82f84dbe90151)）
 
 #### 变更
 
 - Teach the changelog tool to freeze a release and feed the release page（[c52962e](https://github.com/tdyx87/libmini/commit/c52962e0237ff9d80f7e0ee816433ad5adb1f970)）
+- Use std::chrono::steady_clock in unique_temp_directory to avoid clock_gettime POSIX macro/link issues on macOS/Ubuntu（[6a1ed14](https://github.com/tdyx87/libmini/commit/6a1ed1426e9eec1b0c64ae1d96b5319e8e3fff05)）
+- Skip symlink tests when create_symlink fails (sandbox may forbid symlinks)（[5dd33b0](https://github.com/tdyx87/libmini/commit/5dd33b04c9e8fb21e48f63edfc565a2969967122)）
 
 #### 内部
 

@@ -148,7 +148,7 @@ target_link_libraries(app PRIVATE libmini::libmini)
 | stopwatch | `utils/stopwatch.h` | 高精度计时（pause/resume/restart） |
 | file_utils | `utils/file_utils.h` | 读/写/追加文件、原子写（write_file_atomic：temp+fsync+rename，崩溃不截断）、流式文件摘要 sha256_file_hex/md5_file_hex、目录创建（单级/递归）、文件与目录树复制/移动、递归删除、目录详单（类型/大小/mtime）、时间戳、临时路径（W 版 API，UTF-8 中文路径无码页问题）；扩展：符号链接 read/create/remove（Windows 下 read_symlink 返回空、create_symlink 需权限、create/remove_symbolic_link 目录需 RemoveDirectoryW）、POSIX 权限读取/设置（file_permissions / set_file_permissions，Windows 返回 false）、目录占用 scanning（directory_size：递归累加文件大小、支持 follow_symlinks 选项、Windows 下 read_symlink 返回空导致无法追踪符号链接目标）、作用域临时目录（unique_temp_directory：创建唯一临时目录，并可在其中创建文件，适合作为临时工作目录） |
 | path_utils | `utils/path_utils.h` | path_join（多段）/dirname/basename/extension/stem、normalize（解析 ./.. 与盘符/UNC）、绝对化、parent_path、分隔符转换、路径等价比较 |
-| thread_utils | `utils/thread_utils.h` | 线程池（submit 返回 future、wait_idle 排空、pending_tasks 队列深度）+ BlockingQueue 多生产者多消费者阻塞队列（容量上限/close 语义）+ CountdownLatch 倒计时门闩 |
+| thread_utils | `utils/thread_utils.h` | 线程池（submit 返回 future、wait_idle 排空、pending_tasks 队列深度）+ BlockingQueue 多生产者多消费者阻塞队列（容量上限/close 语义）+ CountdownLatch 倒计时门闩 + Semaphore 计数信号量 + Event 手动重置事件 + OnceFlag 只跑一次 + CancellationToken 取消令牌 |
 | json_utils | `utils/json_utils.h` | 基于 nlohmann 的解析/序列化与转义 |
 | xml_utils | `utils/xml_utils.h` | 基于 pugixml 的 XML 解析/序列化 + SimpleXmlNode 轻量结构 |
 | serialization | `utils/serialization.h` | 基于 nlohmann 的通用 JSON 序列化 + XML 树映射序列化 |
@@ -760,6 +760,21 @@ q.close();                 // 关闭：消费端取尽后 pop 返回 false 自�
 CountdownLatch latch(3);   // 三件事都完成后放行所有等待者
 latch.count_down();
 latch.wait();
+
+Semaphore sem(0);          // 计数信号量：生产者 release、消费者 acquire
+sem.release();
+sem.try_acquire_for(100);  // 最多等 100ms
+
+Event ev;                  // 手动重置事件：set 后所有 wait 立即放行
+ev.set();
+ev.wait_for(1000);
+
+OnceFlag once;             // 线程安全只跑一次（同 std::call_once）
+once.call_once([] { init(); });
+
+CancellationToken tok;     // 取消令牌：任务循环里检查、可链接父令牌
+tok.cancel();
+if (tok.is_cancelled()) return;
 ```
 
 ### HTTP 客户端
