@@ -776,10 +776,12 @@ std::string unique_temp_directory(const std::string& prefix,
     const unsigned long long tick =
         static_cast<unsigned long long>(::GetTickCount()) & 0xFFFULL;
 #else
-    struct ::timespec ts;
-    ::clock_gettime(CLOCK_MONOTONIC, &ts);
+    // 使用 std::chrono::steady_clock 獲取單調時間，避免依賴 clock_gettime
+    //（某些平台可能需要定義 _POSIX_C_SOURCE 或連結 rt 庫）
+    const auto now = std::chrono::steady_clock::now();
+    const auto ns = now.time_since_epoch().count();
     const unsigned long long tick =
-        static_cast<unsigned long long>(ts.tv_nsec / 1000000) & 0xFFFULL;
+        static_cast<unsigned long long>(ns / 1000000) & 0xFFFULL;
 #endif
     const unsigned long long id = (++counter << 12) ^ tick;
     char buf[32];
