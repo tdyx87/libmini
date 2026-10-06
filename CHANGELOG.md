@@ -35,6 +35,7 @@
 - Add time-ordered v7 and namespace-derived v5 UUIDs（[9d6741b](https://github.com/tdyx87/libmini/commit/9d6741b4e6687029c6facbb6932e6eb7c773f832)）
 - Add an RFC 4180 CSV reader and writer（[2734f3f](https://github.com/tdyx87/libmini/commit/2734f3f77faae68ebddea02556ca10d91a6abf29)）
 - Add glob matching and recursive file lookup（[7d2a09e](https://github.com/tdyx87/libmini/commit/7d2a09e6691e9d192198204e925e83b65b2e6204)）
+- Add file_utils extensions: symlink, permissions, directory_size, temp_directory（[dac8430](https://github.com/tdyx87/libmini/commit/dac843049e01f6cd33ad6e0d8048d5e400e620fe)）
 
 #### 变更
 
