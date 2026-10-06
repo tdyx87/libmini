@@ -48,6 +48,10 @@
 - Use std::chrono::steady_clock in unique_temp_directory to avoid clock_gettime POSIX macro/link issues on macOS/Ubuntu（[6a1ed14](https://github.com/tdyx87/libmini/commit/6a1ed1426e9eec1b0c64ae1d96b5319e8e3fff05)）
 - Skip symlink tests when create_symlink fails (sandbox may forbid symlinks)（[5dd33b0](https://github.com/tdyx87/libmini/commit/5dd33b04c9e8fb21e48f63edfc565a2969967122)）
 
+#### 修复
+
+- Fix three CI failures: POSIX unused param, symlink dir sizing, zstd find_dependency（[e1763c4](https://github.com/tdyx87/libmini/commit/e1763c4b24a0a2f97b002dff718f2e810cb8382e)）
+
 #### 内部
 
 - Rebaseline the changelog after v0.3.0 and drop dead matrix config（[bfc6d7f](https://github.com/tdyx87/libmini/commit/bfc6d7f1cdb125460017a01a546a1324e081ec6a)）
