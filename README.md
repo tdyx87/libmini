@@ -144,7 +144,7 @@ target_link_libraries(app PRIVATE libmini::libmini)
 | string_utils | `utils/string_utils.h` | split / trim / replace / to_upper / to_lower |
 | string_algo | `utils/string_algo.h` | starts_with / ends_with / iequals / replace_all / split_string / join |
 | lexical_cast | `utils/lexical_cast.h` | 字符串↔数值转换（严格模式，失败抛 bad_lexical_cast） |
-| time_utils | `utils/time_utils.h` | 时间戳、格式化 + 日历运算（月份加减/星期/月末/日期串互转） |
+| time_utils | `utils/time_utils.h` | 时间戳、格式化 + ISO-8601/RFC-3339 格式化与解析（Z/±HH:MM 偏移、基本与扩展格式）+ 日历运算（月份加减/星期/月末/日期串互转） |
 | stopwatch | `utils/stopwatch.h` | 高精度计时（pause/resume/restart） |
 | file_utils | `utils/file_utils.h` | 读/写/追加文件、原子写（write_file_atomic：temp+fsync+rename，崩溃不截断）、流式文件摘要 sha256_file_hex/md5_file_hex、目录创建（单级/递归）、文件与目录树复制/移动、递归删除、目录详单（类型/大小/mtime）、时间戳、临时路径（W 版 API，UTF-8 中文路径无码页问题）；扩展：符号链接 read/create/remove（Windows 下 read_symlink 返回空、create_symlink 需权限、create/remove_symbolic_link 目录需 RemoveDirectoryW）、POSIX 权限读取/设置（file_permissions / set_file_permissions，Windows 返回 false）、目录占用 scanning（directory_size：递归累加文件大小、支持 follow_symlinks 选项、Windows 下 read_symlink 返回空导致无法追踪符号链接目标）、作用域临时目录（unique_temp_directory：创建唯一临时目录，并可在其中创建文件，适合作为临时工作目录） |
 | path_utils | `utils/path_utils.h` | path_join（多段）/dirname/basename/extension/stem、normalize（解析 ./.. 与盘符/UNC）、绝对化、parent_path、分隔符转换、路径等价比较 |

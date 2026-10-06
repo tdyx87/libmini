@@ -18,6 +18,24 @@ LIBMINI_API std::string current_time_string();
 // 格式化时间
 LIBMINI_API std::string format_time(std::chrono::system_clock::time_point tp, const std::string& format = "%Y-%m-%d %H:%M:%S");
 
+// ---------------- ISO-8601 / RFC-3339 ----------------
+
+// 格式化为 RFC-3339（ISO-8601 子集）：
+//   utc=true（默认） → "2026-10-07T08:30:00.123Z"
+//   utc=false        → 按本机时区输出偏移 "2026-10-07T16:30:00.123+08:00"
+//   with_millis=false → 省略小数秒 "2026-10-07T08:30:00Z"
+LIBMINI_API std::string format_iso8601(std::chrono::system_clock::time_point tp,
+                                       bool utc = true,
+                                       bool with_millis = true);
+
+// 解析 RFC-3339 / ISO-8601 日期时间；成功返回 true（out 精确到毫秒）：
+//   - 日期/时间分隔符 'T'/'t'/' '；扩展（2026-10-07）与基本（20261007）格式均接受
+//   - 小数秒可选（'.' 或 ',' 引导，超出毫秒部分截断）；秒也可省略
+//   - 时区：'Z'、±HH:MM、±HHMM、±HH；缺省视为 UTC
+// 非法输入（字段越界/尾随垃圾/缺日期）返回 false，out 不变
+LIBMINI_API bool parse_iso8601(const std::string& text,
+                               std::chrono::system_clock::time_point& out);
+
 // ---------------- 日历运算 ----------------
 // 基于 civil-from-days 算法（Howard Hinnant），纯整数无时区歧义。
 // "日期"统一用 Unix epoch 起的天数（day number）表示。

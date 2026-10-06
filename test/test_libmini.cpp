@@ -2008,6 +2008,153 @@ TEST(CalendarTest, WeekdayAndMonthBoundaries)
     EXPECT_EQ(libmini::date_from_string("bad"), -1);
 }
 
+// ---------------- ISO-8601 / RFC-3339 ----------------
+
+namespace {
+
+// 构造指定 UTC 时刻的 time_point（毫秒精度）
+std::chrono::system_clock::time_point make_tp_ms(std::int64_t ms)
+{
+    using dur = std::chrono::system_clock::duration;
+    return std::chrono::system_clock::time_point(
+        std::chrono::duration_cast<dur>(std::chrono::milliseconds(ms)));
+}
+
+std::int64_t tp_to_ms(std::chrono::system_clock::time_point tp)
+{
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               tp.time_since_epoch())
+        .count();
+}
+
+}  // namespace
+
+TEST(Iso8601Test, FormatKnownVectors)
+{
+    using namespace libmini;
+    // epoch
+    EXPECT_EQ(format_iso8601(make_tp_ms(0)), "1970-01-01T00:00:00.000Z");
+    EXPECT_EQ(format_iso8601(make_tp_ms(0), true, false),
+              "1970-01-01T00:00:00Z");
+    // 有毫秒分量的时刻
+    const std::int64_t t = static_cast<std::int64_t>(days_from_civil(2026, 10, 7)) *
+                               86400000 +
+                           8 * 3600000 + 30 * 60000 + 123;
+    EXPECT_EQ(format_iso8601(make_tp_ms(t)), "2026-10-07T08:30:00.123Z");
+    // 1970 前（负时间戳）
+    EXPECT_EQ(format_iso8601(make_tp_ms(-1000)),
+              "1969-12-31T23:59:59.000Z");
+
+    // 本地时区形式可被自己解析回来（与 utc 版指向同一时刻）
+    const std::chrono::system_clock::time_point tp = make_tp_ms(t);
+    const std::string local = format_iso8601(tp, false);
+    std::chrono::system_clock::time_point back;
+    ASSERT_TRUE(parse_iso8601(local, back));
+    EXPECT_EQ(tp_to_ms(back), tp_to_ms(tp));
+    // 结构符合 ±HH:MM：分隔符 T、日期 10 位、偏移段在末尾
+    ASSERT_GE(local.size(), 25u);
+    EXPECT_EQ(local[10], 'T');
+    EXPECT_TRUE(local.back() == 'Z' || local.size() >= 6);
+    EXPECT_EQ(local[local.size() - 3], ':');
+}
+
+TEST(Iso8601Test, ParseVariants)
+{
+    using namespace libmini;
+    const std::int64_t t = static_cast<std::int64_t>(days_from_civil(2026, 10, 7)) *
+                               86400000 +
+                           8 * 3600000 + 30 * 60000 + 123;
+    std::chrono::system_clock::time_point tp;
+
+    // Z 后缀
+    ASSERT_TRUE(parse_iso8601("2026-10-07T08:30:00.123Z", tp));
+    EXPECT_EQ(tp_to_ms(tp), t);
+    // 小写 t + 空格变体 + 小写 z
+    ASSERT_TRUE(parse_iso8601("2026-10-07t08:30:00.123z", tp));
+    EXPECT_EQ(tp_to_ms(tp), t);
+    ASSERT_TRUE(parse_iso8601("2026-10-07 08:30:00.123Z", tp));
+    EXPECT_EQ(tp_to_ms(tp), t);
+    // 正/负偏移：东八区表示的同一时刻是 00:30:00Z
+    ASSERT_TRUE(parse_iso8601("2026-10-07T16:30:00.123+08:00", tp));
+    EXPECT_EQ(tp_to_ms(tp), t);
+    ASSERT_TRUE(parse_iso8601("2026-10-07T03:00:00.123-05:30", tp));
+    EXPECT_EQ(tp_to_ms(tp), t);
+    // ±HHMM 与 ±HH 写法
+    ASSERT_TRUE(parse_iso8601("2026-10-07T16:30:00.123+0800", tp));
+    EXPECT_EQ(tp_to_ms(tp), t);
+    ASSERT_TRUE(parse_iso8601("2026-10-07T08:30:00.123+00", tp));
+    EXPECT_EQ(tp_to_ms(tp), t);
+    // 无时区 → UTC
+    ASSERT_TRUE(parse_iso8601("2026-10-07T08:30:00.123", tp));
+    EXPECT_EQ(tp_to_ms(tp), t);
+    // 基本格式（无 '-'/':'）
+    ASSERT_TRUE(parse_iso8601("20261007T083000.123Z", tp));
+    EXPECT_EQ(tp_to_ms(tp), t);
+    // 省略小数秒与秒
+    ASSERT_TRUE(parse_iso8601("2026-10-07T08:30:00Z", tp));
+    EXPECT_EQ(tp_to_ms(tp), t - 123);
+    ASSERT_TRUE(parse_iso8601("2026-10-07T08:30Z", tp));
+    EXPECT_EQ(tp_to_ms(tp), t - 123);
+    // 超出毫秒的小数部分被截断（不是四舍五入）
+    ASSERT_TRUE(parse_iso8601("2026-10-07T08:30:00.123999999Z", tp));
+    EXPECT_EQ(tp_to_ms(tp), t);
+    // 1970 前
+    ASSERT_TRUE(parse_iso8601("1969-12-31T23:59:59Z", tp));
+    EXPECT_EQ(tp_to_ms(tp), -1000);
+}
+
+TEST(Iso8601Test, RoundTrip)
+{
+    using namespace libmini;
+    const std::int64_t samples[] = {
+        0,
+        1,
+        -1,
+        1000,
+        -1000,
+        1770000000123LL,   // 2026-02-02T02:40:00.123Z 附近
+        -2208988800000LL,  // 1900-01-01T00:00:00Z
+        static_cast<std::int64_t>(days_from_civil(2026, 10, 7)) * 86400000 +
+            86399999,  // 23:59:59.999
+    };
+    for (std::size_t i = 0; i < sizeof(samples) / sizeof(samples[0]); ++i) {
+        const auto tp = make_tp_ms(samples[i]);
+        const std::string s = format_iso8601(tp);
+        std::chrono::system_clock::time_point back;
+        ASSERT_TRUE(parse_iso8601(s, back)) << "round trip 解析失败: " << s;
+        EXPECT_EQ(tp_to_ms(back), samples[i]) << "round trip 不一致: " << s;
+    }
+}
+
+TEST(Iso8601Test, RejectInvalid)
+{
+    using namespace libmini;
+    std::chrono::system_clock::time_point tp = make_tp_ms(12345);
+    const std::chrono::system_clock::time_point sentinel = tp;
+    const char* bad[] = {
+        "",
+        "garbage",
+        "2026-13-01T00:00:00Z",    // 月份越界
+        "2026-00-01T00:00:00Z",
+        "2026-02-30T00:00:00Z",    // 2 月 30 日
+        "2023-02-29T00:00:00Z",    // 非闰年
+        "2026-10-07T24:00:00Z",    // 小时越界
+        "2026-10-07T08:60:00Z",    // 分钟越界
+        "2026-10-07T08:30:00+25:00",   // 偏移越界
+        "2026-10-07T08:30:00-00:60",   // 偏移分钟越界
+        "2026-10-07T08:30:00.",   // 小数点后无数字
+        "2026-10-07T08:30:00Z trailing",  // 尾随垃圾
+        "2026-10-07",              // 只有日期
+        "08:30:00Z",               // 只有时间
+        "2026/10/07T08:30:00Z",    // 错误分隔符（年份后非法）
+        "abcd-10-07T08:30:00Z",    // 年份非数字
+    };
+    for (std::size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); ++i) {
+        EXPECT_FALSE(parse_iso8601(bad[i], tp)) << "应拒绝: " << bad[i];
+        EXPECT_EQ(tp_to_ms(tp), tp_to_ms(sentinel)) << "失败时 out 不应改变: " << bad[i];
+    }
+}
+
 // ---------------- FileLock 共享模式 ----------------
 
 TEST(FileLockSharedTest, MultipleReadersCoexist)

@@ -187,4 +187,197 @@ std::int64_t date_from_string(const std::string& s)
     return days_from_civil(y, m, d);  // 非法日期在内部校验返回 -1
 }
 
+// ---------------- ISO-8601 / RFC-3339 ----------------
+
+namespace {
+
+// 从 pos 起读 count 个 ASCII 数字；不足/非数字返回 false 且不动 pos
+bool read_int(const std::string& s, std::size_t& pos, int count, long& out)
+{
+    if (pos + static_cast<std::size_t>(count) > s.size()) {
+        return false;
+    }
+    long v = 0;
+    for (int i = 0; i < count; ++i) {
+        const char c = s[pos + static_cast<std::size_t>(i)];
+        if (c < '0' || c > '9') {
+            return false;
+        }
+        v = v * 10 + (c - '0');
+    }
+    pos += static_cast<std::size_t>(count);
+    out = v;
+    return true;
+}
+
+// 本机时区在 tp 时刻相对 UTC 的秒偏移（东为正）。拿不到时区时返回 0。
+std::int64_t local_offset_seconds(std::chrono::system_clock::time_point tp)
+{
+    const std::time_t t = std::chrono::system_clock::to_time_t(tp);
+    std::tm lt;
+#ifdef _WIN32
+    if (localtime_s(&lt, &t) != 0) return 0;
+#else
+    std::tm* p = std::localtime(&t);
+    if (!p) return 0;
+    lt = *p;
+#endif
+    // 用本地时区的 civil 字段当作 UTC 算一遍 epoch 秒，差值就是偏移
+    const std::int64_t as_utc =
+        days_from_civil(lt.tm_year + 1900, lt.tm_mon + 1, lt.tm_mday) * 86400 +
+        lt.tm_hour * 3600 + lt.tm_min * 60 + lt.tm_sec;
+    return static_cast<std::int64_t>(t) - as_utc;
+}
+
+}  // namespace
+
+std::string format_iso8601(std::chrono::system_clock::time_point tp, bool utc,
+                           bool with_millis)
+{
+    std::int64_t ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                          tp.time_since_epoch())
+                          .count();
+
+    // 时区后缀（偏移按 tp 所在时刻的本机时区）
+    std::string tz;
+    if (utc) {
+        tz = "Z";
+    } else {
+        const std::int64_t off = local_offset_seconds(tp);
+        std::int64_t a = off < 0 ? -off : off;
+        int hh = static_cast<int>(a / 3600);
+        int mm = static_cast<int>((a % 3600) / 60);  // 忽略历史上 LMT 的秒级余数
+        if (hh > 99) { hh = 99; mm = 0; }
+        tz += (off < 0 ? '-' : '+');
+        tz += static_cast<char>('0' + hh / 10);
+        tz += static_cast<char>('0' + hh % 10);
+        tz += ':';
+        tz += static_cast<char>('0' + mm / 10);
+        tz += static_cast<char>('0' + mm % 10);
+        ms += off * 1000;  // 换算到本地墙上时间
+    }
+
+    // 向下取整切分天/毫秒（负时间戳：1970 前）
+    std::int64_t days = ms / 86400000;
+    std::int64_t rem = ms % 86400000;
+    if (rem < 0) {
+        rem += 86400000;
+        --days;
+    }
+    int y, mo, d;
+    civil_from_days(days, y, mo, d);
+    const int hh = static_cast<int>(rem / 3600000);
+    rem %= 3600000;
+    const int mi = static_cast<int>(rem / 60000);
+    rem %= 60000;
+    const int se = static_cast<int>(rem / 1000);
+    const int msf = static_cast<int>(rem % 1000);
+
+    // 缓冲 64：-Wformat-truncation 下 %04d 最坏（INT_MIN）11 字节，其余至多 20
+    char buf[64];
+    const int n = with_millis
+        ? std::snprintf(buf, sizeof(buf), "%04d-%02d-%02dT%02d:%02d:%02d.%03d",
+                        y, mo, d, hh, mi, se, msf)
+        : std::snprintf(buf, sizeof(buf), "%04d-%02d-%02dT%02d:%02d:%02d",
+                        y, mo, d, hh, mi, se);
+    if (n <= 0) return std::string();
+    return std::string(buf, static_cast<std::size_t>(n)) + tz;
+}
+
+bool parse_iso8601(const std::string& text,
+                   std::chrono::system_clock::time_point& out)
+{
+    std::size_t pos = 0;
+    long y, mo, d;
+    if (!read_int(text, pos, 4, y)) return false;
+    if (pos < text.size() && text[pos] == '-') ++pos;  // 扩展格式的 '-'
+    if (!read_int(text, pos, 2, mo)) return false;
+    if (pos < text.size() && text[pos] == '-') ++pos;
+    if (!read_int(text, pos, 2, d)) return false;
+
+    // 日期之后必须有时间（'T'/'t'/' ' 分隔）
+    if (pos >= text.size()) return false;
+    const char sep = text[pos];
+    if (sep != 'T' && sep != 't' && sep != ' ') return false;
+    ++pos;
+
+    long hh, mi, ss = 0;
+    if (!read_int(text, pos, 2, hh)) return false;
+    if (pos < text.size() && text[pos] == ':') ++pos;
+    if (!read_int(text, pos, 2, mi)) return false;
+    // 秒可省略；扩展格式用 ':' 引导，基本格式（无 ':'）直接跟两位数字
+    if (pos < text.size() && text[pos] == ':') {
+        ++pos;
+        if (!read_int(text, pos, 2, ss)) return false;
+    } else if (pos + 2 <= text.size() && text[pos] >= '0' && text[pos] <= '9' &&
+               text[pos + 1] >= '0' && text[pos + 1] <= '9') {
+        if (!read_int(text, pos, 2, ss)) return false;
+    }
+
+    // 可选小数秒：'.' 或 ',' 引导；超出毫秒的部分直接截断
+    long frac_ms = 0;
+    if (pos < text.size() && (text[pos] == '.' || text[pos] == ',')) {
+        ++pos;
+        const std::size_t start = pos;
+        long v = 0;
+        int digits = 0;
+        while (pos < text.size() && text[pos] >= '0' && text[pos] <= '9') {
+            if (digits < 3) {
+                v = v * 10 + (text[pos] - '0');
+                ++digits;
+            }
+            ++pos;
+        }
+        if (pos == start) return false;  // '.' 后没数字
+        while (digits < 3) {
+            v *= 10;
+            ++digits;
+        }
+        frac_ms = v;
+    }
+
+    // 可选时区：Z/z、±HH:MM、±HHMM、±HH；缺省视为 UTC
+    std::int64_t off = 0;
+    if (pos < text.size()) {
+        const char z = text[pos];
+        if (z == 'Z' || z == 'z') {
+            ++pos;
+        } else if (z == '+' || z == '-') {
+            ++pos;
+            long oh, om = 0;
+            if (!read_int(text, pos, 2, oh)) return false;
+            if (pos < text.size() && text[pos] == ':') ++pos;
+            if (pos < text.size() && text[pos] >= '0' && text[pos] <= '9') {
+                if (!read_int(text, pos, 2, om)) return false;
+            }
+            if (oh > 23 || om > 59) return false;
+            off = oh * 3600 + om * 60;
+            if (z == '-') off = -off;
+        } else {
+            return false;  // 尾随垃圾
+        }
+    }
+    if (pos != text.size()) return false;
+
+    // 字段范围校验（越界 → 非法）
+    if (mo < 1 || mo > 12) return false;
+    if (y < 0 || y > 9999) return false;
+    if (d < 1 || d > days_in_month(static_cast<int>(y), static_cast<int>(mo))) {
+        return false;
+    }
+    if (hh > 23 || mi > 59 || ss > 60) return false;  // 60：容忍闰秒 23:59:60
+
+    // 已用 days_in_month 校验过，days 不会命中 days_from_civil 的 -1 失败值
+    const std::int64_t days =
+        days_from_civil(static_cast<int>(y), static_cast<int>(mo),
+                        static_cast<int>(d));
+    const std::int64_t ms = (days * 86400 + hh * 3600 + mi * 60 + ss - off) *
+                                1000 +
+                            frac_ms;
+    using dur = std::chrono::system_clock::duration;
+    out = std::chrono::system_clock::time_point(
+        std::chrono::duration_cast<dur>(std::chrono::milliseconds(ms)));
+    return true;
+}
+
 }  // namespace libmini
