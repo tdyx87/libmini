@@ -37,6 +37,7 @@
 - Add glob matching and recursive file lookup（[7d2a09e](https://github.com/tdyx87/libmini/commit/7d2a09e6691e9d192198204e925e83b65b2e6204)）
 - Add file_utils extensions: symlink, permissions, directory_size, temp_directory（[dac8430](https://github.com/tdyx87/libmini/commit/dac843049e01f6cd33ad6e0d8048d5e400e620fe)）
 - Add thread sync primitives: Semaphore, Event, OnceFlag, CancellationToken（[72353e0](https://github.com/tdyx87/libmini/commit/72353e060c8e84f1e7c2280d21b82f84dbe90151)）
+- Add Base64url codec (RFC 4648 §5) with optional padding（[638c4b0](https://github.com/tdyx87/libmini/commit/638c4b0d3b9bf686091f3435f3bb26ee2401eb99)）
 
 #### 变更
 
@@ -47,6 +48,7 @@
 #### 内部
 
 - Rebaseline the changelog after v0.3.0 and drop dead matrix config（[bfc6d7f](https://github.com/tdyx87/libmini/commit/bfc6d7f1cdb125460017a01a546a1324e081ec6a)）
+- Document thread sync primitives in README and refresh changelog（[f45fe47](https://github.com/tdyx87/libmini/commit/f45fe47cb16c72b01cf846dec1339ba40d37f28a)）
 
 <!-- END generated:unreleased -->
 
