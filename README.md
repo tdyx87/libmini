@@ -165,6 +165,7 @@ target_link_libraries(app PRIVATE libmini::libmini)
 | kdf | `utils/kdf.h` | PBKDF2-HMAC-SHA256 密钥派生（零新增依赖，迭代次数带上下限钳制防 CPU DoS）+ 版本化口令密封（口令 → PBKDF2 → AES-256-GCM，自带 magic/版本/算法 ID 的落盘格式，迭代次数与盐进 AAD 防篡改降级）；另含常量时间比较 `constant_time_equals` |
 | env | `utils/env.h` | 环境变量读写与 `%VAR%` 展开（W 版 API，UTF-8） |
 | digest | `utils/digest.h` | MD5 / SHA-1 / SHA-256 / SHA-512（增量计算）——MD5 与 SHA-1 仅供老协议与历史指纹兼容，新代码请用 SHA-2 |
+| blake3 | `utils/blake3.h` | BLAKE3（官方规范实现，零新增依赖）：hash / keyed_hash（MAC 可替 HMAC）/ derive_key（KDF 可替 HKDF）三模式 + XOF 变长输出，官方测试向量逐字节校验 |
 | ini_config | `utils/ini_config.h` | INI 读写：注释/引号/类型化取值/往返保存 |
 | csv | `utils/csv.h` | RFC 4180 CSV 解析与序列化：引号转义、字段内换行、LF/CRLF/裸 CR 三种行尾、UTF-8 BOM、ragged 行原样保留；序列化 → 解析严格无损往返，另带表头读写与列名查找 |
 | glob | `utils/glob.h` | fnmatch 风格通配匹配（`*` `?` `[a-z]` `[!x]` `\x` 转义，Windows 大小写不敏感 / POSIX 敏感）+ 单层与递归查找；结果排序稳定可直接 diff，支持深度上限、结果数上限、隐藏项与符号链接开关 |
@@ -485,6 +486,11 @@ std::string q = UrlEncode::encode("a b&c=中文");
 std::string md5 = Md5::hex(data);                  // 32 位小写
 Md5 m; m.update(chunk1); m.update(chunk2);         // 增量
 std::string sha = Sha256::hex(data);
+
+// BLAKE3：SHA-2 的现代替代（另见 utils/blake3.h：XOF 变长输出）
+std::string b3 = Blake3::hex(data);                // 增量 API 与 Sha256 同形
+std::string mac = Blake3::keyed_hex(key32, data);  // MAC，key 恰好 32 字节
+std::string dk = Blake3::derive_hex(context, mat); // KDF：context 硬编码唯一
 
 // HMAC：API 签名请求（另见 utils/hmac.h，含增量 API 与 HmacMd5）
 std::string sig = HmacSha256::hex(secret_key, payload);

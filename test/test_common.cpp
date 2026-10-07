@@ -252,6 +252,264 @@ TEST(Sha256Test, Incremental)
     EXPECT_EQ(whole.finish(), chunked.finish());
 }
 
+// -------------------------------- blake3 ---------------------------------
+
+namespace {
+
+// 官方 test_vectors.json 的输入生成规则：第 i 字节 = i % 251（向量文件
+// 顶部注释），覆盖 0..250 的完整循环
+std::string blake3_vector_input(std::size_t len)
+{
+    std::string s(len, '\0');
+    for (std::size_t i = 0; i < len; ++i) {
+        s[i] = static_cast<char>(i % 251);
+    }
+    return s;
+}
+
+}  // namespace
+
+TEST(Blake3Test, OfficialVectors)
+{
+    using namespace libmini;
+    // 来自 BLAKE3-team/BLAKE3 test_vectors/test_vectors.json 的 hash 列
+    //（前 32 字节），覆盖：空输入、块边界（63/64/65、127/128）、
+    // chunk 边界（1023/1024/1025）、以及非 2 的幂的多 chunk 树形（2049）
+    struct Case {
+        std::size_t len;
+        const char* hex;
+    };
+    static const Case kCases[] = {
+        {0,
+         "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"},
+        {1,
+         "2d3adedff11b61f14c886e35afa036736dcd87a74d27b5c1510225d0f592e213"},
+        {3,
+         "e1be4d7a8ab5560aa4199eea339849ba8e293d55ca0a81006726d184519e647f"},
+        {4,
+         "f30f5ab28fe047904037f77b6da4fea1e27241c5d132638d8bedce9d40494f32"},
+        {5,
+         "b40b44dfd97e7a84a996a91af8b85188c66c126940ba7aad2e7ae6b385402aa2"},
+        {63,
+         "e9bc37a594daad83be9470df7f7b3798297c3d834ce80ba85d6e207627b7db7b"},
+        {64,
+         "4eed7141ea4a5cd4b788606bd23f46e212af9cacebacdc7d1f4c6dc7f2511b98"},
+        {65,
+         "de1e5fa0be70df6d2be8fffd0e99ceaa8eb6e8c93a63f2d8d1c30ecb6b263dee"},
+        {127,
+         "d81293fda863f008c09e92fc382a81f5a0b4a1251cba1634016a0f86a6bd640d"},
+        {128,
+         "f17e570564b26578c33bb7f44643f539624b05df1a76c81f30acd548c44b45ef"},
+        {1023,
+         "10108970eeda3eb932baac1428c7a2163b0e924c9a9e25b35bba72b28f70bd11"},
+        {1024,
+         "42214739f095a406f3fc83deb889744ac00df831c10daa55189b5d121c855af7"},
+        {1025,
+         "d00278ae47eb27b34faecf67b4fe263f82d5412916c1ffd97c8cb7fb814b8444"},
+        {2048,
+         "e776b6028c7cd22a4d0ba182a8bf62205d2ef576467e838ed6f2529b85fba24a"},
+        {2049,
+         "5f4d72f40d7a5f82b15ca2b2e44b1de3c2ef86c426c95c1af0b6879522563030"},
+        {4096,
+         "015094013f57a5277b59d8475c0501042c0b642e531b0a1c8f58d2163229e969"},
+    };
+    for (const Case& c : kCases) {
+        EXPECT_EQ(Blake3::hex(blake3_vector_input(c.len)), c.hex)
+            << "input_len " << c.len;
+    }
+
+    // C2SP 规范附录的单块执行轨迹：BLAKE3("IETF")
+    EXPECT_EQ(Blake3::hex("IETF"),
+              "83a2de1ee6f4e6ab686889248f4ec0cf4cc5709446a682ffd1cbb4d6165181e2");
+}
+
+TEST(Blake3Test, KeyedOfficialVectors)
+{
+    using namespace libmini;
+    const std::string key = "whats the Elvish word for friend";
+    ASSERT_EQ(key.size(), 32u);  // 官方向量的 32 字节密钥
+
+    struct Case {
+        std::size_t len;
+        const char* hex;
+    };
+    static const Case kCases[] = {
+        {0,
+         "92b2b75604ed3c761f9d6f62392c8a9227ad0ea3f09573e783f1498a4ed60d26"},
+        {1,
+         "6d7878dfff2f485635d39013278ae14f1454b8c0a3a2d34bc1ab38228a80c95b"},
+        {3,
+         "39e67b76b5a007d4921969779fe666da67b5213b096084ab674742f0d5ec62b9"},
+        {64,
+         "ba8ced36f327700d213f120b1a207a3b8c04330528586f414d09f2f7d9ccb7e6"},
+        {65,
+         "c0a4edefa2d2accb9277c371ac12fcdbb52988a86edc54f0716e1591b4326e72"},
+        {1023,
+         "c951ecdf03288d0fcc96ee3413563d8a6d3589547f2c2fb36d9786470f1b9d6e"},
+        {1024,
+         "75c46f6f3d9eb4f55ecaaee480db732e6c2105546f1e675003687c31719c7ba4"},
+        {1025,
+         "357dc55de0c7e382c900fd6e320acc04146be01db6a8ce7210b7189bd664ea69"},
+        {2048,
+         "879cf1fa2ea0e79126cb1063617a05b6ad9d0b696d0d757cf053439f60a99dd1"},
+        {4096,
+         "befc660aea2f1718884cd8deb9902811d332f4fc4a38cf7c7300d597a081bfc0"},
+    };
+    for (const Case& c : kCases) {
+        EXPECT_EQ(Blake3::keyed_hex(key, blake3_vector_input(c.len)), c.hex)
+            << "keyed input_len " << c.len;
+    }
+}
+
+TEST(Blake3Test, DeriveKeyOfficialVectors)
+{
+    using namespace libmini;
+    const std::string context =
+        "BLAKE3 2019-12-27 16:29:52 test vectors context";
+
+    struct Case {
+        std::size_t len;
+        const char* hex;
+    };
+    static const Case kCases[] = {
+        {0,
+         "2cc39783c223154fea8dfb7c1b1660f2ac2dcbd1c1de8277b0b0dd39b7e50d7d"},
+        {1,
+         "b3e2e340a117a499c6cf2398a19ee0d29cca2bb7404c73063382693bf66cb06c"},
+        {3,
+         "440aba35cb006b61fc17c0529255de438efc06a8c9ebf3f2ddac3b5a86705797"},
+        {64,
+         "a5c4a7053fa86b64746d4bb688d06ad1f02a18fce9afd3e818fefaa7126bf73e"},
+        {65,
+         "51fd05c3c1cfbc8ed67d139ad76f5cf8236cd2acd26627a30c104dfd9d3ff8a8"},
+        {1023,
+         "74a16c1c3d44368a86e1ca6df64be6a2f64cce8f09220787450722d85725dea5"},
+        {1024,
+         "7356cd7720d5b66b6d0697eb3177d9f8d73a4a5c5e968896eb6a689684302706"},
+        {1025,
+         "effaa245f065fbf82ac186839a249707c3bddf6d3fdda22d1b95a3c970379bcb"},
+        {2048,
+         "7b2945cb4fef70885cc5d78a87bf6f6207dd901ff239201351ffac04e1088a23"},
+        {4096,
+         "1e0d7f3db8c414c97c6307cbda6cd27ac3b030949da8e23be1a1a924ad2f25b9"},
+    };
+    for (const Case& c : kCases) {
+        EXPECT_EQ(Blake3::derive_hex(context, blake3_vector_input(c.len)),
+                  c.hex)
+            << "derive input_len " << c.len;
+    }
+}
+
+TEST(Blake3Test, StreamingMatchesOneShot)
+{
+    using namespace libmini;
+    const std::string data = blake3_vector_input(5000);
+    const std::string expected = Blake3::hex(data);
+
+    // 喂入尺寸横跨页边界（64）、chunk 边界（1024）与非整除情形
+    const std::size_t feeds[] = {1, 63, 64, 65, 127, 128,
+                                 1023, 1024, 1025, 17, 3000};
+    std::size_t feed_index = 0;
+    Blake3 h;
+    for (std::size_t pos = 0; pos < data.size();) {
+        const std::size_t n = feeds[feed_index++ % (sizeof(feeds) /
+                                                    sizeof(feeds[0]))];
+        const std::size_t take = (n < data.size() - pos) ? n
+                                                         : data.size() - pos;
+        h.update(data.data() + pos, take);
+        pos += take;
+    }
+    EXPECT_EQ(Hex::encode(h.finish(), true), expected);
+
+    // 逐字节喂入（小数据）
+    const std::string small = blake3_vector_input(1100);  // 跨 1 个 chunk
+    Blake3 byte_by_byte;
+    for (std::size_t i = 0; i < small.size(); ++i) {
+        byte_by_byte.update(small.data() + i, 1);
+    }
+    Blake3 one_shot;
+    one_shot.update(small);
+    EXPECT_EQ(byte_by_byte.finish(), one_shot.finish());
+}
+
+TEST(Blake3Test, XofExtendedOutput)
+{
+    using namespace libmini;
+    // 官方向量的 131 字节扩展输出：t=0、t=1 两个整块 + t=2 的前 3 字节，
+    // 验证「根压缩仅 t 递增」的 XOF 路径（规范 §4.4）
+    static const char* kEmptyXof =
+        "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"
+        "e00f03e7b69af26b7faaf09fcd333050338ddfe085b8cc869ca98b206c08243a"
+        "26f5487789e8f660afe6c99ef9e0c52b92e7393024a80459cf91f476f9ffdbda"
+        "7001c22e159b402631f277ca96f2defdf1078282314e763699a31c5363165421c"
+        "ce14d";
+    static const char* kOneByteXof =
+        "2d3adedff11b61f14c886e35afa036736dcd87a74d27b5c1510225d0f592e213"
+        "c3a6cb8bf623e20cdb535f8d1a5ffb86342d9c0b64aca3bce1d31f60adfa137b"
+        "358ad4d79f97b47c3d5e79f179df87a3b9776ef8325f8329886ba42f07fb138b"
+        "b502f4081cbcec3195c5871e6c23e2cc97d3c69a613eba131e5f1351f3f1da78"
+        "6545e5";
+
+    Blake3 empty;
+    EXPECT_EQ(Hex::encode(empty.finish(131), true), kEmptyXof);
+
+    Blake3 one;
+    one.update(blake3_vector_input(1));
+    EXPECT_EQ(Hex::encode(one.finish(131), true), kOneByteXof);
+
+    // 前缀性质：短输出是长输出的前缀，且不承诺长度
+    const std::string data = blake3_vector_input(1500);
+    Blake3 a;
+    a.update(data);
+    const std::string s64 = a.finish(64);
+    Blake3 b;
+    b.update(data);
+    const std::string s200 = b.finish(200);
+    EXPECT_EQ(s200.substr(0, 64), s64);
+    Blake3 c;
+    c.update(data);
+    EXPECT_EQ(s200.substr(0, 32), c.finish());
+    EXPECT_EQ(Blake3::hex(data), Hex::encode(s200.substr(0, 32), true));
+
+    Blake3 zero;
+    zero.update(data);
+    EXPECT_TRUE(zero.finish(0).empty());
+}
+
+TEST(Blake3Test, KeyedModeValidationAndReset)
+{
+    using namespace libmini;
+    // 长度非法的 key：拒绝，且状态保持不变（仍是无键模式）
+    Blake3 h;
+    EXPECT_FALSE(h.reset_keyed("short"));
+    h.update("abc");
+    EXPECT_EQ(Hex::encode(h.finish(), true), Blake3::hex("abc"));
+
+    // 一次性接口对非法 key 返回空串
+    EXPECT_TRUE(Blake3::keyed_hex("x", "abc").empty());
+    EXPECT_TRUE(Blake3::keyed_hex(std::string(33, 'k'), "abc").empty());
+
+    // 同长度不同密钥 → 不同 MAC；正确密钥非空
+    const std::string k1(32, 'a');
+    const std::string k2(32, 'b');
+    const std::string mac1 = Blake3::keyed_hex(k1, "abc");
+    EXPECT_FALSE(mac1.empty());
+    EXPECT_NE(mac1, Blake3::keyed_hex(k2, "abc"));
+    EXPECT_NE(mac1, Blake3::hex("abc"));
+
+    // finish 后 reset 回到无键模式可复用，结果复现
+    ASSERT_TRUE(h.reset_keyed(k1));
+    h.update("payload");
+    const std::string first = h.finish();
+    h.reset();
+    h.update("payload");
+    EXPECT_NE(h.finish(), first);       // 无键模式 ≠ keyed
+    h.reset();
+    ASSERT_TRUE(h.reset_keyed(k1));
+    h.update("payload");
+    EXPECT_EQ(h.finish(), first);       // 同密钥复现
+}
+
 // ------------------------------- ini_config ------------------------------
 
 TEST(IniConfigTest, ParseAndGet)

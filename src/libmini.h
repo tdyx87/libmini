@@ -31,6 +31,7 @@
 #include "utils/kdf.h"
 #include "utils/env.h"
 #include "utils/digest.h"
+#include "utils/blake3.h"
 #include "utils/ini_config.h"
 #include "utils/gzip.h"
 #include "utils/zstd.h"
