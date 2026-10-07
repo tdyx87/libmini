@@ -69,6 +69,83 @@
 
 <!-- END generated:unreleased -->
 
+## [1.0.0] - 2026-10-07
+
+### 新增
+
+- **blake3 模块**（`utils/blake3.h`）：BLAKE3 官方规范实现，零新增依赖。hash /
+  keyed_hash（MAC，可替 HMAC）/ derive_key（KDF，可替 HKDF）三模式 + XOF
+  变长输出（按需截取任意长度），官方测试向量逐字节校验。为什么：比 SHA-2 快数倍，
+  一个原语覆盖哈希、消息认证、密钥派生三件事；XOF 直接给出定长子密钥，避免
+  「拿哈希当 KDF」自行拼接构造的常见错误。
+- **mmap_file 模块**（`utils/mmap_file.h`）：大文件随机访问零拷贝，RAII 管理映射
+  生命周期，只读/读写双模式，Windows（CreateFileMapping/MapViewOfFile）与 POSIX
+  （mmap）双实现同一接口，flush 提供断电级落盘。为什么：索引文件、日志回放这类
+  「按偏移读几 KB」的访问，整读进内存浪费、反复 seek+read 又慢；映射把缓存与回收
+  交给内核，进程崩溃也不用补救。
+- **websocket 模块**（`utils/websocket.h`）：RFC 6455 客户端/服务端，与浏览器直接
+  互通——HTTP Upgrade 握手（Sec-WebSocket-Key/Accept）、掩码帧、分片重组、
+  PING/PONG/CLOSE 自动应答、广播与多连接管理，零第三方依赖。为什么：行情推送、
+  日志流、协同编辑这类实时场景不必为此引入重量级网络库。
+- **circuit_breaker 模块**（`utils/circuit_breaker.h`）：熔断三态机
+  （Closed/Open/HalfOpen）：连续失败达阈值即熔断，冷却后放行限量探测，按结果恢复。
+  execute 把「调用 + 计异常 + 计成败」一体收口，状态转移回调可挂告警，累计统计供
+  观测，线程安全。为什么：下游故障时快速失败，省掉无意义的超时等待与连接堆积，
+  防止故障在服务间级联；半开限量避免恢复瞬间被流量再次压垮。
+- **RpcLoadBalancer**（`utils/rpc.h`）：RPC 多端点负载均衡——轮询 / 随机 / 最少在途
+  三种策略，可重试失败自动故障转移到健康端点，端点健康标记，策略运行期热更新。
+  为什么：单点 RPC 服务端就是可用性单点；有了它客户端侧即可跨实例分摊流量并摘除
+  故障节点，不需要额外搭代理层。
+- **metrics 模块**（`utils/metrics.h`）：指标注册表——Counter（单调计数）/ Gauge
+  （可增减仪表）/ Histogram（固定桶 + 分位数插值），标签随序列名携带，Prometheus
+  文本格式导出（# HELP/# TYPE、`_bucket{le=}` 累计桶、`_sum`/`_count`）。注册幂等、
+  类型冲突告警、计数 CAS 无丢失，线程安全。为什么：可观测性三件套之一即取即用，
+  不值得为一个指标库引整套 prometheus-cpp 及其传递依赖。
+- **trace 模块**（`utils/trace.h`）：分布式追踪——W3C traceparent 解析/格式化实现
+  跨进程传播（与 OpenTelemetry 生态互通），Span 携带属性/事件/状态，SpanScope RAII
+  嵌套作用域析构自动 end（异常路径也不漏结束），Tracer 环形快照收集（容量有界、
+  丢最旧）+ JSON 导出。为什么：一次请求穿多个服务时「慢在哪」只能靠链路定位；
+  收集有界保证长跑进程不会被未导出的 Span 拖垮。
+- **健康检查端点**（`utils/http_server.h`）：`enable_health_endpoints()` 一条命令挂上
+  GET /healthz（存活）与 GET /readyz（就绪检查 JSON）：探针请求绕过前置过滤器
+  （不被鉴权挡板误杀）、显式路由优先，就绪检查保序执行、抛异常转失败原因、任一
+  失败回 503；liveness 处理器可运行期翻转，停机前先把存活探针翻 503 摘流量。
+  为什么：K8s 与负载均衡要求「存活 ≠ 就绪」的探针语义，让每个服务自己拼这套
+  最容易漏掉「探针被过滤器拦下」的坑。
+- **TLS 支持**（`utils/http_client.h` / `utils/http_server.h`）：构建期探测 OpenSSL
+  （Windows 查系统安装如 Strawberry/winget，其余平台走 conan；找不到则整体关闭、
+  http 栈降级为运行期明确报错）。HttpClient 基址为 `https://` 时自动走 SSL 通道，
+  可配自定义 CA（`set_ca_cert_path`）、服务端校验开关（`set_verify_server`）与客户端
+  证书（`set_client_cert`，双向 TLS）；HttpServer 用 `set_ssl_certificates(cert, key)`
+  开 HTTPS——证书在**首次 start 前**生效，PEM 损坏/缺失直接拒绝启动、不静默降级
+  明文，启动后再改配置报错拒绝。为什么：HTTP 栈此前只能明文，而「配置错了却悄悄
+  降级」正是安全缺陷的温床；fail-fast 让错误出现在启动日志里而不是生产流量里。
+- 另有面向既有模块的增量：tar（ustar）与 zstd 压缩读写、Base64url 编解码、
+  ISO-8601/RFC-3339 时间格式化解析、Semaphore/Event/OnceFlag/CancellationToken
+  线程同步原语、file_utils 的符号链接/权限/目录尺寸/临时目录扩展。
+
+### 变更
+
+- 发布说明自动化：`ci/gen_changelog.py --release` 把「未发布」段冻结成正式版本
+  段落，`--notes` 抽出该段作为发布页正文；Release 工作流 publish 阶段直接取用，
+  替代只有一行 Full Changelog 链接的自动说明。
+- `unique_temp_directory` 计时改用 `std::chrono::steady_clock`，规避 macOS/Linux
+  上 `clock_gettime` 宏与链接差异。
+- symlink 测试在沙箱禁止创建符号链接时跳过而非失败。
+
+### 修复
+
+- `find_package(libmini)` 包配置在启用 TLS 的构建中现在会正确
+  `find_dependency(OpenSSL)`：此前 Windows 导出目标引用 `OpenSSL::SSL` 却不做
+  查找，消费者 configure 直接报 “target not found”。
+- 三处 CI 缺陷：POSIX 未使用参数告警、symlink 目录尺寸统计、zstd 的
+  find_dependency 回退。
+
+### 内部
+
+- README 模块表与示例随九个模块同步扩充；提交清单由 `ci/gen_changelog.py` 从
+  git log 自动生成，CI 闸门校验漂移。
+
 ## [0.3.0] - 2026-10-04
 
 ### 新增
@@ -241,6 +318,7 @@ C++11 + CMake + Conan，静态 / 动态库均支持。
 - sqlite 的 `build_executable=False` 选项与平台相关的 64 位问题。
 
 [未发布]: https://github.com/tdyx87/libmini/compare/v0.2.1...HEAD
+[1.0.0]: https://github.com/tdyx87/libmini/compare/v0.3.0...v1.0.0
 [0.3.0]: https://github.com/tdyx87/libmini/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/tdyx87/libmini/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/tdyx87/libmini/compare/v0.1.2...v0.2.0
