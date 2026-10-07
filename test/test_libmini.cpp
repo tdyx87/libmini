@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "libmini.h"
+#include "utils/json_utils.h"  // JsonValue / parse_json（TracingTest 导出验证）
 #include "utils/hmac.h"
 #include "utils/process.h"
 #include "utils/lru_cache.h"
@@ -2107,6 +2108,272 @@ TEST(MetricRegistryTest, ConcurrentObserveCollectAndRender)
     }
     EXPECT_DOUBLE_EQ(c->value(), 20000.0);
     EXPECT_EQ(h->count(), 20000u);  // 计数为整数，精确断言（sum 不断言：浮点加法顺序不定）
+}
+
+// ---------------- 追踪：TraceContext / Span / SpanScope / Tracer ----------------
+
+TEST(TracingTest, SpanLifecycleAndSnapshot)
+{
+    libmini::Tracer tracer("svc");
+    std::shared_ptr<libmini::Span> sp = tracer.start_span("op");
+    EXPECT_TRUE(sp->context().valid());
+    EXPECT_EQ(sp->context().trace_id.size(), 32u);
+    EXPECT_EQ(sp->context().span_id.size(), 16u);
+    EXPECT_TRUE(sp->parent_span_id().empty());
+    EXPECT_TRUE(sp->context().sampled);
+    EXPECT_FALSE(sp->ended());
+    EXPECT_GT(sp->start_ms(), 0);
+    EXPECT_GE(sp->elapsed_ms(), 0);
+
+    sp->set_attribute("user.id", "u42");
+    sp->set_attribute("retries", 3);
+    sp->set_attribute("neg", -7);
+    sp->set_attribute("ratio", 0.5);
+    sp->set_attribute("cached", true);
+    sp->add_event("cache.miss");
+    sp->set_status(libmini::SpanStatus::Ok);
+
+    sp->end();
+    EXPECT_TRUE(sp->ended());
+    sp->end();  // 幂等：不再产生第二个快照
+    EXPECT_EQ(tracer.finished_count(), 1u);
+
+    const std::vector<libmini::SpanSnapshot> done = tracer.finished();
+    ASSERT_EQ(done.size(), 1u);
+    const libmini::SpanSnapshot& s = done[0];
+    EXPECT_EQ(s.service, "svc");
+    EXPECT_EQ(s.name, "op");
+    EXPECT_EQ(s.trace_id, sp->context().trace_id);
+    EXPECT_EQ(s.span_id, sp->context().span_id);
+    EXPECT_TRUE(s.parent_span_id.empty());
+    EXPECT_EQ(s.status, libmini::SpanStatus::Ok);
+    EXPECT_GT(s.start_ms, 0);
+    EXPECT_GE(s.end_ms, s.start_ms);
+    EXPECT_GE(s.duration_ms, 0);
+    EXPECT_EQ(sp->elapsed_ms(), s.duration_ms);  // 结束后 elapsed 即总时长
+
+    // 属性保插入序，数值按整数/定点格式化
+    ASSERT_EQ(s.attributes.size(), 5u);
+    EXPECT_EQ(s.attributes[0].first, "user.id");
+    EXPECT_EQ(s.attributes[0].second, "u42");
+    EXPECT_EQ(s.attributes[1].second, "3");
+    EXPECT_EQ(s.attributes[2].second, "-7");
+    EXPECT_EQ(s.attributes[3].second, "0.5");
+    EXPECT_EQ(s.attributes[4].second, "true");
+    ASSERT_EQ(s.events.size(), 1u);
+    EXPECT_EQ(s.events[0].name, "cache.miss");
+    EXPECT_GT(s.events[0].at_ms, 0);
+
+    // 同键覆盖：只留最后一次，且不改变其它键的插入位置
+    libmini::Tracer t2;
+    std::shared_ptr<libmini::Span> sp2 = t2.start_span("x");
+    sp2->set_attribute("k", "v1");
+    sp2->set_attribute("k", "v2");
+    sp2->set_attribute("n", 2.25);
+    sp2->end();
+    const std::vector<libmini::SpanSnapshot> d2 = t2.finished();
+    ASSERT_EQ(d2.size(), 1u);
+    ASSERT_EQ(d2[0].attributes.size(), 2u);
+    EXPECT_EQ(d2[0].attributes[0].first, "k");
+    EXPECT_EQ(d2[0].attributes[0].second, "v2");
+    EXPECT_EQ(d2[0].attributes[1].second, "2.25");
+}
+
+TEST(TracingTest, NestedScopesAndChildContext)
+{
+    libmini::Tracer tracer("nest");
+    std::shared_ptr<libmini::Span> root = tracer.start_span("root");
+    std::shared_ptr<libmini::Span> child;
+    std::shared_ptr<libmini::Span> gc;
+    {
+        libmini::SpanScope s1(root);
+        EXPECT_EQ(libmini::current_span().get(), root.get());
+        child = tracer.start_child_span("child");  // 挂在 root 下（不改 current）
+        EXPECT_EQ(child->parent_span_id(), root->context().span_id);
+        EXPECT_EQ(child->context().trace_id, root->context().trace_id);
+        EXPECT_NE(child->context().span_id, root->context().span_id);
+        {
+            libmini::SpanScope s2(child);
+            EXPECT_EQ(libmini::current_span().get(), child.get());
+            gc = tracer.start_child_span("gc");
+            {
+                libmini::SpanScope s3(gc);
+                EXPECT_EQ(libmini::current_span().get(), gc.get());
+                EXPECT_EQ(gc->parent_span_id(), child->context().span_id);
+            }  // s3 析构 end(gc) 并恢复 current=child
+            EXPECT_TRUE(gc->ended());
+            EXPECT_EQ(libmini::current_span().get(), child.get());
+            EXPECT_FALSE(child->ended());
+        }  // s2 end(child)
+        EXPECT_TRUE(child->ended());
+        EXPECT_EQ(libmini::current_span().get(), root.get());
+    }  // s1 end(root)
+    EXPECT_TRUE(root->ended());
+    EXPECT_TRUE(libmini::current_span() == nullptr);  // 作用域栈完全恢复
+
+    const std::vector<libmini::SpanSnapshot> done = tracer.finished();
+    ASSERT_EQ(done.size(), 3u);
+    // 完成顺序 = 结束顺序：gc → child → root
+    EXPECT_EQ(done[0].name, "gc");
+    EXPECT_EQ(done[1].name, "child");
+    EXPECT_EQ(done[2].name, "root");
+    EXPECT_TRUE(done[2].parent_span_id.empty());  // 根无父
+    EXPECT_EQ(done[1].parent_span_id, root->context().span_id);
+    EXPECT_EQ(done[0].parent_span_id, child->context().span_id);
+    EXPECT_EQ(done[0].trace_id, done[2].trace_id);  // 同一 trace 三个 span
+}
+
+TEST(TracingTest, TraceparentRoundtrip)
+{
+    libmini::TraceContext ctx;
+    ctx.trace_id = "af7651916cd43dd8448eb211c80319c7";
+    ctx.span_id = "b7ad6b7169203331";
+    ctx.sampled = true;
+    EXPECT_TRUE(ctx.valid());
+    EXPECT_EQ(ctx.traceparent(),
+              "00-af7651916cd43dd8448eb211c80319c7-b7ad6b7169203331-01");
+
+    libmini::TraceContext back = libmini::TraceContext::parse_traceparent(
+        ctx.traceparent());
+    EXPECT_TRUE(back.valid());
+    EXPECT_EQ(back.trace_id, ctx.trace_id);
+    EXPECT_EQ(back.span_id, ctx.span_id);
+    EXPECT_TRUE(back.sampled);
+
+    ctx.sampled = false;
+    const std::string off = ctx.traceparent();
+    EXPECT_EQ(off.substr(off.size() - 2), "00");  // 最后一段 = flags
+    back = libmini::TraceContext::parse_traceparent(off);
+    EXPECT_TRUE(back.valid());
+    EXPECT_FALSE(back.sampled);
+
+    // 大小写不敏感解析
+    back = libmini::TraceContext::parse_traceparent(
+        "00-AF7651916CD43DD8448EB211C80319C7-B7AD6B7169203331-01");
+    EXPECT_TRUE(back.valid());
+
+    // 无效输入一律 invalid：空、垃圾、段数不对、非十六进制、全零 id
+    EXPECT_FALSE(libmini::TraceContext::parse_traceparent("").valid());
+    EXPECT_FALSE(libmini::TraceContext::parse_traceparent("garbage").valid());
+    EXPECT_FALSE(libmini::TraceContext::parse_traceparent(
+                     "00-af7651916cd43dd8448eb211c80319c7-b7ad6b7169203331")
+                     .valid());  // 缺 flags 段
+    EXPECT_FALSE(libmini::TraceContext::parse_traceparent(
+                     "00-zz7651916cd43dd8448eb211c80319c7-b7ad6b7169203331-01")
+                     .valid());  // 非十六进制
+    EXPECT_FALSE(libmini::TraceContext::parse_traceparent(
+                     "00-00000000000000000000000000000000-b7ad6b7169203331-01")
+                     .valid());  // 全零 trace_id
+
+    libmini::TraceContext empty;
+    EXPECT_FALSE(empty.valid());
+    EXPECT_EQ(empty.traceparent(), "");  // 无效上下文不产头值
+}
+
+TEST(TracingTest, RemoteParentContinuesTrace)
+{
+    libmini::Tracer tracer("svc");
+    // 上游服务注入的 traceparent（W3C 规范示例 id）
+    libmini::TraceContext remote = libmini::TraceContext::parse_traceparent(
+        "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01");
+    ASSERT_TRUE(remote.valid());
+
+    std::shared_ptr<libmini::Span> sp = tracer.start_span("server_op", remote);
+    EXPECT_EQ(sp->context().trace_id, remote.trace_id);  // 继续上游 trace
+    EXPECT_EQ(sp->parent_span_id(), remote.span_id);
+    EXPECT_NE(sp->context().span_id, remote.span_id);  // 自己新 id
+    EXPECT_TRUE(sp->context().sampled);
+
+    // 无效父上下文 → 降级为新根（新 trace_id、无父）
+    libmini::TraceContext bad;
+    bad.trace_id = "zz";
+    std::shared_ptr<libmini::Span> root2 = tracer.start_span("root2", bad);
+    EXPECT_TRUE(root2->parent_span_id().empty());
+    EXPECT_EQ(root2->context().trace_id.size(), 32u);
+    EXPECT_NE(root2->context().trace_id, remote.trace_id);
+
+    sp->end();
+    root2->end();
+    EXPECT_EQ(tracer.finished_count(), 2u);
+}
+
+TEST(TracingTest, CapacityDropsOldest)
+{
+    libmini::Tracer tracer("svc", 3);
+    for (int i = 0; i < 5; ++i) {
+        std::shared_ptr<libmini::Span> sp =
+            tracer.start_span("s" + std::to_string(i));
+        sp->end();
+    }
+    EXPECT_EQ(tracer.finished_count(), 3u);
+    EXPECT_EQ(tracer.dropped_count(), 2u);  // 环形：丢最旧保最新
+    const std::vector<libmini::SpanSnapshot> done = tracer.finished();
+    ASSERT_EQ(done.size(), 3u);
+    EXPECT_EQ(done[0].name, "s2");
+    EXPECT_EQ(done[1].name, "s3");
+    EXPECT_EQ(done[2].name, "s4");
+
+    tracer.clear();
+    EXPECT_EQ(tracer.finished_count(), 0u);
+    EXPECT_EQ(tracer.dropped_count(), 0u);
+
+    // 上限 0 = 不保留快照（只计丢弃）
+    libmini::Tracer none("svc", 0);
+    none.start_span("gone")->end();
+    EXPECT_EQ(none.finished_count(), 0u);
+    EXPECT_EQ(none.dropped_count(), 1u);
+}
+
+TEST(TracingTest, ConcurrentSpansFromManyThreads)
+{
+    libmini::Tracer tracer("svc", 1000);
+    std::vector<std::thread> workers;
+    for (int t = 0; t < 4; ++t) {
+        workers.push_back(std::thread([&tracer]() {
+            for (int i = 0; i < 50; ++i) {
+                std::shared_ptr<libmini::Span> sp =
+                    tracer.start_span("work");
+                sp->set_attribute("i", i);
+                sp->end();
+            }
+        }));
+    }
+    // 主线程在写入的同时反复导出（收集锁保护快照队列）
+    for (int i = 0; i < 20; ++i) {
+        EXPECT_FALSE(tracer.finished_json().empty());
+        EXPECT_LE(tracer.finished_count(), 1000u);
+    }
+    for (std::size_t i = 0; i < workers.size(); ++i) {
+        workers[i].join();
+    }
+    EXPECT_EQ(tracer.finished_count(), 200u);
+    EXPECT_EQ(tracer.dropped_count(), 0u);
+}
+
+TEST(TracingTest, FinishedJsonExport)
+{
+    libmini::Tracer tracer("auth-service");
+    std::shared_ptr<libmini::Span> sp = tracer.start_span("login");
+    sp->set_attribute("k", "v");
+    sp->set_status(libmini::SpanStatus::Error, "db down");
+    sp->end();
+
+    const std::string js = tracer.finished_json();
+    const libmini::JsonValue doc =
+        libmini::parse_json(js);  // 非法 JSON 在此抛异常 → 测试失败
+    ASSERT_TRUE(doc.is_array());
+    ASSERT_EQ(doc.size(), 1u);
+    const libmini::JsonValue& item = doc[0];
+    EXPECT_EQ(item.at("service").get<std::string>(), "auth-service");
+    EXPECT_EQ(item.at("name").get<std::string>(), "login");
+    EXPECT_EQ(item.at("status").get<std::string>(), "error");
+    EXPECT_EQ(item.at("status_message").get<std::string>(), "db down");
+    EXPECT_EQ(item.at("trace_id").get<std::string>().size(), 32u);
+    EXPECT_EQ(item.at("span_id").get<std::string>().size(), 16u);
+    EXPECT_TRUE(item.at("parent_span_id").get<std::string>().empty());
+    EXPECT_EQ(item.at("attributes").at("k").get<std::string>(), "v");
+    EXPECT_GE(item.at("duration_ms").get<std::int64_t>(), 0);
+    EXPECT_TRUE(item.at("events").is_array());
 }
 
 // ---------------- CRC 家族：CRC16/Modbus、CRC64、Adler-32 ----------------

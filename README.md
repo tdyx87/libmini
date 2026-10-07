@@ -187,6 +187,7 @@ target_link_libraries(app PRIVATE libmini::libmini)
 | retry | `utils/retry.h` | poll_until 指数退避轮询（抖动防风暴、deadline 变体） |
 | circuit_breaker | `utils/circuit_breaker.h` | 熔断器三态（Closed/Open/HalfOpen）：连续失败熔断、冷却后限量探测、execute 一体化（含异常记录）、状态转移回调、累计统计，线程安全 |
 | metrics | `utils/metrics.h` | 指标注册表：Counter（单调计数）/Gauge（可增减仪表）/Histogram（固定桶 + 分位数插值），标签随序列名携带，Prometheus 文本导出（# HELP/# TYPE、_bucket{le=} 累计桶、_sum/_count），注册幂等、类型冲突告警、线程安全 |
+| trace | `utils/trace.h` | 分布式追踪：W3C traceparent 解析/格式化跨进程传播，Span + 属性/事件/状态，SpanScope RAII 嵌套作用域（析构自动 end），Tracer 快照环形收集（丢最旧）与 JSON 导出，收集线程安全 |
 | object_pool | `utils/object_pool.h` | 线程安全对象池：RAII Lease 借出归还、工厂创建、归还重置钩子 |
 | zip | `utils/zip.h` | ZIP 包读写（zlib deflate/store，UTF-8 文件名，CRC 校验），零新增依赖 |
 | tar | `utils/tar.h` | tar（ustar）读写：文件/目录/符号链接，prefix 拆支持 255 字节长路径，头部 checksum 校验，零新增依赖 |
@@ -911,6 +912,25 @@ lat->observe(12.5);   // 分桶计数 + 求和，超最大上界落 +Inf 桶
 const std::vector<MetricSample> snap = reg.collect();  // 按族名排序的快照
 snap[2].percentile(99);                 // 桶内线性插值分位数（无样本 -1）
 const std::string scrape = reg.render_prometheus();    // Prometheus 文本，直接给拉取端
+```
+
+### 追踪
+
+```cpp
+using namespace libmini;
+Tracer tracer("auth-service");
+TraceContext upstream = TraceContext::parse_traceparent(header("traceparent"));
+auto sp = tracer.start_span("login", upstream);   // 继续上游 trace；无效父按新根
+SpanScope scope(sp);                              // 设为当前 span，析构自动 end
+sp->set_attribute("user.id", "u42");
+{
+    auto db = tracer.start_child_span("db.query");  // 自动挂在 login 下
+    SpanScope db_scope(db);
+    db->set_status(SpanStatus::Ok);
+}                       // db_scope 析构 → end(db)，恢复 current=login
+sp->add_event("password.checked");
+std::string report = tracer.finished_json();      // 结束快照 JSON 数组，上报/落盘
+// 跨进程透传：sp->context().traceparent() → "00-<trace>-<span>-01" 放进请求头
 ```
 
 ### 系统信息

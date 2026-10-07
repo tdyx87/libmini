@@ -30,6 +30,7 @@ set(LIBMINI_SOURCES
     utils/process.cpp    utils/base32.cpp
     utils/console.cpp
     utils/tcp.cpp
+    utils/trace.cpp
     utils/zip.cpp
     utils/tar.cpp
     utils/zstd.cpp

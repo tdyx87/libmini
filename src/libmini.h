@@ -45,6 +45,7 @@
 #include "utils/dir_watcher.h"
 #include "utils/win_service.h"
 #include "utils/tcp.h"
+#include "utils/trace.h"
 #include "utils/websocket.h"
 #include "utils/retry.h"
 #include "utils/circuit_breaker.h"
