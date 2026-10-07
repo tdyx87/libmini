@@ -42,6 +42,7 @@
 - Add in-memory tar (ustar) reader and writer（[e0a7892](https://github.com/tdyx87/libmini/commit/e0a7892dc5c1450b1501abe0db2f0dd8aff53017)）
 - Add zstd compression wrapper with decompression bomb guard（[828b5e4](https://github.com/tdyx87/libmini/commit/828b5e434cb8aae564ccf9a0114f346f8aef91f7)）
 - Add BLAKE3 hash with keyed/derive modes and XOF output（[ac8d004](https://github.com/tdyx87/libmini/commit/ac8d004388ce7d7e643bb51e0060ab1a4e011335)）
+- Add memory-mapped file module with RAII and dual-mode mapping（[98fa80a](https://github.com/tdyx87/libmini/commit/98fa80ac3730665ddcdedc3ea9071b0dca2c0a7d)）
 
 #### 变更
 
