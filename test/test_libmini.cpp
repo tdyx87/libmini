@@ -3,6 +3,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <limits>
 #include <map>
 #include <string>
 #include <thread>
@@ -1812,6 +1813,300 @@ TEST(CircuitBreakerTest, ConfigValidateRejectsInvalid)
     // 阈值兜底为 1：一次失败即熔断；冷却兜底为 0，查询即转 HalfOpen 探测
     EXPECT_NE(cb.state(), libmini::CircuitState::Closed);
     EXPECT_TRUE(cb.allow());  // HalfOpen 放行探测，不会负等待卡死
+}
+
+// ---------------- 指标：Counter/Gauge/Histogram + Prometheus 注册表 ----------------
+
+TEST(MetricRegistryTest, CounterMonotonicAndThreadSafe)
+{
+    libmini::MetricCounter c;
+    EXPECT_DOUBLE_EQ(c.value(), 0.0);
+    c.inc();
+    c.inc(2.5);
+    c.inc(0);      // 非正数：忽略（计数器禁止回退）
+    c.inc(-3);     // 忽略
+    c.inc(std::numeric_limits<double>::quiet_NaN());  // 忽略
+    EXPECT_DOUBLE_EQ(c.value(), 3.5);
+
+    // 并发累加无丢失（CAS 循环）
+    std::vector<std::thread> threads;
+    for (int t = 0; t < 4; ++t) {
+        threads.push_back(std::thread([&c]() {
+            for (int i = 0; i < 10000; ++i) {
+                c.inc();
+            }
+        }));
+    }
+    for (std::size_t i = 0; i < threads.size(); ++i) {
+        threads[i].join();
+    }
+    EXPECT_DOUBLE_EQ(c.value(), 40003.5);  // 4 * 10000 + 3.5，双精度精确
+
+    c.reset();
+    EXPECT_DOUBLE_EQ(c.value(), 0.0);
+}
+
+TEST(MetricRegistryTest, GaugeSetAddSub)
+{
+    libmini::MetricGauge g;
+    g.set(10);
+    g.add(5.5);
+    EXPECT_DOUBLE_EQ(g.value(), 15.5);
+    g.sub(3.5);
+    EXPECT_DOUBLE_EQ(g.value(), 12.0);
+    g.add(-2);
+    EXPECT_DOUBLE_EQ(g.value(), 10.0);
+    g.set(-4.25);
+    EXPECT_DOUBLE_EQ(g.value(), -4.25);
+    // NaN 拒收（仪表可减，NaN 会污染后续运算）
+    g.add(std::numeric_limits<double>::quiet_NaN());
+    g.set(std::numeric_limits<double>::quiet_NaN());
+    EXPECT_DOUBLE_EQ(g.value(), -4.25);
+    g.reset();
+    EXPECT_DOUBLE_EQ(g.value(), 0.0);
+}
+
+TEST(MetricRegistryTest, HistogramBucketsCumulativeAndPercentiles)
+{
+    libmini::MetricHistogram h(std::vector<double>{1, 2, 5, 10});
+    EXPECT_DOUBLE_EQ(h.percentile(50), -1.0);  // 无样本
+
+    h.observe(0.5);   // le=1
+    h.observe(1.0);   // le=1（上界含端点）
+    h.observe(1.5);   // le=2
+    h.observe(3);     // le=5
+    h.observe(7);     // le=10
+    h.observe(50);    // +Inf
+    h.observe(std::numeric_limits<double>::quiet_NaN());  // 忽略
+
+    EXPECT_EQ(h.count(), 6u);
+    EXPECT_DOUBLE_EQ(h.sum(), 63.0);  // 0.5+1+1.5+3+7+50，全程精确
+    const std::vector<std::uint64_t> cum = h.cumulative_counts();
+    ASSERT_EQ(cum.size(), 5u);  // 4 个上界 + 1 个 +Inf
+    EXPECT_EQ(cum[0], 2u);
+    EXPECT_EQ(cum[1], 3u);
+    EXPECT_EQ(cum[2], 4u);
+    EXPECT_EQ(cum[3], 5u);
+    EXPECT_EQ(cum[4], 6u);
+
+    // 桶内线性插值：p50 落 le=2 桶顶 2.0；p75 在 [5,10] 中点 7.5；
+    // p100 只能给最后一个有限上界（样本在 +Inf 桶里无上界可推）
+    EXPECT_DOUBLE_EQ(h.percentile(50), 2.0);
+    EXPECT_DOUBLE_EQ(h.percentile(75), 7.5);
+    EXPECT_DOUBLE_EQ(h.percentile(100), 10.0);
+    EXPECT_DOUBLE_EQ(h.percentile(0), 0.0);
+    EXPECT_DOUBLE_EQ(h.percentile(-5), 0.0);    // 越界钳制到 [0,100]
+    EXPECT_DOUBLE_EQ(h.percentile(999), 10.0);
+
+    // 非 histogram 样本的分位数恒为 -1
+    libmini::MetricSample s;
+    s.type = libmini::MetricType::Counter;
+    EXPECT_DOUBLE_EQ(s.percentile(50), -1.0);
+}
+
+TEST(MetricRegistryTest, HistogramBoundsValidationAndDefaultBuckets)
+{
+    // 默认桶：1/2/5 序列，单位无关的兕底
+    libmini::MetricHistogram def;
+    ASSERT_EQ(def.upper_bounds().size(), 10u);
+    EXPECT_DOUBLE_EQ(def.upper_bounds().front(), 1.0);
+    EXPECT_DOUBLE_EQ(def.upper_bounds().back(), 1000.0);
+    def.observe(2000);  // 超最大上界 → +Inf 桶
+    EXPECT_EQ(def.count(), 1u);
+    EXPECT_EQ(def.cumulative_counts().back(), 1u);
+
+    // 非严格递增/非有限项逐个剔除（5 保留，3 丢，10 保留，+Inf 丢，20 保留）
+    libmini::MetricHistogram messy(
+        std::vector<double>{5, 3, 10, std::numeric_limits<double>::infinity(), 20});
+    ASSERT_EQ(messy.upper_bounds().size(), 3u);
+    EXPECT_DOUBLE_EQ(messy.upper_bounds()[0], 5.0);
+    EXPECT_DOUBLE_EQ(messy.upper_bounds()[1], 10.0);
+    EXPECT_DOUBLE_EQ(messy.upper_bounds()[2], 20.0);
+
+    // 全部非法（首个就非有限）→ 回落默认桶
+    libmini::MetricHistogram allbad(
+        std::vector<double>{std::numeric_limits<double>::quiet_NaN(),
+                            std::numeric_limits<double>::infinity()});
+    EXPECT_EQ(allbad.upper_bounds().size(), 10u);
+
+    // reset：值清零、桶边界不变
+    messy.observe(6);
+    messy.reset();
+    EXPECT_EQ(messy.count(), 0u);
+    EXPECT_DOUBLE_EQ(messy.sum(), 0.0);
+    EXPECT_EQ(messy.upper_bounds().size(), 3u);
+}
+
+TEST(MetricRegistryTest, RegistryReuseAndTypeConflicts)
+{
+    libmini::MetricRegistry reg;
+    std::shared_ptr<libmini::MetricCounter> c1 = reg.counter("requests_total", "请求总数");
+    ASSERT_TRUE(c1 != nullptr);
+
+    // 同名同类型：幂等复用；首个非空 help 生效
+    std::shared_ptr<libmini::MetricCounter> c2 =
+        reg.counter("requests_total", "另一个 help");
+    ASSERT_TRUE(c2 != nullptr);
+    EXPECT_EQ(c1.get(), c2.get());
+
+    // 同名不同类型 / 同族不同类型：类型不可转换 → nullptr（编程错误）
+    EXPECT_TRUE(reg.gauge("requests_total") == nullptr);
+    EXPECT_TRUE(reg.histogram("requests_total") == nullptr);
+    EXPECT_TRUE(reg.gauge("requests_total{code=\"200\"}") == nullptr);
+
+    // 同族同类型的标签序列：新实例，计入同一指标族
+    std::shared_ptr<libmini::MetricCounter> c3 =
+        reg.counter("requests_total{code=\"200\"}");
+    ASSERT_TRUE(c3 != nullptr);
+    EXPECT_NE(c1.get(), c3.get());
+    EXPECT_EQ(reg.size(), 2u);
+
+    const std::vector<libmini::MetricSample> samples = reg.collect();
+    ASSERT_EQ(samples.size(), 2u);
+    EXPECT_EQ(samples[0].help, "请求总数");  // 首个非空 help，不被后续覆盖
+}
+
+TEST(MetricRegistryTest, CollectSortedSnapshotAndResetAll)
+{
+    libmini::MetricRegistry reg;
+    reg.counter("zeta_total", "z help");
+    reg.gauge("alpha_gauge", "a help");
+    std::shared_ptr<libmini::MetricHistogram> h =
+        reg.histogram("mid_ms", std::vector<double>{1, 10});
+    h->observe(5);
+    std::shared_ptr<libmini::MetricCounter> z =
+        reg.counter("zeta_total{env=\"prod\"}");
+    z->inc(7);
+
+    std::vector<libmini::MetricSample> samples = reg.collect();
+    ASSERT_EQ(samples.size(), 4u);
+    // 按 (族名, 序列名) 排序：同族连续，采集顺序稳定
+    EXPECT_EQ(samples[0].name, "alpha_gauge");
+    EXPECT_EQ(samples[1].name, "mid_ms");
+    EXPECT_EQ(samples[2].name, "zeta_total");
+    EXPECT_EQ(samples[3].name, "zeta_total{env=\"prod\"}");
+    EXPECT_EQ(samples[3].base, "zeta_total");
+
+    EXPECT_EQ(samples[0].type, libmini::MetricType::Gauge);
+    EXPECT_EQ(samples[0].help, "a help");
+    EXPECT_DOUBLE_EQ(samples[0].value, 0.0);
+    EXPECT_DOUBLE_EQ(samples[2].value, 0.0);
+    EXPECT_DOUBLE_EQ(samples[3].value, 7.0);
+
+    ASSERT_EQ(samples[1].counts.size(), 3u);
+    EXPECT_EQ(samples[1].counts[0], 0u);
+    EXPECT_EQ(samples[1].counts[1], 1u);  // 观测 5 落 le=10 桶（累计式）
+    EXPECT_EQ(samples[1].total_count, 1u);
+    EXPECT_DOUBLE_EQ(samples[1].sum, 5.0);
+    EXPECT_DOUBLE_EQ(samples[1].percentile(50), 5.5);  // 桶 [1,10] 内插值
+
+    // reset_all：只归零值，注册项与桶边界保留
+    reg.reset_all();
+    samples = reg.collect();
+    ASSERT_EQ(samples.size(), 4u);
+    EXPECT_DOUBLE_EQ(samples[3].value, 0.0);
+    EXPECT_EQ(samples[1].total_count, 0u);
+    EXPECT_DOUBLE_EQ(samples[1].sum, 0.0);
+    EXPECT_EQ(reg.size(), 4u);
+}
+
+TEST(MetricRegistryTest, RenderPrometheusText)
+{
+    libmini::MetricRegistry reg;
+    std::shared_ptr<libmini::MetricCounter> reqs =
+        reg.counter("http_requests_total", "Total requests");
+    reqs->inc(42);
+    std::shared_ptr<libmini::MetricCounter> ok =
+        reg.counter("http_requests_total{code=\"200\"}");
+    ok->inc();
+    std::shared_ptr<libmini::MetricHistogram> h =
+        reg.histogram("latency_ms{route=\"/api\"}",
+                      std::vector<double>{0.5, 1, 5}, "Latency");
+    h->observe(0.25);
+    h->observe(3);
+    h->observe(9);
+
+    const std::string text = reg.render_prometheus();
+
+    // 每族只一组 # HELP / # TYPE，且在序列之前
+    std::size_t type_hits = 0;
+    for (std::size_t pos = text.find("# TYPE http_requests_total ");
+         pos != std::string::npos;
+         pos = text.find("# TYPE http_requests_total ", pos + 1)) {
+        ++type_hits;
+    }
+    EXPECT_EQ(type_hits, 1u);  // 两个序列同族，只写一次
+    EXPECT_NE(text.find("# HELP http_requests_total Total requests\n"),
+              std::string::npos);
+    EXPECT_NE(text.find("# TYPE http_requests_total counter\n"),
+              std::string::npos);
+    EXPECT_NE(text.find("# TYPE latency_ms histogram\n"), std::string::npos);
+
+    // counter 序列：整数值不带小数点；标签序列原样输出
+    EXPECT_NE(text.find("http_requests_total 42\n"), std::string::npos);
+    EXPECT_NE(text.find("http_requests_total{code=\"200\"} 1\n"),
+              std::string::npos);
+
+    // histogram：_bucket{已有标签,le=...} 累计计数 + 末位 +Inf，然后 _sum/_count
+    EXPECT_NE(text.find("latency_ms_bucket{route=\"/api\",le=\"0.5\"} 1\n"),
+              std::string::npos);
+    EXPECT_NE(text.find("latency_ms_bucket{route=\"/api\",le=\"1\"} 1\n"),
+              std::string::npos);
+    EXPECT_NE(text.find("latency_ms_bucket{route=\"/api\",le=\"5\"} 2\n"),
+              std::string::npos);
+    EXPECT_NE(text.find("latency_ms_bucket{route=\"/api\",le=\"+Inf\"} 3\n"),
+              std::string::npos);
+    EXPECT_NE(text.find("latency_ms_sum{route=\"/api\"} 12.25\n"),
+              std::string::npos);
+    EXPECT_NE(text.find("latency_ms_count{route=\"/api\"} 3\n"),
+              std::string::npos);
+}
+
+TEST(MetricRegistryTest, ValidNameCheckAndInvalidStillRegisters)
+{
+    EXPECT_TRUE(libmini::MetricRegistry::valid_name("a"));
+    EXPECT_TRUE(libmini::MetricRegistry::valid_name("_x1:b"));
+    EXPECT_TRUE(libmini::MetricRegistry::valid_name("a_total{code=\"200\"}"));
+    EXPECT_TRUE(libmini::MetricRegistry::valid_name("ns:metric"));
+    EXPECT_FALSE(libmini::MetricRegistry::valid_name(""));
+    EXPECT_FALSE(libmini::MetricRegistry::valid_name("1abc"));
+    EXPECT_FALSE(libmini::MetricRegistry::valid_name("a-b"));
+    EXPECT_FALSE(libmini::MetricRegistry::valid_name("a{b"));   // 无收尾 '}'
+    EXPECT_FALSE(libmini::MetricRegistry::valid_name("a{b}{c}"));  // 第二个 '{'
+
+    // 非法名：告警但不拒绝（注册表本质是字符串键值表，渲染自担）
+    libmini::MetricRegistry reg;
+    std::shared_ptr<libmini::MetricCounter> c = reg.counter("-bad name");
+    EXPECT_TRUE(c != nullptr);
+    EXPECT_EQ(reg.size(), 1u);
+}
+
+TEST(MetricRegistryTest, ConcurrentObserveCollectAndRender)
+{
+    libmini::MetricRegistry reg;
+    std::shared_ptr<libmini::MetricCounter> c = reg.counter("stress_total");
+    std::shared_ptr<libmini::MetricHistogram> h =
+        reg.histogram("stress_ms", std::vector<double>{1, 10, 100});
+
+    std::vector<std::thread> workers;
+    for (int t = 0; t < 4; ++t) {
+        workers.push_back(std::thread([c, h]() {
+            for (int i = 0; i < 5000; ++i) {
+                c->inc();
+                h->observe(static_cast<double>(i % 1000) / 10.0);
+            }
+        }));
+    }
+    // 主线程在写入的同时反复采集与渲染（快照锁 + 原子桶计数不悬空）
+    for (int i = 0; i < 50; ++i) {
+        EXPECT_FALSE(reg.collect().empty());
+        EXPECT_FALSE(reg.render_prometheus().empty());
+    }
+    for (std::size_t i = 0; i < workers.size(); ++i) {
+        workers[i].join();
+    }
+    EXPECT_DOUBLE_EQ(c->value(), 20000.0);
+    EXPECT_EQ(h->count(), 20000u);  // 计数为整数，精确断言（sum 不断言：浮点加法顺序不定）
 }
 
 // ---------------- CRC 家族：CRC16/Modbus、CRC64、Adler-32 ----------------

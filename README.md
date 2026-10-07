@@ -186,6 +186,7 @@ target_link_libraries(app PRIVATE libmini::libmini)
 | websocket | `utils/websocket.h` | WebSocket 客户端/服务端（RFC 6455，与浏览器互通）：HTTP Upgrade 握手（Sec-WebSocket-Key/Accept）、掩码帧、分片重组、PING/PONG/CLOSE 自动应答、广播与多连接，零第三方依赖 |
 | retry | `utils/retry.h` | poll_until 指数退避轮询（抖动防风暴、deadline 变体） |
 | circuit_breaker | `utils/circuit_breaker.h` | 熔断器三态（Closed/Open/HalfOpen）：连续失败熔断、冷却后限量探测、execute 一体化（含异常记录）、状态转移回调、累计统计，线程安全 |
+| metrics | `utils/metrics.h` | 指标注册表：Counter（单调计数）/Gauge（可增减仪表）/Histogram（固定桶 + 分位数插值），标签随序列名携带，Prometheus 文本导出（# HELP/# TYPE、_bucket{le=} 累计桶、_sum/_count），注册幂等、类型冲突告警、线程安全 |
 | object_pool | `utils/object_pool.h` | 线程安全对象池：RAII Lease 借出归还、工厂创建、归还重置钩子 |
 | zip | `utils/zip.h` | ZIP 包读写（zlib deflate/store，UTF-8 文件名，CRC 校验），零新增依赖 |
 | tar | `utils/tar.h` | tar（ustar）读写：文件/目录/符号链接，prefix 拆支持 255 字节长路径，头部 checksum 校验，零新增依赖 |
@@ -892,6 +893,24 @@ LogFacade::init(o);
 LogFacade::logger()->info("service started, pid={}", current_pid());
 LogFacade::set_level(LogLevel::Warn);   // 运行期动态调级
 LogFacade::shutdown();
+```
+
+### 指标
+
+```cpp
+using namespace libmini;
+MetricRegistry reg;
+auto reqs = reg.counter("http_requests_total", "请求总数");
+auto conns = reg.gauge("active_connections");
+auto lat = reg.histogram("latency_ms{route=\"/api\"}",
+                         {1, 5, 10, 50, 100, 500}, "耗时分布");
+reqs->inc();          // 单调计数，inc(<=0) 忽略；并发 CAS 无丢失
+conns->set(12);       // 仪表可增可减
+lat->observe(12.5);   // 分桶计数 + 求和，超最大上界落 +Inf 桶
+
+const std::vector<MetricSample> snap = reg.collect();  // 按族名排序的快照
+snap[2].percentile(99);                 // 桶内线性插值分位数（无样本 -1）
+const std::string scrape = reg.render_prometheus();    // Prometheus 文本，直接给拉取端
 ```
 
 ### 系统信息
