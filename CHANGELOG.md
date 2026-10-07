@@ -47,6 +47,7 @@
 - Add circuit breaker with closed/open/half-open state machine（[97b7acf](https://github.com/tdyx87/libmini/commit/97b7acf8598aeb8037bd16412eaaf758c83f14a6)）
 - Add RPC multi-endpoint load balancing with failover（[7e1ef80](https://github.com/tdyx87/libmini/commit/7e1ef80a5859130b976bd6e8aa842ea7437359fc)）
 - Add metrics registry with Prometheus text export（[57cd472](https://github.com/tdyx87/libmini/commit/57cd472bd7cea370c8d4ecf22d226f19b76d6059)）
+- Add distributed tracing with W3C traceparent propagation（[82e86a8](https://github.com/tdyx87/libmini/commit/82e86a804ffbbc1b8432785a6eed586a80b4875e)）
 
 #### 变更
 
