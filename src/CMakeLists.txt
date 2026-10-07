@@ -190,6 +190,9 @@ if(_libmini_ssl)
 else()
     message(STATUS "libmini: TLS/HTTPS disabled (OpenSSL not found; https reports a runtime error)")
 endif()
+# 供 libminiConfig.cmake.in 决定消费者是否需要 find_dependency(OpenSSL)：
+# POSIX 恒链接（aes_gcm）；Windows 仅 TLS 启用时导出目标才引用 OpenSSL::
+set(LIBMINI_WITH_OPENSSL ${_libmini_ssl})
 
 # ---------------- 安装规则（下游 find_package(libmini) 支持） ----------------
 include(GNUInstallDirs)

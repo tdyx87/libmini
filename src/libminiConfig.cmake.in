@@ -8,8 +8,9 @@ set(CMAKE_FIND_PACKAGE_PREFER_CONFIG ON)
 
 # libminiTargets.cmake 引用这些 imported target，必须先找到对应包。
 # 依赖与 src/CMakeLists.txt 中 target_link_libraries(libmini PUBLIC ...) 一致；
-# OpenSSL 仅 POSIX 分支需要（Windows 走系统 CNG），Windows 上找不到也无所谓——
-# 接受不强制（REQUIRED=OFF），目标分支不会引用它
+# OpenSSL：POSIX 恒被引用（aes_gcm 的 EVP 实现）；Windows 上 aes_gcm 走系统
+# CNG，仅当构建时找到 OpenSSL（TLS 启用，@LIBMINI_WITH_OPENSSL@=ON）导出目标
+# 才引用 OpenSSL::/openssl::——此时必须 find，否则 libminiTargets 报目标不存在
 find_dependency(nlohmann_json)
 find_dependency(pugixml)
 find_dependency(spdlog)
@@ -18,7 +19,7 @@ find_dependency(ZLIB)
 find_dependency(SQLite3)
 find_dependency(zstd)
 find_dependency(Threads)
-if(NOT WIN32)
+if(NOT WIN32 OR @LIBMINI_WITH_OPENSSL@)
     find_dependency(OpenSSL)
 endif()
 
