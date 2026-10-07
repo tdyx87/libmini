@@ -27,45 +27,7 @@
 
 ### 提交清单
 
-#### 新增
-
-- Add secure_random: a real CSPRNG, and move UUID v4 onto it（[71a2c97](https://github.com/tdyx87/libmini/commit/71a2c97a0f0a82394bae3dbbfde88c40bc2e3904)）
-- Add kdf: turn passwords into keys without a new dependency（[49af0b8](https://github.com/tdyx87/libmini/commit/49af0b8ebbb4294eef9486227f500d489a6bff04)）
-- Add SHA-1 and SHA-512 to the digest module（[5c95416](https://github.com/tdyx87/libmini/commit/5c95416904bee1ded1d7e16aad5bdef5ecb14dda)）
-- Add time-ordered v7 and namespace-derived v5 UUIDs（[9d6741b](https://github.com/tdyx87/libmini/commit/9d6741b4e6687029c6facbb6932e6eb7c773f832)）
-- Add an RFC 4180 CSV reader and writer（[2734f3f](https://github.com/tdyx87/libmini/commit/2734f3f77faae68ebddea02556ca10d91a6abf29)）
-- Add glob matching and recursive file lookup（[7d2a09e](https://github.com/tdyx87/libmini/commit/7d2a09e6691e9d192198204e925e83b65b2e6204)）
-- Add file_utils extensions: symlink, permissions, directory_size, temp_directory（[dac8430](https://github.com/tdyx87/libmini/commit/dac843049e01f6cd33ad6e0d8048d5e400e620fe)）
-- Add thread sync primitives: Semaphore, Event, OnceFlag, CancellationToken（[72353e0](https://github.com/tdyx87/libmini/commit/72353e060c8e84f1e7c2280d21b82f84dbe90151)）
-- Add Base64url codec (RFC 4648 §5) with optional padding（[638c4b0](https://github.com/tdyx87/libmini/commit/638c4b0d3b9bf686091f3435f3bb26ee2401eb99)）
-- Add ISO-8601 / RFC-3339 formatting and parsing to time_utils（[78dd430](https://github.com/tdyx87/libmini/commit/78dd43037f4fb369aebd93c146537c7255793cf8)）
-- Add in-memory tar (ustar) reader and writer（[e0a7892](https://github.com/tdyx87/libmini/commit/e0a7892dc5c1450b1501abe0db2f0dd8aff53017)）
-- Add zstd compression wrapper with decompression bomb guard（[828b5e4](https://github.com/tdyx87/libmini/commit/828b5e434cb8aae564ccf9a0114f346f8aef91f7)）
-- Add BLAKE3 hash with keyed/derive modes and XOF output（[ac8d004](https://github.com/tdyx87/libmini/commit/ac8d004388ce7d7e643bb51e0060ab1a4e011335)）
-- Add memory-mapped file module with RAII and dual-mode mapping（[98fa80a](https://github.com/tdyx87/libmini/commit/98fa80ac3730665ddcdedc3ea9071b0dca2c0a7d)）
-- Add WebSocket client and server with RFC 6455 handshake and framing（[7c59ef0](https://github.com/tdyx87/libmini/commit/7c59ef004a3fa3a680a1cec94c60a780a4603440)）
-- Add circuit breaker with closed/open/half-open state machine（[97b7acf](https://github.com/tdyx87/libmini/commit/97b7acf8598aeb8037bd16412eaaf758c83f14a6)）
-- Add RPC multi-endpoint load balancing with failover（[7e1ef80](https://github.com/tdyx87/libmini/commit/7e1ef80a5859130b976bd6e8aa842ea7437359fc)）
-- Add metrics registry with Prometheus text export（[57cd472](https://github.com/tdyx87/libmini/commit/57cd472bd7cea370c8d4ecf22d226f19b76d6059)）
-- Add distributed tracing with W3C traceparent propagation（[82e86a8](https://github.com/tdyx87/libmini/commit/82e86a804ffbbc1b8432785a6eed586a80b4875e)）
-- Add liveness and readiness health endpoints to HttpServer（[649b831](https://github.com/tdyx87/libmini/commit/649b831a6bded91903f51ec31aa5e8d3f44c9d8b)）
-- Add TLS support to HTTP client and server（[0028a3d](https://github.com/tdyx87/libmini/commit/0028a3ded166c375f055706ecd92e70339f6cd71)）
-
-#### 变更
-
-- Teach the changelog tool to freeze a release and feed the release page（[c52962e](https://github.com/tdyx87/libmini/commit/c52962e0237ff9d80f7e0ee816433ad5adb1f970)）
-- Use std::chrono::steady_clock in unique_temp_directory to avoid clock_gettime POSIX macro/link issues on macOS/Ubuntu（[6a1ed14](https://github.com/tdyx87/libmini/commit/6a1ed1426e9eec1b0c64ae1d96b5319e8e3fff05)）
-- Skip symlink tests when create_symlink fails (sandbox may forbid symlinks)（[5dd33b0](https://github.com/tdyx87/libmini/commit/5dd33b04c9e8fb21e48f63edfc565a2969967122)）
-- Find OpenSSL in package config for TLS-enabled builds（[293bee4](https://github.com/tdyx87/libmini/commit/293bee469764362252d135b534974ed9912c7f7e)）
-
-#### 修复
-
-- Fix three CI failures: POSIX unused param, symlink dir sizing, zstd find_dependency（[e1763c4](https://github.com/tdyx87/libmini/commit/e1763c4b24a0a2f97b002dff718f2e810cb8382e)）
-
-#### 内部
-
-- Rebaseline the changelog after v0.3.0 and drop dead matrix config（[bfc6d7f](https://github.com/tdyx87/libmini/commit/bfc6d7f1cdb125460017a01a546a1324e081ec6a)）
-- Document thread sync primitives in README and refresh changelog（[f45fe47](https://github.com/tdyx87/libmini/commit/f45fe47cb16c72b01cf846dec1339ba40d37f28a)）
+（暂无提交）
 
 <!-- END generated:unreleased -->
 
