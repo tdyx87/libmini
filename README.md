@@ -154,7 +154,7 @@ target_link_libraries(app PRIVATE libmini::libmini)
 | serialization | `utils/serialization.h` | 基于 nlohmann 的通用 JSON 序列化 + XML 树映射序列化 |
 | msgpack | `utils/msgpack.h` | MsgPack 二进制序列化（nlohmann 内置编解码，规范全兼容）：JsonValue 树/类型化封装，与 JSON 同套类型支持 |
 | proto_buf | `utils/proto_buf.h` | ProtoBuf proto3 wire format 编解码（零依赖手写，与官方字节级兼容）：字段号键的 JsonValue 树、packed 展开工具 |
-| rpc | `utils/rpc.h` | JSON RPC（HTTP / Windows 命名管道 / POSIX UDS / 裸 TCP 帧四种传输，一套 API）：客户端连接池/重试/抖动/日志，服务端过载保护（立即拒绝或排队背压）/延迟分位/队列监控/spdlog 日志；`config()` 导出配置快照 + `validate()` 非法值自检 |
+| rpc | `utils/rpc.h` | JSON RPC（HTTP / Windows 命名管道 / POSIX UDS / 裸 TCP 帧四种传输，一套 API）：客户端连接池/重试/抖动/日志，服务端过载保护（立即拒绝或排队背压）/延迟分位/队列监控/spdlog 日志；`RpcLoadBalancer` 多端点负载均衡（轮询/随机/最少在途 + 可重试失败故障转移 + 端点健康标记）；`config()` 导出配置快照 + `validate()` 非法值自检 |
 | uuid | `utils/uuid.h` | v4 随机生成与解析；**v7 时间有序**（RFC 9562，前 48 位 Unix 毫秒 + 进程内计数器，单进程内严格单调递增，写密集场景当主键时索引体积与写入放大远优于 v4）；**v5 命名空间派生**（含 DNS/URL/OID/X500 四个预定义命名空间，同输入恒等输出）；另有 `version()` / `variant()` / `timestamp_ms()` |
 | crc | `utils/crc.h` | CRC-32（zlib）/ CRC-16 Modbus / CRC-64 XZ / Adler-32，均支持增量计算 |
 | encoding | `utils/encoding.h` | Base64 / Base64url（JWT/URL 安全，默认无填充）/ Hex / URL 编解码 |
@@ -424,6 +424,16 @@ if (reply.empty()) {
     std::cout << "rpc failed: " << client.last_error_message() << "\n";
 }
 double cost = client.last_call_elapsed_ms();  // 本次 call 总耗时（含重试等待）
+
+// 多端点负载均衡：封装多个 RpcClient，按策略选点 + 可重试失败自动故障转移；
+// 候选顺序健康优先（连续失败达阈值的端点只作兜底，成功一次即恢复）
+RpcLoadBalancer lb;
+lb.add_endpoint("10.0.0.1", 8080);                  // HTTP（也支持 Tcp / 本地管道）
+lb.add_endpoint(RpcTransport::Tcp, "10.0.0.2:9000");
+lb.set_strategy(RpcBalanceStrategy::RoundRobin);     // Random / LeastInFlight 可选
+lb.set_unhealthy_threshold(3);                      // 连续失败 3 次 → 降为兜底候选
+std::string r3 = lb.call("add", R"({"a":1,"b":2})");  // 连接失败/超时/过载自动换端点
+const RpcBalancerStats bs = lb.stats();  // 每端点 attempts/successes/in_flight + 合计 failovers
 
 // 本地传输：同协议跑在管道/UDS 上，重试、过载语义（429 ↔ status:"overloaded"）、
 // 统计与直方图与 HTTP 完全一致；客户端可用 transport()/endpoint() 查询传输与端点

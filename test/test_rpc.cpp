@@ -3444,6 +3444,418 @@ TEST(RpcConfigValidationTest, ApplyConfigClampsAndSelfChecks)
     EXPECT_TRUE(c.validate());
 }
 
+// ==================== 多端点负载均衡测试 ====================
+
+// 起一个临时服务器立刻停机，得到一个保证无人监听的端口（连接必被拒绝）
+static int grab_closed_port()
+{
+    libmini::RpcServer tmp(0);
+    tmp.start_background();
+    if (!tmp.wait_until_ready(5000)) {
+        return 0;
+    }
+    const int port = tmp.port();
+    tmp.stop();
+    return port;
+}
+
+// 轮询均匀分发 + 计数归属 + reset_stats 清零（健康/在途保留）
+TEST(RpcLoadBalancerTest, RoundRobinDistributesAndResetClearsCounts)
+{
+    TestServer a;
+    TestServer b;
+    a.server().register_method("whoami", [](const std::string&) {
+        return json{{"who", "a"}}.dump();
+    });
+    b.server().register_method("whoami", [](const std::string&) {
+        return json{{"who", "b"}}.dump();
+    });
+
+    libmini::RpcLoadBalancer lb;
+    lb.add_endpoint("127.0.0.1", a.port());
+    lb.add_endpoint("127.0.0.1", b.port());
+    EXPECT_EQ(lb.endpoint_count(), 2u);
+    EXPECT_EQ(lb.config().strategy, libmini::RpcBalanceStrategy::RoundRobin);
+    EXPECT_TRUE(lb.config().failover);
+    EXPECT_EQ(lb.config().unhealthy_threshold, 0);
+
+    int saw_a = 0;
+    int saw_b = 0;
+    for (int i = 0; i < 6; ++i) {
+        // 首次带单次调用级超时（三参形态），其余走默认
+        const std::string reply =
+            (i == 0) ? lb.call("whoami", "null", 3000) : lb.call("whoami", "null");
+        ASSERT_FALSE(reply.empty()) << lb.last_error_message();
+        if (json::parse(reply).at("who").get<std::string>() == "a") {
+            ++saw_a;
+        } else {
+            ++saw_b;
+        }
+    }
+    EXPECT_EQ(saw_a, 3);
+    EXPECT_EQ(saw_b, 3);
+    EXPECT_EQ(lb.last_error(), libmini::RpcError::OK);
+    EXPECT_TRUE(lb.last_error_message().empty());
+
+    libmini::RpcBalancerStats st = lb.stats();
+    ASSERT_EQ(st.endpoints.size(), 2u);
+    EXPECT_EQ(st.endpoints[0].selected, 3u);
+    EXPECT_EQ(st.endpoints[1].selected, 3u);
+    EXPECT_EQ(st.endpoints[0].attempts, 3u);
+    EXPECT_EQ(st.total_calls, 6u);
+    EXPECT_EQ(st.total_successes, 6u);
+    EXPECT_EQ(st.total_failures, 0u);
+    EXPECT_EQ(st.failovers, 0u);
+    EXPECT_TRUE(st.endpoints[0].healthy);
+    EXPECT_EQ(st.endpoints[0].in_flight, 0u);
+
+    lb.reset_stats();
+    st = lb.stats();
+    EXPECT_EQ(st.total_calls, 0u);
+    EXPECT_EQ(st.endpoints[0].attempts, 0u);
+    EXPECT_EQ(st.endpoints[1].selected, 0u);
+    EXPECT_TRUE(st.endpoints[0].healthy);  // 健康状态保留
+}
+
+// 死端点在前：可重试失败自动切换到存活端点，计数与 failover 归属正确
+TEST(RpcLoadBalancerTest, FailoverSwitchesToLiveEndpoint)
+{
+    TestServer live;
+    live.server().register_method("whoami", [](const std::string&) {
+        return json{{"who", "live"}}.dump();
+    });
+    // live 先占位，之后再拿关闭端口，避免端口重叠
+    const int dead_port = grab_closed_port();
+    ASSERT_GT(dead_port, 0);
+    ASSERT_NE(dead_port, live.port());
+
+    libmini::RpcLoadBalancer lb;
+    libmini::RpcClientConfig cc;
+    cc.timeout_ms = 1000;
+    cc.max_retries = 0;  // 快速失败：故障转移不经端点客户端的退避重试
+    lb.apply_client_config(cc);
+    lb.add_endpoint("127.0.0.1", dead_port);
+    lb.add_endpoint("127.0.0.1", live.port());
+
+    const std::string reply = lb.call("whoami", "null");
+    ASSERT_FALSE(reply.empty()) << lb.last_error_message();
+    EXPECT_EQ(json::parse(reply).at("who").get<std::string>(), "live");
+    EXPECT_EQ(lb.last_error(), libmini::RpcError::OK);
+    EXPECT_FALSE(lb.last_endpoint().empty());
+
+    libmini::RpcBalancerStats st = lb.stats();
+    EXPECT_EQ(st.total_calls, 1u);
+    EXPECT_EQ(st.total_successes, 1u);
+    EXPECT_EQ(st.failovers, 1u);
+    ASSERT_EQ(st.endpoints.size(), 2u);
+    EXPECT_EQ(st.endpoints[0].attempts, 1u);
+    EXPECT_EQ(st.endpoints[0].failures, 1u);
+    EXPECT_TRUE(st.endpoints[0].healthy);  // 阈值 0（关闭）→ 不标记不健康
+    EXPECT_EQ(st.endpoints[1].attempts, 1u);
+    EXPECT_EQ(st.endpoints[1].successes, 1u);
+}
+
+// 关闭 failover：首个失败即终止，绝不碰第二个端点
+TEST(RpcLoadBalancerTest, FailoverDisabledStopsAtFirstFailure)
+{
+    TestServer live;
+    live.server().register_method("whoami", [](const std::string&) {
+        return json{{"who", "live"}}.dump();
+    });
+    const int dead_port = grab_closed_port();
+    ASSERT_GT(dead_port, 0);
+
+    libmini::RpcLoadBalancer lb;
+    libmini::RpcClientConfig cc;
+    cc.timeout_ms = 1000;
+    cc.max_retries = 0;
+    lb.apply_client_config(cc);
+    lb.set_failover(false);
+    lb.add_endpoint("127.0.0.1", dead_port);
+    lb.add_endpoint("127.0.0.1", live.port());
+
+    EXPECT_TRUE(lb.call("whoami", "null").empty());
+    EXPECT_EQ(lb.last_error(), libmini::RpcError::CONNECTION_FAILED);
+    EXPECT_FALSE(lb.last_error_message().empty());
+
+    libmini::RpcBalancerStats st = lb.stats();
+    EXPECT_EQ(st.total_calls, 1u);
+    EXPECT_EQ(st.total_failures, 1u);
+    EXPECT_EQ(st.failovers, 0u);
+    EXPECT_EQ(st.endpoints[0].attempts, 1u);
+    EXPECT_EQ(st.endpoints[1].attempts, 0u);  // 存活端点完全没被碰过
+}
+
+// 健康阈值：失败一次标记不健康后，轮询轮到它时改走健康端点
+//（候选顺序健康优先，不依赖 failover）
+TEST(RpcLoadBalancerTest, HealthThresholdSkipsUnhealthyEndpoint)
+{
+    TestServer live;
+    live.server().register_method("whoami", [](const std::string&) {
+        return json{{"who", "live"}}.dump();
+    });
+    const int dead_port = grab_closed_port();
+    ASSERT_GT(dead_port, 0);
+
+    libmini::RpcLoadBalancer lb;
+    libmini::RpcClientConfig cc;
+    cc.timeout_ms = 1000;
+    cc.max_retries = 0;
+    lb.apply_client_config(cc);
+    lb.set_failover(false);  // 隔离健康机制：失败不换端点，看后续轮询是否绕开
+    lb.set_unhealthy_threshold(1);
+    lb.add_endpoint("127.0.0.1", live.port());
+    lb.add_endpoint("127.0.0.1", dead_port);
+
+    int ok = 0;
+    for (int i = 0; i < 8; ++i) {
+        if (!lb.call("whoami", "null").empty()) {
+            ++ok;
+        }
+    }
+    EXPECT_EQ(ok, 7);  // 仅第 2 次（轮询首中死端点）失败，其后全部绕行
+
+    libmini::RpcBalancerStats st = lb.stats();
+    EXPECT_EQ(st.total_calls, 8u);
+    EXPECT_EQ(st.total_successes, 7u);
+    EXPECT_EQ(st.total_failures, 1u);
+    EXPECT_EQ(st.failovers, 0u);
+    ASSERT_EQ(st.endpoints.size(), 2u);
+    EXPECT_EQ(st.endpoints[0].attempts, 7u);
+    EXPECT_EQ(st.endpoints[1].attempts, 1u);  // 只在被标记前试过一次
+    EXPECT_FALSE(st.endpoints[1].healthy);
+    EXPECT_EQ(st.endpoints[1].consecutive_failures, 1);
+    EXPECT_TRUE(st.endpoints[0].healthy);
+}
+
+// 最少在途：一个端点被慢调用占住时，后续调用全部走空闲端点
+TEST(RpcLoadBalancerTest, LeastInFlightPrefersIdleEndpoint)
+{
+    TestServer a;
+    TestServer b;
+    a.server().register_method("whoami", [](const std::string&) {
+        return json{{"who", "a"}}.dump();
+    });
+    b.server().register_method("whoami", [](const std::string&) {
+        return json{{"who", "b"}}.dump();
+    });
+
+    libmini::RpcLoadBalancer lb;
+    lb.set_strategy(libmini::RpcBalanceStrategy::LeastInFlight);
+    lb.add_endpoint("127.0.0.1", a.port());  // endpoints[0]
+    lb.add_endpoint("127.0.0.1", b.port());
+
+    std::thread holder([&lb]() {
+        const std::string r = lb.call("sleep_ms", R"({"ms":1200})");
+        (void)r;
+    });
+    // 等到慢调用真正占用 endpoints[0]（在途数 > 0）再发后续调用
+    for (int i = 0; i < 150 && lb.stats().endpoints[0].in_flight == 0; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    ASSERT_GT(lb.stats().endpoints[0].in_flight, 0u);
+
+    for (int i = 0; i < 4; ++i) {
+        const std::string reply = lb.call("whoami", "null");
+        ASSERT_FALSE(reply.empty()) << lb.last_error_message();
+        EXPECT_EQ(json::parse(reply).at("who").get<std::string>(), "b")
+            << "call " << i << " should have skipped the busy endpoint";
+    }
+    holder.join();
+
+    libmini::RpcBalancerStats st = lb.stats();
+    EXPECT_EQ(st.endpoints[0].attempts, 1u);  // 只有那个慢调用
+    EXPECT_EQ(st.endpoints[1].attempts, 4u);
+    EXPECT_EQ(st.total_successes, 5u);
+}
+
+// 随机策略：大量调用下两个端点都达到可观测的占比
+TEST(RpcLoadBalancerTest, RandomStrategyReachesBothEndpoints)
+{
+    TestServer a;
+    TestServer b;
+    a.server().register_method("whoami", [](const std::string&) {
+        return json{{"who", "a"}}.dump();
+    });
+    b.server().register_method("whoami", [](const std::string&) {
+        return json{{"who", "b"}}.dump();
+    });
+
+    libmini::RpcLoadBalancer lb;
+    lb.set_strategy(libmini::RpcBalanceStrategy::Random);
+    lb.add_endpoint("127.0.0.1", a.port());
+    lb.add_endpoint("127.0.0.1", b.port());
+
+    int saw_a = 0;
+    int saw_b = 0;
+    for (int i = 0; i < 60; ++i) {
+        const std::string reply = lb.call("whoami", "null");
+        ASSERT_FALSE(reply.empty()) << lb.last_error_message();
+        (json::parse(reply).at("who").get<std::string>() == "a" ? saw_a : saw_b)++;
+    }
+    // 60 次二项分布，任一端点 < 10 的概率约 1e-9，不会抖
+    EXPECT_GE(saw_a, 10);
+    EXPECT_GE(saw_b, 10);
+}
+
+// 全部不健康仍会尝试（兕底候选不空转），每调用至多每端点一次
+TEST(RpcLoadBalancerTest, AllUnhealthyEndpointsStillAttempted)
+{
+    const int dead1 = grab_closed_port();
+    ASSERT_GT(dead1, 0);
+    const int dead2 = grab_closed_port();
+    ASSERT_GT(dead2, 0);
+    ASSERT_NE(dead1, dead2);
+
+    libmini::RpcLoadBalancer lb;
+    libmini::RpcClientConfig cc;
+    cc.timeout_ms = 1000;
+    cc.max_retries = 0;
+    lb.apply_client_config(cc);
+    lb.set_unhealthy_threshold(1);
+    lb.add_endpoint("127.0.0.1", dead1);
+    lb.add_endpoint("127.0.0.1", dead2);
+
+    EXPECT_TRUE(lb.call("add", R"({"a":1,"b":2})").empty());
+    EXPECT_TRUE(lb.call("add", R"({"a":1,"b":2})").empty());
+    EXPECT_TRUE(lb.call("add", R"({"a":1,"b":2})").empty());
+
+    libmini::RpcBalancerStats st = lb.stats();
+    EXPECT_EQ(st.total_calls, 3u);
+    EXPECT_EQ(st.total_failures, 3u);
+    EXPECT_EQ(st.failovers, 3u);  // 每次调用都把两个端点各试一遍
+    ASSERT_EQ(st.endpoints.size(), 2u);
+    EXPECT_EQ(st.endpoints[0].attempts + st.endpoints[1].attempts, 6u);
+    EXPECT_FALSE(st.endpoints[0].healthy);
+    EXPECT_FALSE(st.endpoints[1].healthy);
+}
+
+// 空均衡器：同步/异步都快速失败，不挂起、不除零
+TEST(RpcLoadBalancerTest, EmptyBalancerFailsFast)
+{
+    libmini::RpcLoadBalancer lb;
+    EXPECT_EQ(lb.endpoint_count(), 0u);
+
+    EXPECT_TRUE(lb.call("add", "null").empty());
+    EXPECT_EQ(lb.last_error(), libmini::RpcError::CONNECTION_FAILED);
+    EXPECT_EQ(lb.last_error_message(), "no endpoints configured");
+    EXPECT_TRUE(lb.last_endpoint().empty());
+
+    // future 形态：空串立即可取，不阻塞
+    EXPECT_TRUE(lb.call_async("add", "null").get().empty());
+
+    // 回调形态：无端点时在调用线程立即执行
+    bool called = false;
+    libmini::RpcError seen = libmini::RpcError::OK;
+    lb.call_async("add", "null",
+                  [&](const std::string& result, libmini::RpcError err,
+                      const std::string&) {
+                      EXPECT_TRUE(result.empty());
+                      called = true;
+                      seen = err;
+                  });
+    EXPECT_TRUE(called);
+    EXPECT_EQ(seen, libmini::RpcError::CONNECTION_FAILED);
+
+    libmini::RpcBalancerStats st = lb.stats();
+    EXPECT_EQ(st.total_calls, 3u);
+    EXPECT_EQ(st.total_failures, 3u);
+    EXPECT_EQ(st.failovers, 0u);
+}
+
+// apply_config：三个均衡器键 + client.* 键一次灌入；非法值不覆盖当前值
+TEST(RpcLoadBalancerTest, ApplyConfigWiresBalancerAndClientKeys)
+{
+    libmini::ConfigFacade cfg;
+    cfg.set_default("rpc.strategy", "least_in_flight");
+    cfg.set_default("rpc.failover", "false");
+    cfg.set_default("rpc.unhealthy_threshold", "3");
+    cfg.set_default("rpc.timeout_ms", "1234");
+    cfg.set_default("rpc.max_retries", "0");
+
+    libmini::RpcLoadBalancer lb;
+    lb.apply_config(cfg, "rpc.");
+
+    const libmini::RpcBalancerConfig bc = lb.config();
+    EXPECT_EQ(bc.strategy, libmini::RpcBalanceStrategy::LeastInFlight);
+    EXPECT_FALSE(bc.failover);
+    EXPECT_EQ(bc.unhealthy_threshold, 3);
+    EXPECT_TRUE(bc.validate());
+
+    const libmini::RpcClientConfig cc = lb.client_config();
+    EXPECT_EQ(cc.timeout_ms, 1234);
+    EXPECT_EQ(cc.max_retries, 0);
+    EXPECT_EQ(cc.retry_base_delay_ms, 100);  // 未提供的键保持默认
+
+    // 无法识别的 strategy 值：记 warn 且不覆盖当前值
+    libmini::ConfigFacade bad;
+    bad.set_default("rpc.strategy", "bogus");
+    lb.apply_config(bad, "rpc.");
+    EXPECT_EQ(lb.config().strategy, libmini::RpcBalanceStrategy::LeastInFlight);
+
+    // 负阈值：validate 报警判否，运行语义兑底为关闭健康判定
+    libmini::ConfigFacade neg;
+    neg.set_default("rpc.unhealthy_threshold", "-2");
+    lb.apply_config(neg, "rpc.");
+    EXPECT_EQ(lb.config().unhealthy_threshold, -2);
+    EXPECT_FALSE(lb.config().validate());
+}
+
+// 异步两种形态的故障转移：future 可取回结果，回调独立携带错误信息
+TEST(RpcLoadBalancerTest, AsyncCallFailsOverToLiveEndpoint)
+{
+    TestServer live;
+    live.server().register_method("whoami", [](const std::string&) {
+        return json{{"who", "live"}}.dump();
+    });
+    const int dead_port = grab_closed_port();
+    ASSERT_GT(dead_port, 0);
+
+    libmini::RpcLoadBalancer lb;
+    libmini::RpcClientConfig cc;
+    cc.timeout_ms = 1000;
+    cc.max_retries = 0;
+    lb.apply_client_config(cc);
+    lb.add_endpoint("127.0.0.1", dead_port);
+    lb.add_endpoint("127.0.0.1", live.port());
+
+    const std::string reply = lb.call_async("whoami", "null").get();
+    ASSERT_FALSE(reply.empty());
+    EXPECT_EQ(json::parse(reply).at("who").get<std::string>(), "live");
+
+    std::promise<std::string> got;
+    std::future<std::string> fut = got.get_future();
+    lb.call_async("whoami", "null",
+                  [&got](const std::string& result, libmini::RpcError err,
+                         const std::string&) {
+                      got.set_value(err == libmini::RpcError::OK
+                                        ? result
+                                        : std::string());
+                  });
+    const std::string reply2 = fut.get();
+    ASSERT_FALSE(reply2.empty());
+    EXPECT_EQ(json::parse(reply2).at("who").get<std::string>(), "live");
+
+    // 第三次调用轮询位回到死端点，再次验证 future 形态的切换
+    const std::string reply3 = lb.call_async("whoami", "null").get();
+    ASSERT_FALSE(reply3.empty());
+    EXPECT_EQ(json::parse(reply3).at("who").get<std::string>(), "live");
+
+    libmini::RpcBalancerStats st = lb.stats();
+    EXPECT_EQ(st.total_calls, 3u);
+    EXPECT_EQ(st.total_successes, 3u);
+    EXPECT_EQ(st.failovers, 2u);  // 第 1、3 次先中死端点各切一次；第 2 次轮询直接命中存活端点
+    ASSERT_EQ(st.endpoints.size(), 2u);
+    EXPECT_EQ(st.endpoints[0].attempts, 2u);  // 死端点两次都被先试到
+    EXPECT_EQ(st.endpoints[0].failures, 2u);
+
+    // 移动语义：转移后照常可用，被移出对象为空
+    libmini::RpcLoadBalancer moved = std::move(lb);
+    EXPECT_EQ(moved.endpoint_count(), 2u);
+    EXPECT_EQ(lb.endpoint_count(), 0u);
+    EXPECT_FALSE(moved.call("whoami", "null").empty());
+}
+
 int main(int argc, char** argv)
 {
     ::testing::InitGoogleTest(&argc, argv);

@@ -2797,6 +2797,771 @@ bool uds_connect(int fd, const std::string& path, int timeout_ms)
 
 #endif  // _WIN32
 
+// ==================== 多端点负载均衡 ====================
+
+namespace {
+
+// 允许 failover 的错误口径：与 RpcClient 内部重试一致——连接失败/超时/过载
+// 属「换个端点可能就好了」；SERVER_ERROR/PROTOCOL_ERROR 是业务或协议问题，
+// 换端点同样会失败（或掩盖真实错误），不切换
+bool balancer_failoverable(RpcError err)
+{
+    return err == RpcError::CONNECTION_FAILED || err == RpcError::TIMEOUT ||
+           err == RpcError::OVERLOADED;
+}
+
+// RpcClientConfig 结构体 → 各 setter（RpcClient 新增 setter 时同步这里）
+void apply_client_config_struct(RpcClient& client, const RpcClientConfig& config)
+{
+    client.set_timeout_ms(config.timeout_ms);
+    client.set_max_retries(config.max_retries);
+    client.set_retry_base_delay_ms(config.retry_base_delay_ms);
+    client.set_retry_max_delay_ms(config.retry_max_delay_ms);
+    client.set_retry_max_total_wait_ms(config.retry_max_total_wait_ms);
+    client.set_retry_jitter(config.retry_jitter);
+    client.set_connection_pool_max(config.pool_max);
+    client.set_connection_pool_idle_ms(config.pool_idle_ms);
+    client.set_pipeline_max_in_flight(config.pipeline_max_in_flight);
+}
+
+}  // namespace
+
+bool RpcBalancerConfig::validate() const
+{
+    ConfigWarn w;
+    w.add(unhealthy_threshold < 0, "RpcBalancerConfig.unhealthy_threshold < 0");
+    return w.ok();
+}
+
+struct RpcLoadBalancer::Impl
+{
+    struct Endpoint
+    {
+        std::unique_ptr<RpcClient> client;
+        std::string label;  // endpoint() 快照（构造时定型）
+        RpcTransport transport = RpcTransport::Http;
+        std::uint64_t selected = 0;
+        std::uint64_t attempts = 0;
+        std::uint64_t successes = 0;
+        std::uint64_t failures = 0;
+        std::size_t in_flight = 0;
+        int consecutive_failures = 0;
+        bool healthy = true;
+    };
+
+    // 一次对外调用的故障转移链：链内严格串行（上一步回调结束才发起下一步），
+    // 每步在端点客户端自己的执行器线程上推进，均衡器不占额外线程
+    struct AsyncChain
+    {
+        Impl* impl;                 // 析构排空保证链存活期间 impl 不被释放
+        std::string method;
+        std::string params;
+        std::vector<Endpoint*> order;  // 调用开始时确定的候选顺序
+        std::size_t index = 0;         // 当前尝试在 order 中的位置
+        std::string last_label;        // 最近一次实际发起的端点
+        RpcClient::RpcAsyncCallback callback;  // 最终回调（future 形态包装 promise）
+    };
+
+    mutable std::mutex mutex;  // 保护除 pending_async 外的全部状态；网络调用不持锁
+    std::vector<std::unique_ptr<Endpoint>> endpoints;  // 追加式（不移除，指针稳定）
+    RpcBalancerConfig config;
+    RpcClientConfig client_config;
+    spdlog::logger* logger = nullptr;
+    std::uint64_t rr_counter = 0;
+    RpcError last_error = RpcError::OK;
+    std::string last_message;
+    std::string last_endpoint;
+    std::uint64_t total_calls = 0;
+    std::uint64_t total_successes = 0;
+    std::uint64_t total_failures = 0;
+    std::uint64_t failovers = 0;
+
+    std::mutex async_mutex;  // 仅保护 pending_async（与 mutex 分开，finalize 不嵌套两把锁）
+    std::condition_variable async_cv;
+    std::size_t pending_async = 0;
+
+    // ---- 以下方法调用方须持有 mutex（async_* 内部自行加解锁）----
+
+    // 策略选起点；RoundRobin/LeastInFlight 共用轮询计数打散并列
+    std::size_t pick_start_locked()
+    {
+        const std::size_t n = endpoints.size();
+        if (n == 0) {
+            return 0;
+        }
+        if (config.strategy == RpcBalanceStrategy::Random) {
+            return static_cast<std::size_t>(random_int(0, static_cast<int>(n) - 1));
+        }
+        const std::size_t tie = rr_counter++ % n;
+        if (config.strategy != RpcBalanceStrategy::LeastInFlight) {
+            return tie;
+        }
+        std::size_t best = tie;
+        std::size_t best_load = endpoints[tie]->in_flight;
+        for (std::size_t i = 1; i < n; ++i) {
+            const std::size_t idx = (tie + i) % n;
+            if (endpoints[idx]->in_flight < best_load) {
+                best = idx;
+                best_load = endpoints[idx]->in_flight;
+            }
+        }
+        return best;
+    }
+
+    // 候选顺序：从 start 转一圈，健康端点在前、不健康端点垫底兕底。
+    // 全部不健康时等价于整圈（仍会尝试）；不健康端点被成功调用一次即恢复
+    // 健康——避免「标记后永不重试」的永久剔除
+    std::vector<Endpoint*> build_order_locked(std::size_t start)
+    {
+        const std::size_t n = endpoints.size();
+        std::vector<Endpoint*> order;
+        std::vector<Endpoint*> unhealthy_tail;
+        order.reserve(n);
+        for (std::size_t i = 0; i < n; ++i) {
+            Endpoint* ep = endpoints[(start + i) % n].get();
+            if (ep->healthy) {
+                order.push_back(ep);
+            } else {
+                unhealthy_tail.push_back(ep);
+            }
+        }
+        order.insert(order.end(), unhealthy_tail.begin(), unhealthy_tail.end());
+        return order;
+    }
+
+    // 取第 index 个候选并记账（selected 只记首选）；越界返回 nullptr
+    Endpoint* begin_attempt_locked(const std::vector<Endpoint*>& order, std::size_t index)
+    {
+        if (index >= order.size()) {
+            return nullptr;
+        }
+        Endpoint* ep = order[index];
+        ++ep->attempts;
+        if (index == 0) {
+            ++ep->selected;
+        }
+        ++ep->in_flight;
+        return ep;
+    }
+
+    // 尝试结束记账 + 健康判定
+    void finish_attempt_locked(Endpoint* ep, RpcError err)
+    {
+        if (ep->in_flight > 0) {
+            --ep->in_flight;
+        }
+        if (err == RpcError::OK) {
+            ++ep->successes;
+            ep->consecutive_failures = 0;
+            ep->healthy = true;
+            return;
+        }
+        ++ep->failures;
+        ++ep->consecutive_failures;
+        if (config.unhealthy_threshold > 0 &&
+            ep->consecutive_failures >= config.unhealthy_threshold) {
+            ep->healthy = false;
+        }
+    }
+
+    // 结果/错误自洽兜底：last_error 是客户端级快照，并发下可能读到别的调用
+    // 写入的值——结果非空必成功；结果空但读到 OK 则按连接失败处理（宁可多
+    // 一次 failover，不把失败当成功）。与 RpcClient 同语义的并发 caveat。
+    static void normalize_error(const std::string& result, RpcError* err,
+                                std::string* message)
+    {
+        if (!result.empty()) {
+            *err = RpcError::OK;
+            message->clear();
+        } else if (*err == RpcError::OK) {
+            *err = RpcError::CONNECTION_FAILED;
+            if (message->empty()) {
+                *message = "empty result";
+            }
+        }
+    }
+
+    void async_start(const std::shared_ptr<AsyncChain>& chain);
+    void async_advance(const std::shared_ptr<AsyncChain>& chain, Endpoint* ep, RpcError err,
+                       const std::string& message, const std::string& result);
+    void async_finalize(const std::shared_ptr<AsyncChain>& chain, const std::string& result,
+                        RpcError err, const std::string& message);
+};
+
+void RpcLoadBalancer::Impl::async_start(const std::shared_ptr<AsyncChain>& chain)
+{
+    Endpoint* ep = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        ep = begin_attempt_locked(chain->order, chain->index);
+    }
+    if (!ep) {
+        async_finalize(chain, std::string(), RpcError::CONNECTION_FAILED,
+                       "no endpoints configured");
+        return;
+    }
+    chain->last_label = ep->label;
+    // 回调里可再调 call_async（含本客户端）：链式推进，不占均衡器线程
+    ep->client->call_async(chain->method, chain->params,
+        [chain, ep](const std::string& result, RpcError err, const std::string& message) {
+            RpcError e = err;
+            std::string msg = message;
+            normalize_error(result, &e, &msg);
+            chain->impl->async_advance(chain, ep, e, msg, result);
+        });
+}
+
+void RpcLoadBalancer::Impl::async_advance(const std::shared_ptr<AsyncChain>& chain,
+                                          Endpoint* ep, RpcError err,
+                                          const std::string& message,
+                                          const std::string& result)
+{
+    if (err == RpcError::OK) {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            finish_attempt_locked(ep, RpcError::OK);
+        }
+        async_finalize(chain, result, RpcError::OK, std::string());
+        return;
+    }
+
+    bool switchable = false;
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        finish_attempt_locked(ep, err);
+        switchable = config.failover && balancer_failoverable(err) &&
+                     chain->index + 1 < chain->order.size();
+        if (switchable) {
+            ++failovers;
+            if (logger) {
+                logger->warn("rpc balancer failover {} -> next, method=\"{}\" reason=\"{}\"",
+                             ep->label, chain->method, message);
+            }
+        }
+    }
+    if (!switchable) {
+        async_finalize(chain, std::string(), err, message);
+        return;
+    }
+    ++chain->index;
+    async_start(chain);
+}
+
+void RpcLoadBalancer::Impl::async_finalize(const std::shared_ptr<AsyncChain>& chain,
+                                           const std::string& result, RpcError err,
+                                           const std::string& message)
+{
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        ++total_calls;
+        if (err == RpcError::OK) {
+            ++total_successes;
+        } else {
+            ++total_failures;
+        }
+        last_error = err;
+        last_message = message;
+        last_endpoint = chain->last_label;
+    }
+    RpcClient::RpcAsyncCallback callback = chain->callback;
+    if (callback) {
+        callback(result, err, message);
+    }
+    {
+        std::lock_guard<std::mutex> lock(async_mutex);
+        if (pending_async > 0) {
+            --pending_async;
+        }
+    }
+    async_cv.notify_all();
+}
+
+RpcLoadBalancer::RpcLoadBalancer() : impl_(new Impl())
+{
+}
+
+RpcLoadBalancer::RpcLoadBalancer(const RpcBalancerConfig& config) : RpcLoadBalancer()
+{
+    impl_->config = config;
+    impl_->config.validate();  // 构造不拒绝，仅提前暴露非法项（与 RpcClient 一致）
+}
+
+RpcLoadBalancer::~RpcLoadBalancer()
+{
+    Impl* impl = impl_;
+    if (!impl) {
+        return;
+    }
+    {
+        // 排空在途异步链，保证释放 Impl 时没有回调还会触碰它
+        //（在回调里销毁均衡器会自我等待挂死——文档已声明禁止）
+        std::unique_lock<std::mutex> lock(impl->async_mutex);
+        impl->async_cv.wait(lock, [impl] { return impl->pending_async == 0; });
+    }
+    delete impl;
+    impl_ = nullptr;
+}
+
+RpcLoadBalancer::RpcLoadBalancer(RpcLoadBalancer&& other) noexcept : impl_(other.impl_)
+{
+    other.impl_ = nullptr;
+}
+
+RpcLoadBalancer& RpcLoadBalancer::operator=(RpcLoadBalancer&& other) noexcept
+{
+    if (this == &other) {
+        return *this;
+    }
+    Impl* old = impl_;
+    if (old) {
+        {
+            std::unique_lock<std::mutex> lock(old->async_mutex);
+            old->async_cv.wait(lock, [old] { return old->pending_async == 0; });
+        }
+        delete old;
+    }
+    impl_ = other.impl_;
+    other.impl_ = nullptr;
+    return *this;
+}
+
+void RpcLoadBalancer::add_endpoint(const std::string& host, int port)
+{
+    if (!impl_) {
+        return;
+    }
+    add_endpoint_core(std::unique_ptr<RpcClient>(new RpcClient(host, port)));
+}
+
+void RpcLoadBalancer::add_endpoint(RpcTransport transport, const std::string& endpoint)
+{
+    if (!impl_) {
+        return;
+    }
+    add_endpoint_core(std::unique_ptr<RpcClient>(new RpcClient(transport, endpoint)));
+}
+
+void RpcLoadBalancer::add_endpoint(const std::string& pipe_or_socket_path)
+{
+    if (!impl_) {
+        return;
+    }
+    add_endpoint_core(std::unique_ptr<RpcClient>(new RpcClient(pipe_or_socket_path)));
+}
+
+void RpcLoadBalancer::add_endpoint_core(std::unique_ptr<RpcClient> client)
+{
+    RpcClientConfig cfg;
+    spdlog::logger* log = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        cfg = impl_->client_config;
+        log = impl_->logger;
+    }
+    // 入池前配置：端点在插入前对外不可见，无「未配置即被调用」窗口
+    apply_client_config_struct(*client, cfg);
+    if (log) {
+        client->set_logger(log);
+    }
+    std::unique_ptr<Impl::Endpoint> ep(new Impl::Endpoint());
+    ep->label = client->endpoint();
+    ep->transport = client->transport();
+    ep->client = std::move(client);
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    impl_->endpoints.push_back(std::move(ep));
+}
+
+std::size_t RpcLoadBalancer::endpoint_count() const
+{
+    if (!impl_) {
+        return 0;
+    }
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    return impl_->endpoints.size();
+}
+
+void RpcLoadBalancer::set_strategy(RpcBalanceStrategy strategy)
+{
+    if (!impl_) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    impl_->config.strategy = strategy;
+}
+
+void RpcLoadBalancer::set_failover(bool enable)
+{
+    if (!impl_) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    impl_->config.failover = enable;
+}
+
+void RpcLoadBalancer::set_unhealthy_threshold(int consecutive_failures)
+{
+    if (!impl_) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    impl_->config.unhealthy_threshold = consecutive_failures;
+    // 阈值变化即时重估：调大可能让当前不健康的端点恢复；<=0 = 关闭健康判定
+    for (auto& ep : impl_->endpoints) {
+        ep->healthy = consecutive_failures <= 0 ||
+                     ep->consecutive_failures < consecutive_failures;
+    }
+}
+
+void RpcLoadBalancer::apply_client_config(const RpcClientConfig& config)
+{
+    if (!impl_) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    impl_->client_config = config;
+    for (auto& ep : impl_->endpoints) {
+        apply_client_config_struct(*ep->client, config);
+    }
+}
+
+RpcClientConfig RpcLoadBalancer::client_config() const
+{
+    if (!impl_) {
+        return RpcClientConfig();
+    }
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    return impl_->client_config;
+}
+
+RpcBalancerConfig RpcLoadBalancer::config() const
+{
+    if (!impl_) {
+        return RpcBalancerConfig();
+    }
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    return impl_->config;
+}
+
+void RpcLoadBalancer::apply_config(const ConfigFacade& config,
+                                   const std::string& key_prefix)
+{
+    if (!impl_) {
+        return;
+    }
+    // 每键独立 has() 判断：未提供的键保持当前值；无法识别的键跳过。
+    // 与 RpcClient::apply_config 相同的取值风格，前缀后匹配
+    const std::string p = key_prefix;
+    if (config.has(p + "strategy")) {
+        const std::string v = config.get(p + "strategy");
+        if (v == "round_robin") {
+            set_strategy(RpcBalanceStrategy::RoundRobin);
+        } else if (v == "random") {
+            set_strategy(RpcBalanceStrategy::Random);
+        } else if (v == "least_in_flight") {
+            set_strategy(RpcBalanceStrategy::LeastInFlight);
+        } else {
+            spdlog::logger* log = LogFacade::logger();
+            if (log) {
+                log->warn("rpc config invalid: strategy=\"{}\" "
+                          "(round_robin|random|least_in_flight)",
+                          v);
+            }
+        }
+    }
+    if (config.has(p + "failover")) {
+        set_failover(config.get_bool(p + "failover", true));
+    }
+    if (config.has(p + "unhealthy_threshold")) {
+        set_unhealthy_threshold(config.get_int(p + "unhealthy_threshold", 0));
+    }
+
+    // client.* 键从当前快照出发，只覆盖出现过的键，出现过才整体下发
+    RpcClientConfig client_cfg = client_config();
+    bool has_client_key = false;
+    if (config.has(p + "timeout_ms")) {
+        client_cfg.timeout_ms = config.get_int(p + "timeout_ms", 5000);
+        has_client_key = true;
+    }
+    if (config.has(p + "max_retries")) {
+        client_cfg.max_retries = config.get_int(p + "max_retries", 3);
+        has_client_key = true;
+    }
+    if (config.has(p + "retry_base_delay_ms")) {
+        client_cfg.retry_base_delay_ms = config.get_int(p + "retry_base_delay_ms", 100);
+        has_client_key = true;
+    }
+    if (config.has(p + "retry_max_delay_ms")) {
+        client_cfg.retry_max_delay_ms = config.get_int(p + "retry_max_delay_ms", 4000);
+        has_client_key = true;
+    }
+    if (config.has(p + "retry_max_total_wait_ms")) {
+        client_cfg.retry_max_total_wait_ms =
+            config.get_int(p + "retry_max_total_wait_ms", 10000);
+        has_client_key = true;
+    }
+    if (config.has(p + "retry_jitter")) {
+        client_cfg.retry_jitter = config.get_bool(p + "retry_jitter", false);
+        has_client_key = true;
+    }
+    if (config.has(p + "pool_max")) {
+        client_cfg.pool_max = static_cast<std::size_t>(
+            std::max(0, config.get_int(p + "pool_max", 8)));
+        has_client_key = true;
+    }
+    if (config.has(p + "pool_idle_ms")) {
+        client_cfg.pool_idle_ms = config.get_int(p + "pool_idle_ms", 30000);
+        has_client_key = true;
+    }
+    if (config.has(p + "pipeline_max_in_flight")) {
+        client_cfg.pipeline_max_in_flight = static_cast<std::size_t>(
+            std::max(0, config.get_int(p + "pipeline_max_in_flight", 0)));
+        has_client_key = true;
+    }
+    if (has_client_key) {
+        apply_client_config(client_cfg);
+    }
+
+    // 灌完配置自检一次：须写 this->config()——形参 config（ConfigFacade）
+    // 遮蔽了成员函数名
+    this->config().validate();
+}
+
+void RpcLoadBalancer::set_logger(spdlog::logger* logger)
+{
+    if (!impl_) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    impl_->logger = logger;
+    for (auto& ep : impl_->endpoints) {
+        ep->client->set_logger(logger);
+    }
+}
+
+std::string RpcLoadBalancer::call_core(const std::string& method,
+                                       const std::string& params, int timeout_ms)
+{
+    if (!impl_) {
+        return std::string();
+    }
+
+    std::vector<Impl::Endpoint*> order;
+    {
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        if (impl_->endpoints.empty()) {
+            ++impl_->total_calls;
+            ++impl_->total_failures;
+            impl_->last_error = RpcError::CONNECTION_FAILED;
+            impl_->last_message = "no endpoints configured";
+            impl_->last_endpoint.clear();
+            return std::string();
+        }
+        order = impl_->build_order_locked(impl_->pick_start_locked());
+    }
+
+    const std::size_t max_attempts = impl_->config.failover ? order.size() : 1;
+    RpcError final_err = RpcError::UNKNOWN;
+    std::string final_msg;
+    std::string final_label;
+
+    for (std::size_t idx = 0; idx < max_attempts; ++idx) {
+        Impl::Endpoint* ep = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(impl_->mutex);
+            ep = impl_->begin_attempt_locked(order, idx);
+        }
+        if (!ep) {
+            break;
+        }
+
+        // 网络调用不持锁：其他线程可并发选点/记账
+        std::string result = (timeout_ms > 0)
+                                 ? ep->client->call(method, params, timeout_ms)
+                                 : ep->client->call(method, params);
+        RpcError err = ep->client->last_error();
+        std::string msg = ep->client->last_error_message();
+        Impl::normalize_error(result, &err, &msg);
+
+        bool switchable = false;
+        {
+            std::lock_guard<std::mutex> lock(impl_->mutex);
+            impl_->finish_attempt_locked(ep, err);
+            if (err == RpcError::OK) {
+                ++impl_->total_calls;
+                ++impl_->total_successes;
+                impl_->last_error = RpcError::OK;
+                impl_->last_message.clear();
+                impl_->last_endpoint = ep->label;
+                return result;
+            }
+            final_err = err;
+            final_msg = msg;
+            final_label = ep->label;
+            switchable = impl_->config.failover && balancer_failoverable(err) &&
+                         idx + 1 < order.size();
+            if (switchable) {
+                ++impl_->failovers;
+                if (impl_->logger) {
+                    impl_->logger->warn(
+                        "rpc balancer failover {} -> next, method=\"{}\" reason=\"{}\"",
+                        ep->label, method, msg);
+                }
+            }
+        }
+        if (!switchable) {
+            break;
+        }
+    }
+
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    ++impl_->total_calls;
+    ++impl_->total_failures;
+    impl_->last_error = final_err;
+    impl_->last_message = final_msg;
+    impl_->last_endpoint = final_label;
+    return std::string();
+}
+
+std::string RpcLoadBalancer::call(const std::string& method, const std::string& params)
+{
+    return call_core(method, params, 0);
+}
+
+std::string RpcLoadBalancer::call(const std::string& method, const std::string& params,
+                                  int timeout_ms)
+{
+    return call_core(method, params, timeout_ms);
+}
+
+std::future<std::string> RpcLoadBalancer::call_async(const std::string& method,
+                                                     const std::string& params)
+{
+    std::shared_ptr<std::promise<std::string>> promise(new std::promise<std::string>());
+    std::future<std::string> future = promise->get_future();
+    call_async(method, params,
+               [promise](const std::string& result, RpcError, const std::string&) {
+                   promise->set_value(result);
+               });
+    return future;
+}
+
+void RpcLoadBalancer::call_async(const std::string& method, const std::string& params,
+                                 RpcClient::RpcAsyncCallback callback)
+{
+    if (!impl_) {
+        return;
+    }
+
+    std::shared_ptr<Impl::AsyncChain> chain(new Impl::AsyncChain());
+    chain->impl = impl_;
+    chain->method = method;
+    chain->params = params;
+    chain->callback = std::move(callback);
+
+    {
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        if (impl_->endpoints.empty()) {
+            ++impl_->total_calls;
+            ++impl_->total_failures;
+            impl_->last_error = RpcError::CONNECTION_FAILED;
+            impl_->last_message = "no endpoints configured";
+            impl_->last_endpoint.clear();
+        } else {
+            chain->order = impl_->build_order_locked(impl_->pick_start_locked());
+        }
+    }
+
+    if (chain->order.empty()) {
+        // 无端点：回调在调用线程立即执行（文档已声明），不经内部线程
+        if (chain->callback) {
+            chain->callback(std::string(), RpcError::CONNECTION_FAILED,
+                            "no endpoints configured");
+        }
+        return;
+    }
+
+    {
+        // 先计数再发起：finalize 的递减不会先于首次递增发生
+        std::lock_guard<std::mutex> lock(impl_->async_mutex);
+        ++impl_->pending_async;
+    }
+    impl_->async_start(chain);
+}
+
+RpcError RpcLoadBalancer::last_error() const
+{
+    if (!impl_) {
+        return RpcError::OK;
+    }
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    return impl_->last_error;
+}
+
+std::string RpcLoadBalancer::last_error_message() const
+{
+    if (!impl_) {
+        return std::string();
+    }
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    return impl_->last_message;
+}
+
+std::string RpcLoadBalancer::last_endpoint() const
+{
+    if (!impl_) {
+        return std::string();
+    }
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    return impl_->last_endpoint;
+}
+
+RpcBalancerStats RpcLoadBalancer::stats() const
+{
+    RpcBalancerStats out;
+    if (!impl_) {
+        return out;
+    }
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    out.total_calls = impl_->total_calls;
+    out.total_successes = impl_->total_successes;
+    out.total_failures = impl_->total_failures;
+    out.failovers = impl_->failovers;
+    out.endpoints.reserve(impl_->endpoints.size());
+    for (const auto& ep : impl_->endpoints) {
+        RpcEndpointStats s;
+        s.endpoint = ep->label;
+        s.transport = ep->transport;
+        s.selected = ep->selected;
+        s.attempts = ep->attempts;
+        s.successes = ep->successes;
+        s.failures = ep->failures;
+        s.in_flight = ep->in_flight;
+        s.consecutive_failures = ep->consecutive_failures;
+        s.healthy = ep->healthy;
+        out.endpoints.push_back(std::move(s));
+    }
+    return out;
+}
+
+void RpcLoadBalancer::reset_stats()
+{
+    if (!impl_) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    impl_->total_calls = 0;
+    impl_->total_successes = 0;
+    impl_->total_failures = 0;
+    impl_->failovers = 0;
+    for (auto& ep : impl_->endpoints) {
+        ep->selected = 0;
+        ep->attempts = 0;
+        ep->successes = 0;
+        ep->failures = 0;
+        // consecutive_failures/healthy/in_flight 属运行状态，保留
+    }
+}
+
 struct RpcServer::Impl
 {
     // HTTP/Tcp 监听端口（0 = 自动分配）；本地传输为 -1。

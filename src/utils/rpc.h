@@ -402,6 +402,128 @@ private:
                           int call_timeout_ms = 0);
 };
 
+// ==================== 多端点负载均衡 ====================
+
+// 选点策略（健康优先于策略：不健康端点只作兜底候选）
+enum class RpcBalanceStrategy {
+    RoundRobin,     // 轮询（默认）：按加入顺序循环
+    Random,         // 随机：每次均匀随机选一个端点
+    LeastInFlight,  // 最少在途：选当前未完成调用数最少的端点（并列取轮询位打散）
+};
+
+// 单端点累计统计（自上次 reset_stats() 起计数；in_flight 为实时值不清零）
+struct RpcEndpointStats {
+    std::string endpoint;            // 端点串（"host:port" /管道路径）
+    RpcTransport transport = RpcTransport::Http;
+    std::uint64_t selected = 0;      // 被选为本次调用首选端点的次数
+    std::uint64_t attempts = 0;      // 实际发起的调用次数（含 failover 转入的）
+    std::uint64_t successes = 0;
+    std::uint64_t failures = 0;
+    std::size_t in_flight = 0;       // 当前进行中的调用数（LeastInFlight 依据）
+    int consecutive_failures = 0;    // 连续失败次数（健康判定依据）
+    bool healthy = true;             // 健康标记；false 时仅作兜底候选
+};
+
+// 负载均衡器整体统计
+struct RpcBalancerStats {
+    std::uint64_t total_calls = 0;     // 对外调用次数（每次 call/call_async 计 1，与端点尝试次数无关）
+    std::uint64_t total_successes = 0;
+    std::uint64_t total_failures = 0;
+    std::uint64_t failovers = 0;       // 因失败改用其他端点的切换次数（每次切换计 1）
+    std::vector<RpcEndpointStats> endpoints;
+};
+
+// 负载均衡器配置（apply_config 对应键：strategy / failover / unhealthy_threshold）
+struct LIBMINI_API RpcBalancerConfig {
+    RpcBalanceStrategy strategy = RpcBalanceStrategy::RoundRobin;
+    bool failover = true;           // 可重试失败（连接失败/超时/过载）时自动改用候选中的下一端点
+    int unhealthy_threshold = 0;    // 连续失败达到该值后端点标记不健康（仅兜底候选）；0 = 关闭健康判定
+
+    // 越界项逐条经 LogFacade 记 warn，任一命中返回 false
+    bool validate() const;
+};
+
+// 多端点负载均衡：封装多个 RpcClient，按策略选点 + 可重试失败自动故障转移。
+//
+//   RpcLoadBalancer lb;
+//   lb.add_endpoint("10.0.0.1", 8080);                 // HTTP
+//   lb.add_endpoint(RpcTransport::Tcp, "10.0.0.2:9000");
+//   std::string r = lb.call("add", "[1,2]");
+//
+// 候选顺序在每次调用开始时确定：健康端点在前（按策略选起点转一圈），
+// 不健康端点排在末尾作兜底（全部健康端点失败后才轮到，成功一次即恢复健康）。
+// 可重试失败 = RpcError::CONNECTION_FAILED / TIMEOUT / OVERLOADED（与客户端
+// 重试一致的口径）；SERVER_ERROR/PROTOCOL_ERROR 属业务或协议问题，不切换端点。
+// 端点加入后不移除；计数与健康状态受内部锁保护，可多线程并发调用。
+// failover 发生在端点客户端自身重试（max_retries，指数退避）耗尽之后；
+// 需要更快故障转移时用 apply_client_config 把 max_retries 调小（如 0/1）。
+//
+// 该类不可拷贝，可以移动。不要在异步回调里销毁它（析构等待所有在途异步调用
+// 结束，回调里销毁会自我等待挂死）。
+class LIBMINI_API RpcLoadBalancer {
+public:
+    RpcLoadBalancer();
+    explicit RpcLoadBalancer(const RpcBalancerConfig& config);
+    ~RpcLoadBalancer();
+    RpcLoadBalancer(const RpcLoadBalancer&) = delete;
+    RpcLoadBalancer& operator=(const RpcLoadBalancer&) = delete;
+    RpcLoadBalancer(RpcLoadBalancer&& other) noexcept;
+    RpcLoadBalancer& operator=(RpcLoadBalancer&& other) noexcept;
+
+    // 追加端点（不移除）；与 RpcClient 的三个构造一一对应
+    void add_endpoint(const std::string& host, int port);            // HTTP
+    void add_endpoint(RpcTransport transport, const std::string& endpoint);
+    void add_endpoint(const std::string& pipe_or_socket_path);       // 本地管道/UDS
+    std::size_t endpoint_count() const;
+
+    // 策略与故障转移（批量读快照用 config()）
+    void set_strategy(RpcBalanceStrategy strategy);
+    void set_failover(bool enable);
+    void set_unhealthy_threshold(int consecutive_failures);
+
+    // 端点客户端配置：对所有已有与后续加入的端点生效
+    void apply_client_config(const RpcClientConfig& config);
+    RpcClientConfig client_config() const;
+    RpcBalancerConfig config() const;
+
+    // 从 ConfigFacade 批量应用：strategy/failover/unhealthy_threshold
+    // 三个均衡器键 + RpcClient::apply_config 的全部 client.* 键，灌完自检一次
+    void apply_config(const ConfigFacade& config,
+                      const std::string& key_prefix = std::string());
+
+    // 日志：应用于所有端点客户端；均衡器在发生故障转移时经它写一条 warn
+    void set_logger(spdlog::logger* logger);
+
+    // 同步调用：失败返回空串，错误由 last_error()/last_error_message() 给出
+    std::string call(const std::string& method, const std::string& params);
+    std::string call(const std::string& method, const std::string& params,
+                     int timeout_ms);
+
+    // 异步调用（future 形态，语义同 call；错误详情看 stats()/last_error()）
+    std::future<std::string> call_async(const std::string& method,
+                                        const std::string& params);
+    // 回调形态：错误信息随本次调用独立携带（并发场景推荐）；无端点时回调在
+    // 调用线程立即执行
+    void call_async(const std::string& method, const std::string& params,
+                    RpcClient::RpcAsyncCallback callback);
+
+    // 最近一次完成的调用（与 RpcClient 同语义：并发下反映最后完成的那次）
+    RpcError last_error() const;
+    std::string last_error_message() const;
+    std::string last_endpoint() const;  // 最近一次调用实际发起的端点（成功或最终失败）
+
+    RpcBalancerStats stats() const;
+    void reset_stats();  // 清零累计计数；健康状态与在途数保留
+
+private:
+    struct Impl;
+    Impl* impl_;
+
+    std::string call_core(const std::string& method, const std::string& params,
+                          int timeout_ms);
+    void add_endpoint_core(std::unique_ptr<RpcClient> client);
+};
+
 //
 // 端点与传输（三选一，构造时确定）：
 //   RpcServer(8080)                        → HTTP over TCP（0 = 自动分配端口）
