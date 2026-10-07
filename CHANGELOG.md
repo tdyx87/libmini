@@ -44,6 +44,7 @@
 - Add BLAKE3 hash with keyed/derive modes and XOF output（[ac8d004](https://github.com/tdyx87/libmini/commit/ac8d004388ce7d7e643bb51e0060ab1a4e011335)）
 - Add memory-mapped file module with RAII and dual-mode mapping（[98fa80a](https://github.com/tdyx87/libmini/commit/98fa80ac3730665ddcdedc3ea9071b0dca2c0a7d)）
 - Add WebSocket client and server with RFC 6455 handshake and framing（[7c59ef0](https://github.com/tdyx87/libmini/commit/7c59ef004a3fa3a680a1cec94c60a780a4603440)）
+- Add circuit breaker with closed/open/half-open state machine（[97b7acf](https://github.com/tdyx87/libmini/commit/97b7acf8598aeb8037bd16412eaaf758c83f14a6)）
 
 #### 变更
 
