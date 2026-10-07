@@ -183,6 +183,7 @@ target_link_libraries(app PRIVATE libmini::libmini)
 | base32 | `utils/base32.h` | RFC 4648 Base32 编解码（宽松/严格模式，容空白字符） |
 | console | `utils/console.h` | 控制台退出信号封装：Ctrl+C/Ctrl+Break/SIGTERM 触发回调 + stop_requested 轮询，前台与服务模式共用清理逻辑 |
 | tcp | `utils/tcp.h` | 裸 TCP 长连接：帧协议（免粘包）、心跳保活（配置校验 validate）、大帧完整性、服务端多连接/广播，零第三方依赖 |
+| websocket | `utils/websocket.h` | WebSocket 客户端/服务端（RFC 6455，与浏览器互通）：HTTP Upgrade 握手（Sec-WebSocket-Key/Accept）、掩码帧、分片重组、PING/PONG/CLOSE 自动应答、广播与多连接，零第三方依赖 |
 | retry | `utils/retry.h` | poll_until 指数退避轮询（抖动防风暴、deadline 变体） |
 | object_pool | `utils/object_pool.h` | 线程安全对象池：RAII Lease 借出归还、工厂创建、归还重置钩子 |
 | zip | `utils/zip.h` | ZIP 包读写（zlib deflate/store，UTF-8 文件名，CRC 校验），零新增依赖 |
@@ -623,6 +624,19 @@ TcpClient client(cfg);
 client.set_on_message([](const std::string& msg) { handle(msg); });
 client.connect("127.0.0.1", 9000);
 client.send(payload);                       // 单帧上限 max_frame_bytes（默认 16MB）
+
+// WebSocket（RFC 6455，浏览器互通；见 utils/websocket.h）
+WsServer ws_server;
+ws_server.set_on_message([&ws_server](std::uint64_t conn, const std::string& msg) {
+    ws_server.send(conn, "echo:" + msg);    // 或 broadcast()
+});
+ws_server.start("127.0.0.1", 9001);          // on_connect 在 Upgrade 握手成功后触发
+
+WsClient ws;
+ws.set_on_message([](const std::string& msg) { handle(msg); });
+ws.connect("127.0.0.1", 9001, "/chat");     // 同步握手，成功才返回 true
+ws.send("hello");                           // 文本帧；send_binary() 二进制帧
+ws.close();                                  // 走 CLOSE 帧握手优雅断开
 
 // 指数退避轮询（见 utils/retry.h）：等服务就绪/等文件出现
 bool ok = poll_until([&] { return file_exists(flag_path); },

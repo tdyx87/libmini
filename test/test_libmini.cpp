@@ -1932,6 +1932,204 @@ TEST(TcpTest, HeartbeatDetectsDeadPeer)
     server.stop();
 }
 
+// ---------------- WebSocket：RFC 6455 ----------------
+
+TEST(WebSocketTest, EchoRoundTripUtf8)
+{
+    libmini::WsServer server;
+    server.set_on_message([&server](std::uint64_t conn, const std::string& msg) {
+        server.send(conn, "echo:" + msg);
+    });
+    ASSERT_TRUE(server.start("127.0.0.1", 0));
+    ASSERT_GT(server.port(), 0);
+
+    libmini::WsClient ws;
+    std::string got;
+    ws.set_on_message([&](const std::string& msg) { got = msg; });
+    ASSERT_TRUE(ws.connect("127.0.0.1", server.port(), "/chat"));
+    ASSERT_TRUE(ws.is_connected());
+    ASSERT_TRUE(ws.send("hello 中文"));
+
+    for (int i = 0; i < 200 && got.empty(); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    EXPECT_EQ(got, "echo:hello 中文");
+
+    ws.close();
+    server.stop();
+}
+
+TEST(WebSocketTest, LargeBinaryPayload)
+{
+    libmini::WsServer server;
+    std::string server_got;
+    server.set_on_message([&](std::uint64_t, const std::string& msg) {
+        server_got = msg;
+    });
+    ASSERT_TRUE(server.start("127.0.0.1", 0));
+
+    libmini::WsClient ws;
+    ASSERT_TRUE(ws.connect("127.0.0.1", server.port()));
+
+    // 256KB 二进制：验证 64 位长度域（>125 且 >65535）与掩码往返
+    std::string payload;
+    payload.reserve(256 * 1024);
+    for (int i = 0; i < 256 * 1024; ++i) {
+        payload.push_back(static_cast<char>(i & 0xff));
+    }
+    ASSERT_TRUE(ws.send_binary(payload));
+
+    for (int i = 0; i < 300 && server_got.size() != payload.size(); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    EXPECT_EQ(server_got, payload);
+
+    ws.close();
+    server.stop();
+}
+
+TEST(WebSocketTest, HandshakeRejectsPlainHttpServer)
+{
+    // 对面是 HTTP 服务器（不会回 101 + 正确 Accept）：握手必须失败
+    libmini::HttpServer http;
+    http.get("/", [](const libmini::HttpRequest&) {
+        return libmini::HttpReply::text(200, "ok");
+    });
+    ASSERT_TRUE(http.start_background(0));
+    ASSERT_TRUE(http.wait_until_ready());
+
+    libmini::WsClient ws;
+    libmini::WsConfig cfg;
+    cfg.handshake_timeout_ms = 1500;
+    libmini::WsClient timed(cfg);
+    EXPECT_FALSE(timed.connect("127.0.0.1",
+                               static_cast<std::uint16_t>(http.port())));
+    EXPECT_FALSE(timed.is_connected());
+    ws.close();
+    http.stop();
+}
+
+TEST(WebSocketTest, CloseHandshakeFiresDisconnectCallbacks)
+{
+    libmini::WsServer server;
+    std::atomic<int> server_conn{0};
+    std::atomic<int> server_disc{0};
+    std::uint64_t cid = 0;
+    server.set_on_connect([&](std::uint64_t id) {
+        cid = id;
+        ++server_conn;
+    });
+    server.set_on_disconnect([&](std::uint64_t, const std::string&) {
+        ++server_disc;
+    });
+    ASSERT_TRUE(server.start("127.0.0.1", 0));
+
+    libmini::WsClient ws;
+    std::atomic<int> client_disc{0};
+    std::string reason;
+    ws.set_on_disconnect([&](const std::string& r) {
+        ++client_disc;
+        reason = r;
+    });
+    ASSERT_TRUE(ws.connect("127.0.0.1", server.port()));
+    for (int i = 0; i < 200 && server_conn.load() == 0; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    EXPECT_EQ(server_conn.load(), 1);
+    EXPECT_EQ(server.connection_count(), 1u);
+
+    // 客户端主动 close：应走 CLOSE 帧握手，服务端感知断开
+    ws.close();
+    for (int i = 0; i < 200 && server_disc.load() == 0; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    EXPECT_EQ(server_disc.load(), 1);
+    EXPECT_EQ(client_disc.load(), 1);
+    EXPECT_EQ(reason, "closed");
+    EXPECT_FALSE(ws.is_connected());
+
+    // 服务端主动 disconnect：客户端收到 CLOSE 后触发断连回调
+    libmini::WsClient c2;
+    std::atomic<int> c2_disc{0};
+    c2.set_on_disconnect([&](const std::string&) { ++c2_disc; });
+    ASSERT_TRUE(c2.connect("127.0.0.1", server.port()));
+    for (int i = 0; i < 200 && server_conn.load() < 2; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    ASSERT_EQ(server_conn.load(), 2);
+    server.disconnect(cid);
+    for (int i = 0; i < 200 && c2_disc.load() == 0; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    EXPECT_EQ(c2_disc.load(), 1);
+
+    c2.close();
+    server.stop();
+}
+
+TEST(WebSocketTest, BroadcastToMultipleClients)
+{
+    libmini::WsServer server;
+    ASSERT_TRUE(server.start("127.0.0.1", 0));
+
+    constexpr int kClients = 4;
+    std::vector<std::unique_ptr<libmini::WsClient>> clients;
+    std::atomic<int> received{0};
+    for (int i = 0; i < kClients; ++i) {
+        auto c = std::make_unique<libmini::WsClient>();
+        c->set_on_message([&](const std::string& msg) {
+            if (msg == "news") {
+                ++received;
+            }
+        });
+        ASSERT_TRUE(c->connect("127.0.0.1", server.port()));
+        clients.push_back(std::move(c));
+    }
+    // 等全部完成 Upgrade（on_connect 在握手后触发）
+    for (int i = 0; i < 200 &&
+                    server.connection_count() != kClients; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    EXPECT_EQ(server.connection_count(),
+              static_cast<std::size_t>(kClients));
+
+    server.broadcast("news");
+    for (int i = 0; i < 200 && received.load() < kClients; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    EXPECT_EQ(received.load(), kClients);
+
+    for (auto& c : clients) {
+        c->close();
+    }
+    server.stop();
+}
+
+TEST(WebSocketTest, MessageLimitEnforcedAndConfigValidate)
+{
+    libmini::WsConfig cfg;
+    cfg.max_message_bytes = 1024;
+    libmini::WsServer server(cfg);
+    ASSERT_TRUE(server.start("127.0.0.1", 0));
+
+    libmini::WsClient ws(cfg);
+    ASSERT_TRUE(ws.connect("127.0.0.1", server.port()));
+    // 超限消息在发送侧直接拒绝
+    EXPECT_FALSE(ws.send(std::string(2048, 'x')));
+    EXPECT_TRUE(ws.send(std::string(1024, 'x')));
+
+    // 非法配置：两端都拒绝启动/连接
+    libmini::WsConfig bad;
+    bad.max_message_bytes = 0;
+    libmini::WsServer bad_server(bad);
+    EXPECT_FALSE(bad_server.start("127.0.0.1", 0));
+    libmini::WsClient bad_client(bad);
+    EXPECT_FALSE(bad_client.connect("127.0.0.1", server.port()));
+
+    ws.close();
+    server.stop();
+}
+
 // ---------------- 日历运算 ----------------
 
 TEST(CalendarTest, DaysInMonthAndLeapYears)
