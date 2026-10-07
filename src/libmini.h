@@ -40,6 +40,7 @@
 #include "utils/csv.h"
 #include "utils/glob.h"
 #include "utils/file_lock.h"
+#include "utils/mmap_file.h"
 #include "utils/dir_watcher.h"
 #include "utils/win_service.h"
 #include "utils/tcp.h"

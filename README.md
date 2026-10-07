@@ -175,6 +175,7 @@ target_link_libraries(app PRIVATE libmini::libmini)
 | args | `utils/args.h` | 命令行解析：--key=value、flag、位置参数、自动 usage |
 | file_lock | `utils/file_lock.h` | 跨进程文件锁：独占/共享（读多写少）双模式，try_lock / 超时等待 / RAII Guard |
 | dir_watcher | `utils/dir_watcher.h` | 目录变化监听（创建/修改/删除/重命名，支持子树），ReadDirectoryChangesW |
+| mmap_file | `utils/mmap_file.h` | 内存映射文件（RAII，只读/读写双模式，CreateFileMapping/MapViewOfFile 与 mmap 双实现）：大文件随机访问零拷贝，flush 提供断电级落盘 |
 | win_service | `utils/win_service.h` | Windows 服务封装：ServiceControl（安装/卸载/启停/查询）+ ServiceApp（一体化入口 + PAUSE/CONTINUE 支持） |
 | hmac | `utils/hmac.h` | HMAC-SHA256 / HMAC-MD5（RFC 2104，增量与一次性 API，云服务签名请求） |
 | process | `utils/process.h` | 子进程执行：捕获 stdout/退出码、超时强杀、stdin 输入、UTF-8 命令行（CreateProcessW / fork+exec） |
@@ -273,6 +274,17 @@ watcher.set_callback([](const WatchNotification& n) {
 });
 watcher.start("config", /*watch_subtree=*/true);
 // ... watcher.stop(); 之后可再次 start()
+
+// 内存映射：大文件零拷贝随机访问（RAII，析构自动解除映射）
+MappedFile mf;
+if (mf.open("big.bin")) {
+    const char* p = mf.data();               // 视图起点，长度 mf.size()
+    use(p[4096]);                            // 随机访问直接下标
+}
+MappedFile rw;
+rw.open("journal.log", MapMode::ReadWrite);
+rw.data()[0] = 'x';                          // 直接改页缓存，立即可见
+rw.flush();                                 // 需要断电持久性时显式刷盘
 ```
 
 ### Windows 服务

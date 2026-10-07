@@ -1238,6 +1238,146 @@ TEST(FileUtilsExtensionTest, UniqueTempDirectoryInCustomDir)
     remove_tree(base);
 }
 
+// -------------------------------- mmap_file -------------------------------
+
+TEST(MappedFileTest, ReadOnlyViewMatchesReadFile)
+{
+    using namespace libmini;
+    const std::string path = unique_temp_path("mmap_ro_");
+    std::string content = "line1\n";
+    content.push_back('\0');
+    content.push_back('\x01');
+    content += "binary";
+    content.push_back('\xff');
+    content += "中文";
+    ASSERT_TRUE(write_file(path, content));
+
+    MappedFile mf;
+    ASSERT_TRUE(mf.open(path));
+    EXPECT_TRUE(mf.is_open());
+    EXPECT_EQ(mf.size(), content.size());
+    ASSERT_TRUE(mf.data() != nullptr);
+    EXPECT_EQ(std::string(mf.data(), mf.size()), content);
+    EXPECT_EQ(std::string(mf.data(), mf.size()), read_file(path));
+
+    // 只读映射 flush 按契约返回 false
+    EXPECT_FALSE(mf.flush());
+
+    mf.close();
+    EXPECT_FALSE(mf.is_open());
+    EXPECT_EQ(mf.size(), 0u);
+    EXPECT_TRUE(mf.data() == nullptr);
+    mf.close();  // 幂等
+}
+
+TEST(MappedFileTest, ReadWriteModifyAndFlush)
+{
+    using namespace libmini;
+    const std::string path = unique_temp_path("mmap_rw_");
+    ASSERT_TRUE(write_file(path, "abcdef"));
+
+    MappedFile mf;
+    ASSERT_TRUE(mf.open(path, MapMode::ReadWrite));
+    ASSERT_TRUE(mf.data() != nullptr);
+    EXPECT_EQ(std::string(mf.data(), mf.size()), "abcdef");
+
+    // 直接改页缓存
+    mf.data()[0] = 'z';
+    EXPECT_TRUE(mf.flush());
+    // 改动应立即对其他映射读者可见（仍是同一份页缓存）。
+    // 不直接用 read_file 验证：它在 Windows 上以 FILE_SHARE_READ 打开，
+    // 与写句柄冲突，那属于 read_file 的共享模式限制而非映射问题
+    MappedFile reader;
+    ASSERT_TRUE(reader.open(path));
+    EXPECT_EQ(std::string(reader.data(), reader.size()), "zbcdef");
+    reader.close();
+
+    mf.close();
+    // 解除映射后改动仍在（已刷盘）
+    EXPECT_EQ(read_file(path), "zbcdef");
+    EXPECT_TRUE(remove_file(path));
+}
+
+TEST(MappedFileTest, OpenFailureCases)
+{
+    using namespace libmini;
+    MappedFile mf;
+
+    // 不存在的文件
+    EXPECT_FALSE(mf.open("mmap_missing_9x7.tmp"));
+    EXPECT_FALSE(mf.is_open());
+    EXPECT_TRUE(mf.data() == nullptr);
+    EXPECT_EQ(mf.size(), 0u);
+
+    // 不是普通文件（目录）
+#ifdef _WIN32
+    EXPECT_FALSE(mf.open("."));
+#else
+    // POSIX 下 /dev/null 不是普通文件，应被 S_ISREG 拦下
+    EXPECT_FALSE(mf.open("/dev/null"));
+#endif
+    EXPECT_FALSE(mf.is_open());
+}
+
+TEST(MappedFileTest, EmptyFileOpensWithoutView)
+{
+    using namespace libmini;
+    const std::string path = unique_temp_path("mmap_empty_");
+    ASSERT_TRUE(write_file(path, ""));
+
+    MappedFile mf;
+    ASSERT_TRUE(mf.open(path));
+    EXPECT_TRUE(mf.is_open());
+    EXPECT_EQ(mf.size(), 0u);
+    // 无图：非 const data() 为 nullptr，const 版本为非空空串
+    EXPECT_TRUE(mf.data() == nullptr);
+    ASSERT_TRUE(static_cast<const MappedFile&>(mf).data() != nullptr);
+    EXPECT_EQ(std::string(static_cast<const MappedFile&>(mf).data()), "");
+    // 空文件没有视图可刷
+    EXPECT_FALSE(mf.flush());
+
+    mf.close();
+    EXPECT_TRUE(remove_file(path));
+}
+
+TEST(MappedFileTest, MoveSemanticsAndReopen)
+{
+    using namespace libmini;
+    const std::string path1 = unique_temp_path("mmap_mv1_");
+    const std::string path2 = unique_temp_path("mmap_mv2_");
+    ASSERT_TRUE(write_file(path1, "first"));
+    ASSERT_TRUE(write_file(path2, "second!"));
+
+    // 移动构造：资源随之转移，源回到未打开状态
+    MappedFile a;
+    ASSERT_TRUE(a.open(path1));
+    MappedFile b(std::move(a));
+    EXPECT_TRUE(b.is_open());
+    EXPECT_EQ(b.size(), 5u);
+    EXPECT_FALSE(a.is_open());
+    EXPECT_TRUE(a.data() == nullptr);
+    EXPECT_EQ(std::string(b.data(), b.size()), "first");
+
+    // 对已打开对象再 open：先自动 close 旧文件
+    ASSERT_TRUE(b.open(path2));
+    EXPECT_EQ(b.size(), 7u);
+    EXPECT_EQ(std::string(b.data(), b.size()), "second!");
+
+    // 移动赋值：目标先释放旧资源
+    MappedFile c;
+    ASSERT_TRUE(c.open(path1));
+    c = std::move(b);
+    EXPECT_TRUE(c.is_open());
+    EXPECT_EQ(c.size(), 7u);
+    EXPECT_FALSE(b.is_open());
+    EXPECT_EQ(std::string(c.data(), c.size()), "second!");
+    c.close();
+    b.close();  // 幂等
+
+    EXPECT_TRUE(remove_file(path1));
+    EXPECT_TRUE(remove_file(path2));
+}
+
 // ------------------------------- format 辅助 ------------------------------
 
 TEST(FormatHelpersTest, FormatBytes)

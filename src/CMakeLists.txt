@@ -6,6 +6,7 @@ set(LIBMINI_SOURCES
     utils/stopwatch.cpp
     utils/file_utils.cpp
     utils/file_lock.cpp
+    utils/mmap_file.cpp
     utils/dir_watcher.cpp
     utils/win_service.cpp
     utils/path_utils.cpp
