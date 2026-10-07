@@ -56,6 +56,7 @@
 - Teach the changelog tool to freeze a release and feed the release page（[c52962e](https://github.com/tdyx87/libmini/commit/c52962e0237ff9d80f7e0ee816433ad5adb1f970)）
 - Use std::chrono::steady_clock in unique_temp_directory to avoid clock_gettime POSIX macro/link issues on macOS/Ubuntu（[6a1ed14](https://github.com/tdyx87/libmini/commit/6a1ed1426e9eec1b0c64ae1d96b5319e8e3fff05)）
 - Skip symlink tests when create_symlink fails (sandbox may forbid symlinks)（[5dd33b0](https://github.com/tdyx87/libmini/commit/5dd33b04c9e8fb21e48f63edfc565a2969967122)）
+- Find OpenSSL in package config for TLS-enabled builds（[293bee4](https://github.com/tdyx87/libmini/commit/293bee469764362252d135b534974ed9912c7f7e)）
 
 #### 修复
 
