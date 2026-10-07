@@ -185,6 +185,7 @@ target_link_libraries(app PRIVATE libmini::libmini)
 | tcp | `utils/tcp.h` | 裸 TCP 长连接：帧协议（免粘包）、心跳保活（配置校验 validate）、大帧完整性、服务端多连接/广播，零第三方依赖 |
 | websocket | `utils/websocket.h` | WebSocket 客户端/服务端（RFC 6455，与浏览器互通）：HTTP Upgrade 握手（Sec-WebSocket-Key/Accept）、掩码帧、分片重组、PING/PONG/CLOSE 自动应答、广播与多连接，零第三方依赖 |
 | retry | `utils/retry.h` | poll_until 指数退避轮询（抖动防风暴、deadline 变体） |
+| circuit_breaker | `utils/circuit_breaker.h` | 熔断器三态（Closed/Open/HalfOpen）：连续失败熔断、冷却后限量探测、execute 一体化（含异常记录）、状态转移回调、累计统计，线程安全 |
 | object_pool | `utils/object_pool.h` | 线程安全对象池：RAII Lease 借出归还、工厂创建、归还重置钩子 |
 | zip | `utils/zip.h` | ZIP 包读写（zlib deflate/store，UTF-8 文件名，CRC 校验），零新增依赖 |
 | tar | `utils/tar.h` | tar（ustar）读写：文件/目录/符号链接，prefix 拆支持 255 字节长路径，头部 checksum 校验，零新增依赖 |
@@ -641,6 +642,17 @@ ws.close();                                  // 走 CLOSE 帧握手优雅断开
 // 指数退避轮询（见 utils/retry.h）：等服务就绪/等文件出现
 bool ok = poll_until([&] { return file_exists(flag_path); },
                      /*max_attempts=*/10, /*base_delay_ms=*/100);
+
+// 熔断器（见 utils/circuit_breaker.h）：弱依赖连续失败后快速失败，
+// 冷却 30s 放少量探测试探恢复，避免打爆下游
+CircuitBreaker breaker;                     // 5 次连续失败熔断 30s
+CircuitOutcome r = breaker.execute([&] { return ping_downstream(); });
+if (r == CircuitOutcome::Rejected) {        // 熔断中：走降级
+    use_fallback();
+}
+breaker.set_on_state_change([](CircuitState from, CircuitState to) {
+    log_state(from, to);                    // 转移回调（锁外触发，可重入）
+});
 
 // CRC 家族（均支持增量）
 Crc16Modbus crc16; crc16.update(frame);     // Modbus RTU

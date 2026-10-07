@@ -49,6 +49,7 @@ set(LIBMINI_SOURCES
     utils/config_facade.cpp
     utils/net_addr.cpp
     utils/websocket.cpp
+    utils/circuit_breaker.cpp
     utils/timer_wheel.cpp
 )
 

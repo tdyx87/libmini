@@ -1609,6 +1609,211 @@ TEST(RetryTest, DeadlineVariant)
     EXPECT_TRUE(ok2);
 }
 
+// ---------------- 熔断器 ----------------
+
+TEST(CircuitBreakerTest, OpensAfterConsecutiveFailures)
+{
+    libmini::CircuitBreakerConfig cfg;
+    cfg.failure_threshold = 3;
+    cfg.open_duration_ms = 60000;  // 测试内不冷却
+    libmini::CircuitBreaker cb(cfg);
+    EXPECT_EQ(cb.state(), libmini::CircuitState::Closed);
+
+    // 连续失败不足阈值：保持 Closed，成功清零连续计数
+    EXPECT_TRUE(cb.allow());
+    cb.record_failure();
+    EXPECT_TRUE(cb.allow());
+    cb.record_failure();
+    EXPECT_TRUE(cb.allow());
+    cb.record_success();
+    EXPECT_EQ(cb.state(), libmini::CircuitState::Closed);
+
+    // 重新累计到阈值 → Open，后续 allow 立即拒绝（快速失败）
+    EXPECT_TRUE(cb.allow());
+    cb.record_failure();
+    EXPECT_TRUE(cb.allow());
+    cb.record_failure();
+    EXPECT_TRUE(cb.allow());
+    cb.record_failure();
+    EXPECT_EQ(cb.state(), libmini::CircuitState::Open);
+    EXPECT_FALSE(cb.allow());
+    EXPECT_FALSE(cb.allow());
+
+    const libmini::CircuitBreakerStats st = cb.stats();
+    EXPECT_EQ(st.failures, 5u);
+    EXPECT_EQ(st.rejected, 2u);
+    EXPECT_EQ(st.state_changes, 1u);
+}
+
+TEST(CircuitBreakerTest, HalfOpenAfterCooldownThenCloseOnSuccess)
+{
+    libmini::CircuitBreakerConfig cfg;
+    cfg.failure_threshold = 1;
+    cfg.open_duration_ms = 80;
+    cfg.success_threshold = 2;
+    libmini::CircuitBreaker cb(cfg);
+
+    EXPECT_TRUE(cb.allow());
+    cb.record_failure();
+    ASSERT_EQ(cb.state(), libmini::CircuitState::Open);
+    EXPECT_FALSE(cb.allow());
+
+    // 冷却到点：state()/allow() 惰性推进到 HalfOpen
+    std::this_thread::sleep_for(std::chrono::milliseconds(120));
+    EXPECT_EQ(cb.state(), libmini::CircuitState::HalfOpen);
+
+    // HalfOpen 放行探测，连续成功达阈值 → Closed
+    EXPECT_TRUE(cb.allow());
+    cb.record_success();
+    EXPECT_EQ(cb.state(), libmini::CircuitState::HalfOpen);
+    EXPECT_TRUE(cb.allow());
+    cb.record_success();
+    EXPECT_EQ(cb.state(), libmini::CircuitState::Closed);
+    EXPECT_TRUE(cb.allow());
+}
+
+TEST(CircuitBreakerTest, HalfOpenProbeFailureReopens)
+{
+    libmini::CircuitBreakerConfig cfg;
+    cfg.failure_threshold = 1;
+    cfg.open_duration_ms = 60;
+    libmini::CircuitBreaker cb(cfg);
+
+    EXPECT_TRUE(cb.allow());
+    cb.record_failure();
+    ASSERT_EQ(cb.state(), libmini::CircuitState::Open);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    ASSERT_EQ(cb.state(), libmini::CircuitState::HalfOpen);
+
+    // 探测失败：立即回 Open 重新冷却
+    EXPECT_TRUE(cb.allow());
+    cb.record_failure();
+    EXPECT_EQ(cb.state(), libmini::CircuitState::Open);
+    EXPECT_FALSE(cb.allow());
+
+    // 再次冷却后又能探测（失败不永久锁死）
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    EXPECT_EQ(cb.state(), libmini::CircuitState::HalfOpen);
+    EXPECT_TRUE(cb.allow());
+}
+
+TEST(CircuitBreakerTest, HalfOpenConcurrentProbeLimit)
+{
+    libmini::CircuitBreakerConfig cfg;
+    cfg.failure_threshold = 1;
+    cfg.open_duration_ms = 40;
+    cfg.half_open_max_calls = 2;
+    libmini::CircuitBreaker cb(cfg);
+
+    EXPECT_TRUE(cb.allow());
+    cb.record_failure();
+    std::this_thread::sleep_for(std::chrono::milliseconds(80));
+    ASSERT_EQ(cb.state(), libmini::CircuitState::HalfOpen);
+
+    // 名额 2：前两个放行，第三个拒绝
+    EXPECT_TRUE(cb.allow());
+    EXPECT_TRUE(cb.allow());
+    EXPECT_FALSE(cb.allow());
+
+    // 归结一个结果释放名额
+    cb.record_success();
+    EXPECT_TRUE(cb.allow());
+}
+
+TEST(CircuitBreakerTest, ExecuteOutcomesAndExceptionRecords)
+{
+    libmini::CircuitBreakerConfig cfg;
+    cfg.failure_threshold = 1;
+    cfg.open_duration_ms = 60000;
+    libmini::CircuitBreaker cb(cfg);
+
+    // 成功与失败自动记录
+    EXPECT_EQ(cb.execute([]() { return true; }),
+              libmini::CircuitOutcome::Success);
+    EXPECT_EQ(cb.execute([]() { return false; }),
+              libmini::CircuitOutcome::Failure);
+    ASSERT_EQ(cb.state(), libmini::CircuitState::Open);
+
+    // 熔断中：Rejected 且 call 不执行
+    bool called = false;
+    EXPECT_EQ(cb.execute([&]() {
+        called = true;
+        return true;
+    }), libmini::CircuitOutcome::Rejected);
+    EXPECT_FALSE(called);
+
+    // 异常路径：记录失败后原样上抛（failure_threshold=1，故先 reset）
+    cb.reset();
+    ASSERT_EQ(cb.state(), libmini::CircuitState::Closed);
+    EXPECT_THROW(cb.execute([]() -> bool { throw std::runtime_error("boom"); }),
+                 std::runtime_error);
+    EXPECT_EQ(cb.state(), libmini::CircuitState::Open);  // 异常也计入失败
+}
+
+TEST(CircuitBreakerTest, StateChangeCallbackAndReset)
+{
+    libmini::CircuitBreakerConfig cfg;
+    cfg.failure_threshold = 1;
+    cfg.open_duration_ms = 50;
+    libmini::CircuitBreaker cb(cfg);
+
+    std::vector<std::pair<int, int>> transitions;
+    cb.set_on_state_change([&](libmini::CircuitState from,
+                               libmini::CircuitState to) {
+        transitions.emplace_back(static_cast<int>(from),
+                                 static_cast<int>(to));
+        // 回调内重入是安全的（锁外触发）
+        (void)cb.state();
+    });
+
+    EXPECT_TRUE(cb.allow());
+    cb.record_failure();  // Closed → Open（0→1）
+    std::this_thread::sleep_for(std::chrono::milliseconds(90));
+    (void)cb.state();      // Open → HalfOpen 惰性转移（1→2）
+    EXPECT_TRUE(cb.allow());
+    cb.record_success();   // success_threshold 默认 2：HalfOpen → 不转移
+    EXPECT_EQ(transitions.size(), 2u);
+    EXPECT_EQ(transitions[0], std::make_pair(0, 1));
+    EXPECT_EQ(transitions[1], std::make_pair(1, 2));
+
+    // reset：回到 Closed 并触发转移，累计统计保留
+    const std::uint64_t allowed_before = cb.stats().allowed;
+    cb.reset();
+    EXPECT_EQ(cb.state(), libmini::CircuitState::Closed);
+    EXPECT_EQ(transitions.back(), std::make_pair(2, 0));
+    EXPECT_EQ(cb.stats().allowed, allowed_before);
+    EXPECT_EQ(cb.stats().state_changes, 3u);
+
+    // reset_stats 清零累计、状态不变
+    cb.reset_stats();
+    const libmini::CircuitBreakerStats st = cb.stats();
+    EXPECT_EQ(st.allowed, 0u);
+    EXPECT_EQ(st.state_changes, 0u);
+    EXPECT_EQ(cb.state(), libmini::CircuitState::Closed);
+}
+
+TEST(CircuitBreakerTest, ConfigValidateRejectsInvalid)
+{
+    libmini::CircuitBreakerConfig good;
+    EXPECT_TRUE(good.validate());
+
+    libmini::CircuitBreakerConfig bad;
+    bad.failure_threshold = 0;
+    bad.open_duration_ms = -1;
+    bad.half_open_max_calls = 0;
+    bad.success_threshold = -2;
+    EXPECT_FALSE(bad.validate());
+
+    // 非法配置构造后仍可用（兜底：阈值按 1 处理、冷却按 0 处理，不除零不卡死）
+    libmini::CircuitBreaker cb(bad);
+    EXPECT_TRUE(cb.allow());
+    cb.record_failure();
+    // 阈值兜底为 1：一次失败即熔断；冷却兜底为 0，查询即转 HalfOpen 探测
+    EXPECT_NE(cb.state(), libmini::CircuitState::Closed);
+    EXPECT_TRUE(cb.allow());  // HalfOpen 放行探测，不会负等待卡死
+}
+
 // ---------------- CRC 家族：CRC16/Modbus、CRC64、Adler-32 ----------------
 
 TEST(CrcFamilyTest, Crc16ModbusCheckValue)

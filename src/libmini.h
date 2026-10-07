@@ -46,6 +46,7 @@
 #include "utils/tcp.h"
 #include "utils/websocket.h"
 #include "utils/retry.h"
+#include "utils/circuit_breaker.h"
 #include "utils/zip.h"
 #include "utils/tar.h"
 #include "utils/object_pool.h"
