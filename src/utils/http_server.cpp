@@ -12,6 +12,7 @@
 #include <httplib.h>
 
 #include "config_facade.h"
+#include "json_utils.h"  // /readyz 响应组装
 
 namespace libmini {
 
@@ -210,6 +211,18 @@ public:
     std::vector<HttpFilter> filters;            // 前置过滤器（按注册顺序）
     HttpAccessLogger access_logger;             // 访问日志钩子
 
+    // ------- 健康检查状态（运行期可读写，health_mu 保护） -------
+    HttpHandler liveness;                       // 空 = 默认 200 "ok"
+    struct ReadinessEntry {
+        std::string name;
+        HealthCheck check;
+    };
+    std::vector<ReadinessEntry> readiness;      // 注册顺序保序
+    std::mutex health_mu;
+    std::vector<std::string> get_routes;        // 已注册 GET/HEAD 路由（内建端点去重）
+    bool healthz_registered = false;            // enable_health_endpoints 幂等
+    bool readyz_registered = false;
+
     Impl()
     {
         bind_error_handlers();
@@ -375,6 +388,9 @@ void HttpServer::route(const std::string& method, const std::string& pattern,
                        HttpHandler handler)
 {
     httplib::Server::Handler h = impl_->wrap(std::move(handler));
+    if (method == "GET" || method == "HEAD") {
+        impl_->get_routes.push_back(pattern);  // 内建健康端点「显式优先」的判据
+    }
     if (method == "GET") {
         impl_->svr.Get(pattern, h);
     } else if (method == "POST") {
@@ -426,6 +442,114 @@ void HttpServer::use(HttpFilter filter)
 void HttpServer::set_access_logger(HttpAccessLogger logger)
 {
     impl_->access_logger = std::move(logger);
+}
+
+// ---------------- 健康检查 ----------------
+
+void HttpServer::set_liveness_handler(HttpHandler handler)
+{
+    std::lock_guard<std::mutex> lock(impl_->health_mu);
+    impl_->liveness = std::move(handler);
+}
+
+void HttpServer::add_readiness_check(const std::string& name, HealthCheck check)
+{
+    std::lock_guard<std::mutex> lock(impl_->health_mu);
+    for (std::size_t i = 0; i < impl_->readiness.size(); ++i) {
+        if (impl_->readiness[i].name == name) {
+            impl_->readiness[i].check = std::move(check);  // 重名覆盖，位置保序
+            return;
+        }
+    }
+    Impl::ReadinessEntry entry;
+    entry.name = name;
+    entry.check = std::move(check);
+    impl_->readiness.push_back(std::move(entry));
+}
+
+void HttpServer::clear_readiness_checks()
+{
+    std::lock_guard<std::mutex> lock(impl_->health_mu);
+    impl_->readiness.clear();
+}
+
+void HttpServer::enable_health_endpoints()
+{
+    // 显式路由优先：同路径 GET 已注册时不接管内建版
+    const bool have_healthz =
+        std::find(impl_->get_routes.begin(), impl_->get_routes.end(),
+                  "/healthz") != impl_->get_routes.end();
+    if (!impl_->healthz_registered && !have_healthz) {
+        impl_->svr.Get("/healthz",
+                       [this](const httplib::Request&, httplib::Response& res) {
+            HttpHandler handler;
+            {
+                std::lock_guard<std::mutex> lock(impl_->health_mu);
+                handler = impl_->liveness;
+            }
+            if (handler) {
+                HttpRequest hreq;  // 探针无业务上下文：只给 method/path
+                hreq.method = "GET";
+                hreq.path = "/healthz";
+                apply_reply(handler(hreq), res);
+            } else {
+                apply_reply(HttpReply::text(200, "ok"), res);
+            }
+        });
+        impl_->healthz_registered = true;
+    }
+
+    const bool have_readyz =
+        std::find(impl_->get_routes.begin(), impl_->get_routes.end(),
+                  "/readyz") != impl_->get_routes.end();
+    if (!impl_->readyz_registered && !have_readyz) {
+        impl_->svr.Get("/readyz",
+                       [this](const httplib::Request&, httplib::Response& res) {
+            std::vector<Impl::ReadinessEntry> checks;
+            {
+                std::lock_guard<std::mutex> lock(impl_->health_mu);
+                // 锁外执行回调：检查里可再注册新检查，不自锁；也不阻塞其它探针
+                checks = impl_->readiness;
+            }
+            JsonValue arr = JsonValue::array();
+            bool all_ok = true;
+            for (std::size_t i = 0; i < checks.size(); ++i) {
+                std::string detail;
+                const std::chrono::steady_clock::time_point t0 =
+                    std::chrono::steady_clock::now();
+                if (checks[i].check) {
+                    try {
+                        detail = checks[i].check();
+                    } catch (const std::exception& e) {
+                        detail = e.what();
+                    } catch (...) {
+                        detail = "health check threw";
+                    }
+                }
+                const std::int64_t elapsed_ms =
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - t0)
+                        .count();
+                const bool ok = detail.empty();
+                if (!ok) {
+                    all_ok = false;
+                }
+                JsonValue item;
+                item["name"] = checks[i].name;
+                item["status"] = ok ? "ok" : "fail";
+                item["detail"] = detail;
+                item["elapsed_ms"] = elapsed_ms;
+                arr.push_back(item);
+            }
+            JsonValue doc;
+            doc["status"] = all_ok ? "ok" : "unavailable";
+            doc["checks"] = arr;
+            apply_reply(HttpReply::json(all_ok ? 200 : 503,
+                                        to_json_string(doc)),
+                        res);
+        });
+        impl_->readyz_registered = true;
+    }
 }
 
 // ---------------- 生命周期 ----------------

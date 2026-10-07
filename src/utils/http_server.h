@@ -59,6 +59,10 @@ typedef std::function<void(const HttpRequest&, const HttpReply&,
                            std::int64_t elapsed_ms)>
     HttpAccessLogger;
 
+// 就绪检查回调：返回空串 = 通过；返回文本 = 失败原因（写进 /readyz 响应体）。
+// 在 /readyz 的请求线程上执行——必须快速、线程安全，别在里面做阻塞 IO
+typedef std::function<std::string()> HealthCheck;
+
 // HTTP 服务器（基于 cpp-httplib 的一等公民封装，与 HttpClient 对称）：
 //
 //   HttpServer server;
@@ -103,6 +107,28 @@ public:
 
     // 访问日志钩子（每次请求收尾时回调一次）
     void set_access_logger(HttpAccessLogger logger);
+
+    // ---------------- 健康检查 ----------------
+
+    // 自定义存活处理器（默认：恒 200 text "ok"）。运行期可安全切换——
+    // 返回 503 即让负载均衡/K8s 摘流量（优雅停机前翻转）；读写内部加锁
+    void set_liveness_handler(HttpHandler handler);
+
+    // 注册就绪检查（保序输出；同名覆盖旧的，可在运行期增改）。回调逐个
+    // 执行（全部跑、不短路——一次看全所有失败原因），抛异常按失败处理
+    void add_readiness_check(const std::string& name, HealthCheck check);
+
+    // 清空全部就绪检查（未注册任何检查时 /readyz 恒 200 = 视为就绪）
+    void clear_readiness_checks();
+
+    // 注册内建探针端点（可重复调用，幂等；已存在同路径 GET 路由时不注册，
+    // 显式路由优先）。两个端点都绕过 use() 过滤器（探针不带业务鉴权头）：
+    //   GET /healthz —— 存活：默认 200 "ok"，set_liveness_handler 可自定义
+    //   GET /readyz  —— 就绪：执行全部就绪检查，响应为 JSON：
+    //       200 {"status":"ok","checks":[{"name":..,"status":"ok",
+    //            "detail":"","elapsed_ms":..}, ...]}
+    //       503 {"status":"unavailable", ...}  任一检查失败即 503
+    void enable_health_endpoints();
 
     // ---------------- 生命周期 ----------------
 

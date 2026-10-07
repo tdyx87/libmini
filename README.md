@@ -197,7 +197,7 @@ target_link_libraries(app PRIVATE libmini::libmini)
 | hardware_info | `utils/hardware_info.h` | 硬件清单：CPU 型号与拓扑、网卡（MAC/IPv4/IPv6）、物理磁盘（型号/序列号/总线）、卷（盘符/文件系统/标识）、主板与 BIOS |
 | machine_fingerprint | `utils/machine_fingerprint.h` | 机器指纹（许可证绑定 / 席位去重）：主板序列号 + CPU 型号 + 物理网卡 MAC（+ 物理盘序列号）经占位符过滤与虚拟网卡排除后派生 SHA-256 标识；`FingerprintPolicy` 三档控制易变信号是否参与，`confidence` 标可信度，`signals` 暴露归一化中间层供跨版本迁移 |
 | http_client | `utils/http_client.h` | HttpClient：GET/POST/PUT/DELETE/通用方法、query 编码拼装、默认头、超时、重定向；headers 键统一小写；status=0 表示传输层错误 |
-| http_server | `utils/http_server.h` | HttpServer：路径参数（`:name`）/query 解析、前置过滤器、fallback、访问日志钩子、请求体上限、apply_config（port/max_body_bytes） |
+| http_server | `utils/http_server.h` | HttpServer：路径参数（`:name`）/query 解析、前置过滤器、fallback、访问日志钩子、请求体上限、健康检查（/healthz 存活 + /readyz 就绪检查 JSON，探针绕过过滤器、显式路由优先、存活可运行期翻转）、apply_config（port/max_body_bytes） |
 | log_facade | `utils/log_facade.h` | LogFacade：一行初始化 spdlog（控制台+滚动文件、级别、格式、可选异步），运行期调级，幂等 init/shutdown |
 | config_facade | `utils/config_facade.h` | 分层配置门面：默认值 → 文件（JSON/INI 按扩展名）→ 环境变量三层合并，键路径取值（get_int/get_bool/...），source_of 查来源 |
 | net_addr | `utils/net_addr.h` | socket 地址工具：端点解析（host:port / 纯端口 / IPv6 括号）、域名解析（IPv4 优先）、IPv4 格式化往返；RPC/TCP 统一使用 |
@@ -876,6 +876,14 @@ server.use([](const HttpRequest& req, HttpReply& reply) {   // 前置过滤器
 });
 server.set_access_logger([](const HttpRequest& rq, const HttpReply& rp,
                             std::int64_t ms) { /* 方法/路径/状态/耗时 */ });
+
+server.enable_health_endpoints();               // GET /healthz（存活）+ GET /readyz（就绪）
+std::atomic<bool> ready(true);
+server.add_readiness_check("upstream", [&ready] {   // 全过 → 200；任一失败 → 503
+    return ready ? "" : "upstream unavailable";     // 非空串 = 失败原因（进响应体）
+});
+// server.set_liveness_handler(...) 可运行期翻转 /healthz 为 503（停机前摘流量）
+
 server.start_background(8080);                              // 或 0 自动分配
 server.wait_until_ready();
 server.stop();

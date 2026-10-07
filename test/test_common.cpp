@@ -3791,6 +3791,170 @@ TEST(HttpServerTest, ApplyConfigPortFromEnv)
     env_remove("LT_HTTPSRV_PORT");
 }
 
+// 内建探针端点：默认形态 + 绕过 use() 过滤器（探针不带业务鉴权头）
+TEST(HttpServerTest, EnableHealthEndpointsAndBypassFilters)
+{
+    using namespace libmini;
+    HttpServer server;
+    server.get("/biz", [](const HttpRequest&) {
+        return HttpReply::text(200, "biz");
+    });
+    // 业务路由全被鉴权过滤器挡住；探针端点不应受影响
+    server.use([](const HttpRequest&, HttpReply& reply) {
+        reply = HttpReply::error(401, "unauthorized");
+        return false;
+    });
+    server.enable_health_endpoints();
+    ASSERT_TRUE(server.start_background(0));
+    ASSERT_TRUE(server.wait_until_ready());
+
+    HttpClient probe("127.0.0.1", server.port());
+    const HttpResponse h = probe.get("/healthz");
+    EXPECT_EQ(h.status, 200);
+    EXPECT_EQ(h.body, "ok");
+
+    // 无就绪检查 = 视为就绪；checks 为空数组
+    const HttpResponse r = probe.get("/readyz");
+    EXPECT_EQ(r.status, 200);
+    const JsonValue doc = parse_json(r.body);
+    EXPECT_EQ(doc.at("status").get<std::string>(), "ok");
+    EXPECT_TRUE(doc.at("checks").empty());
+
+    // 业务路由仍受过滤器保护
+    const HttpResponse b = probe.get("/biz");
+    EXPECT_EQ(b.status, 401);
+
+    server.stop();
+}
+
+// 就绪检查：全过 200 / 任一失败 503（含异常转失败）、保序、重名覆盖、
+// 运行期增改与清空（回调读写有锁，安全）
+TEST(HttpServerTest, ReadinessChecksPassFailOrderAndOverride)
+{
+    using namespace libmini;
+    HttpServer server;
+    std::atomic<bool> db_ok(true);
+    server.add_readiness_check("db", [&db_ok]() {
+        return db_ok ? std::string() : std::string("connection refused");
+    });
+    server.add_readiness_check("cache", []() { return std::string(); });
+    server.enable_health_endpoints();
+    ASSERT_TRUE(server.start_background(0));
+    ASSERT_TRUE(server.wait_until_ready());
+
+    HttpClient c("127.0.0.1", server.port());
+
+    // 全部通过：200 + 每项 ok，注册顺序保序
+    HttpResponse r = c.get("/readyz");
+    EXPECT_EQ(r.status, 200);
+    JsonValue doc = parse_json(r.body);
+    EXPECT_EQ(doc.at("status").get<std::string>(), "ok");
+    const JsonValue& checks = doc.at("checks");
+    ASSERT_EQ(checks.size(), 2u);
+    EXPECT_EQ(checks[0].at("name").get<std::string>(), "db");
+    EXPECT_EQ(checks[0].at("status").get<std::string>(), "ok");
+    EXPECT_EQ(checks[1].at("name").get<std::string>(), "cache");
+    EXPECT_GE(checks[0].at("elapsed_ms").get<std::int64_t>(), 0);
+
+    // 单个失败 → 整体 503，原因进响应体
+    db_ok = false;
+    r = c.get("/readyz");
+    EXPECT_EQ(r.status, 503);
+    doc = parse_json(r.body);
+    EXPECT_EQ(doc.at("status").get<std::string>(), "unavailable");
+    ASSERT_EQ(doc.at("checks").size(), 2u);
+    EXPECT_EQ(doc.at("checks")[0].at("status").get<std::string>(), "fail");
+    EXPECT_EQ(doc.at("checks")[0].at("detail").get<std::string>(),
+              "connection refused");
+    db_ok = true;
+
+    // 运行期追加：检查抛异常 → 按失败处理（503 + e.what()）
+    server.add_readiness_check("boom", []() -> std::string {
+        throw std::runtime_error("kaboom");
+    });
+    r = c.get("/readyz");
+    EXPECT_EQ(r.status, 503);
+    doc = parse_json(r.body);
+    ASSERT_EQ(doc.at("checks").size(), 3u);
+    EXPECT_EQ(doc.at("checks")[2].at("name").get<std::string>(), "boom");
+    EXPECT_EQ(doc.at("checks")[2].at("status").get<std::string>(), "fail");
+    EXPECT_NE(doc.at("checks")[2].at("detail").get<std::string>().find(
+                  "kaboom"),
+              std::string::npos);
+
+    // 重名覆盖不增行；清空后回到 200 空检查
+    server.clear_readiness_checks();
+    server.add_readiness_check("db", []() { return std::string(); });
+    server.add_readiness_check("db", []() { return std::string("down"); });
+    r = c.get("/readyz");
+    EXPECT_EQ(r.status, 503);
+    doc = parse_json(r.body);
+    ASSERT_EQ(doc.at("checks").size(), 1u);
+    EXPECT_EQ(doc.at("checks")[0].at("detail").get<std::string>(), "down");
+
+    server.clear_readiness_checks();
+    r = c.get("/readyz");
+    EXPECT_EQ(r.status, 200);
+
+    server.stop();
+}
+
+// 存活处理器可运行期翻转：503 剡流量后仍能恢复，且不影响 /readyz
+TEST(HttpServerTest, LivenessHandlerFlipsIndependentlyOfReadiness)
+{
+    using namespace libmini;
+    HttpServer server;
+    server.enable_health_endpoints();
+    ASSERT_TRUE(server.start_background(0));
+    ASSERT_TRUE(server.wait_until_ready());
+
+    HttpClient c("127.0.0.1", server.port());
+    EXPECT_EQ(c.get("/healthz").body, "ok");  // 默认形态
+
+    // 优雅停机前翻转：摘流量
+    server.set_liveness_handler([](const HttpRequest&) {
+        return HttpReply::text(503, "draining");
+    });
+    HttpResponse h = c.get("/healthz");
+    EXPECT_EQ(h.status, 503);
+    EXPECT_EQ(h.body, "draining");
+    // 存活与就绪独立：readyz 仍是 200
+    EXPECT_EQ(c.get("/readyz").status, 200);
+
+    // 恢复期：换回 200（运行期切换，锁保护无竞态）
+    server.set_liveness_handler([](const HttpRequest&) {
+        return HttpReply::text(200, "back");
+    });
+    h = c.get("/healthz");
+    EXPECT_EQ(h.status, 200);
+    EXPECT_EQ(h.body, "back");
+
+    server.stop();
+}
+
+// 显式路由优先：先注册的 GET /healthz 不被内建版接管
+TEST(HttpServerTest, ExplicitRouteWinsOverBuiltinHealthEndpoint)
+{
+    using namespace libmini;
+    HttpServer server;
+    server.get("/healthz", [](const HttpRequest&) {
+        return HttpReply::text(200, "custom-probe");
+    });
+    server.enable_health_endpoints();  // 检测到已有 GET → 不注册内建 /healthz
+    ASSERT_TRUE(server.start_background(0));
+    ASSERT_TRUE(server.wait_until_ready());
+
+    HttpClient c("127.0.0.1", server.port());
+    EXPECT_EQ(c.get("/healthz").body, "custom-probe");
+    EXPECT_EQ(c.get("/readyz").status, 200);  // 内建 /readyz 照常注册
+
+    // 重复 enable 幂等：不重复注册也不报错
+    server.enable_health_endpoints();
+    EXPECT_EQ(c.get("/healthz").body, "custom-probe");
+
+    server.stop();
+}
+
 int main(int argc, char** argv)
 {
     ::testing::InitGoogleTest(&argc, argv);
