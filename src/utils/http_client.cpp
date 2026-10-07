@@ -97,6 +97,18 @@ struct HttpClient::Impl
     int timeout_ms = 5000;
     bool follow_location = false;
 
+    // 连接目标（set_client_cert 重建底层客户端时用）
+    std::string host;
+    int port = 0;
+    bool is_https = false;
+    bool usable = false;  // 目标可解析（base_url 解析成功/直连构造）
+
+    // TLS 配置：仅 https 生效，重建后仍然生效
+    std::string ca_cert_path;
+    std::string client_cert_path;
+    std::string client_key_path;
+    bool verify_server = true;
+
     void apply_common()
     {
         const time_t sec = timeout_ms / 1000;
@@ -114,13 +126,56 @@ struct HttpClient::Impl
             headers.emplace(kv.first, kv.second);
         }
     }
+
+    // CA/校验开关是运行期可改的，直接施加到现有客户端
+    void apply_tls()
+    {
+#ifdef CPPHTTPLIB_OPENSSL_SUPPORT
+        if (client && is_https) {
+            if (!ca_cert_path.empty()) {
+                client->set_ca_cert_path(ca_cert_path);
+            }
+            client->enable_server_certificate_verification(verify_server);
+        }
+#endif
+    }
+
+    // 按当前目标与 TLS 配置（重）建底层客户端。https 在未启用 SSL 的构建里
+    // 不创建客户端——client 保持空，请求时统一报 "SSL unavailable"
+    void build()
+    {
+        client.reset();
+        if (!usable) {
+            return;
+        }
+        if (is_https) {
+#ifdef CPPHTTPLIB_OPENSSL_SUPPORT
+            // 万能构造器按 scheme 选 SSLClient；客户端证书在构造期绑定
+            const std::string url =
+                "https://" + host + ":" + std::to_string(port);
+            if (!client_cert_path.empty()) {
+                client.reset(new httplib::Client(url, client_cert_path,
+                                                 client_key_path));
+            } else {
+                client.reset(new httplib::Client(url));
+            }
+            apply_tls();
+            apply_common();
+#endif
+            return;
+        }
+        client.reset(new httplib::Client(host, port));
+        apply_common();
+    }
 };
 
 HttpClient::HttpClient(const std::string& host, int port)
     : impl_(new Impl)
 {
-    impl_->client.reset(new httplib::Client(host, port));
-    impl_->apply_common();
+    impl_->host = host;
+    impl_->port = port;
+    impl_->usable = true;
+    impl_->build();
 }
 
 HttpClient::HttpClient(const std::string& base_url) : impl_(new Impl)
@@ -128,24 +183,17 @@ HttpClient::HttpClient(const std::string& base_url) : impl_(new Impl)
     std::string host;
     int port = 0;
     bool is_https = false;
+
     if (!parse_base_url(base_url, host, port, is_https)) {
-        impl_->client.reset();  // 延迟到请求时报告错误
+        impl_->usable = false;  // 延迟到请求时报告错误
+        impl_->build();
         return;
     }
-    if (is_https) {
-#ifdef CPPHTTPLIB_OPENSSL_SUPPORT
-        impl_->client.reset(new httplib::Client(host, port, nullptr,
-                                                "https"));
-#else
-        // 未启用 SSL：client 置空，请求时统一报错
-        impl_->client.reset();
-        return;
-#endif
-    }
-    if (!impl_->client) {
-        impl_->client.reset(new httplib::Client(host, port));
-    }
-    impl_->apply_common();
+    impl_->host = host;
+    impl_->port = port;
+    impl_->is_https = is_https;
+    impl_->usable = true;
+    impl_->build();
 }
 
 HttpClient::~HttpClient()
@@ -178,6 +226,26 @@ void HttpClient::set_follow_location(bool follow)
     if (impl_->client) {
         impl_->client->set_follow_location(follow);
     }
+}
+
+void HttpClient::set_ca_cert_path(const std::string& ca_cert_path)
+{
+    impl_->ca_cert_path = ca_cert_path;
+    impl_->apply_tls();
+}
+
+void HttpClient::set_verify_server(bool enable)
+{
+    impl_->verify_server = enable;
+    impl_->apply_tls();
+}
+
+void HttpClient::set_client_cert(const std::string& cert_path,
+                                 const std::string& key_path)
+{
+    impl_->client_cert_path = cert_path;
+    impl_->client_key_path = key_path;
+    impl_->build();  // httplib 构造期绑定客户端证书 → 重建
 }
 
 std::string HttpClient::build_query(

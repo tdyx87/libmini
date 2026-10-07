@@ -196,8 +196,8 @@ target_link_libraries(app PRIVATE libmini::libmini)
 | system_info | `utils/system_info.h` | 主机名/PID/可执行文件路径/CPU 数/物理内存/磁盘容量与剩余 |
 | hardware_info | `utils/hardware_info.h` | 硬件清单：CPU 型号与拓扑、网卡（MAC/IPv4/IPv6）、物理磁盘（型号/序列号/总线）、卷（盘符/文件系统/标识）、主板与 BIOS |
 | machine_fingerprint | `utils/machine_fingerprint.h` | 机器指纹（许可证绑定 / 席位去重）：主板序列号 + CPU 型号 + 物理网卡 MAC（+ 物理盘序列号）经占位符过滤与虚拟网卡排除后派生 SHA-256 标识；`FingerprintPolicy` 三档控制易变信号是否参与，`confidence` 标可信度，`signals` 暴露归一化中间层供跨版本迁移 |
-| http_client | `utils/http_client.h` | HttpClient：GET/POST/PUT/DELETE/通用方法、query 编码拼装、默认头、超时、重定向；headers 键统一小写；status=0 表示传输层错误 |
-| http_server | `utils/http_server.h` | HttpServer：路径参数（`:name`）/query 解析、前置过滤器、fallback、访问日志钩子、请求体上限、健康检查（/healthz 存活 + /readyz 就绪检查 JSON，探针绕过过滤器、显式路由优先、存活可运行期翻转）、apply_config（port/max_body_bytes） |
+| http_client | `utils/http_client.h` | HttpClient：GET/POST/PUT/DELETE/通用方法、query 编码拼装、默认头、超时、重定向；headers 键统一小写；status=0 表示传输层错误；TLS（https 基址自动切换，自定义 CA / 服务端校验开关 / 客户端证书） |
+| http_server | `utils/http_server.h` | HttpServer：路径参数（`:name`）/query 解析、前置过滤器、fallback、访问日志钩子、请求体上限、健康检查（/healthz 存活 + /readyz 就绪检查 JSON，探针绕过过滤器、显式路由优先、存活可运行期翻转）、apply_config（port/max_body_bytes）；TLS（set_ssl_certificates，首次 start 前生效，证书无效拒绝启动） |
 | log_facade | `utils/log_facade.h` | LogFacade：一行初始化 spdlog（控制台+滚动文件、级别、格式、可选异步），运行期调级，幂等 init/shutdown |
 | config_facade | `utils/config_facade.h` | 分层配置门面：默认值 → 文件（JSON/INI 按扩展名）→ 环境变量三层合并，键路径取值（get_int/get_bool/...），source_of 查来源 |
 | net_addr | `utils/net_addr.h` | socket 地址工具：端点解析（host:port / 纯端口 / IPv6 括号）、域名解析（IPv4 优先）、IPv4 格式化往返；RPC/TCP 统一使用 |
@@ -859,6 +859,12 @@ HttpResponse r = c.get("/items", {{"page", "1"}});   // query 自动编码拼装
 if (r.ok()) { use(r.body); }                          // 2xx；r.headers 键统一小写
 
 HttpResponse p = c.post_json("/items", R"({"name":"x"})");
+
+// TLS（基址为 https 时自动走 SSL；编译时检测到 OpenSSL 才可用）
+HttpClient s("https://api.example.com");
+s.set_ca_cert_path("certs/ca.pem");   // 自定义 CA / 私有 PKI
+s.set_verify_server(true);            // false = 跳过服务端证书校验（默认开）
+s.set_client_cert("certs/cli.pem", "certs/cli.key");  // 双向 TLS 客户端证书
 ```
 
 ### HTTP 服务器
@@ -883,6 +889,9 @@ server.add_readiness_check("upstream", [&ready] {   // 全过 → 200；任一�
     return ready ? "" : "upstream unavailable";     // 非空串 = 失败原因（进响应体）
 });
 // server.set_liveness_handler(...) 可运行期翻转 /healthz 为 503（停机前摘流量）
+
+server.set_ssl_certificates("certs/srv.pem", "certs/srv.key");  // TLS：首次 start 前设置
+// 证书/私钥无效 → start 失败并给出错误，不降级明文；启动后再改会报错拒绝
 
 server.start_background(8080);                              // 或 0 自动分配
 server.wait_until_ready();

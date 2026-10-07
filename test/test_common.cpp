@@ -3955,6 +3955,160 @@ TEST(HttpServerTest, ExplicitRouteWinsOverBuiltinHealthEndpoint)
     server.stop();
 }
 
+// ------------------------------- TLS / HTTPS -------------------------------
+
+// 自签测试证书（仅供单测，无保密价值，到期 2126）：
+// CN=libmini-test，SAN=IP:127.0.0.1 + DNS:localhost + DNS:127.0.0.1。
+// DNS:127.0.0.1 不是笔误：httplib 的 IP-SAN 匹配分支在 MinGW 下被
+// __MINGW32__ 排除，只能靠 dNSName 命中；POSIX 走 IP-SAN 分支
+namespace {
+
+const char kTlsTestCertPem[] = R"pem(-----BEGIN CERTIFICATE-----
+MIIDODCCAiCgAwIBAgIUHWtxYg6wBZGIs5QSsJtNydlw/p0wDQYJKoZIhvcNAQEL
+BQAwFzEVMBMGA1UEAwwMbGlibWluaS10ZXN0MCAXDTI2MTAwNzA1MTUzM1oYDzIx
+MjYwOTEzMDUxNTMzWjAXMRUwEwYDVQQDDAxsaWJtaW5pLXRlc3QwggEiMA0GCSqG
+SIb3DQEBAQUAA4IBDwAwggEKAoIBAQDv55Jwia4CNW1OBtcxkxqeJYU+fJdglpM6
+Qx3XJptEnD72PhGJeNHSZ3CUZVSFGhEKNpH0uR7wMBdKFR/ALSKOSzrLQMabrrNY
+2zkWrH5ZsYKNFsip7gS7Yg/d7gfjEQGWAfhQC8ceo860Xf1EkzcxlRJEoLvD7DJp
+eHGUi4Oy8ONWyJkJvFbRidn88TD6Gflem0zwEPfjLcr+W/d90SmGEhxdL2L32G3u
+21po890Z/otCtxZm6Vx5T9su+o5/acH1R4dt+0vTZy2BJo1lXekBn2kAk6qsHc3V
+Lt8qnZvx14HQAdvKJ/HD3adQ6xcVgv7SRlwaRlUeIJ1gJKSNc6k9AgMBAAGjejB4
+MB0GA1UdDgQWBBTeYG554CuNl26cxxgOuy8CGRtwlTAfBgNVHSMEGDAWgBTeYG55
+4CuNl26cxxgOuy8CGRtwlTAPBgNVHRMBAf8EBTADAQH/MCUGA1UdEQQeMByHBH8A
+AAGCCWxvY2FsaG9zdIIJMTI3LjAuMC4xMA0GCSqGSIb3DQEBCwUAA4IBAQC+Ms3U
+rd76MXmO+pI6PDRefkOd4sa1OWQjKq6qcP66OTWRSC/xN0pbZLDx0oFCF0JSdxbC
+nVVXRY7ATq2HBzvMMTczNVbGwi7hxer04be/jkmMgKRezopHkyTLsGsANh6UoXy4
+j1P87qpk/UqsAZrhgcd6cnLLJnwrgoT9idV+A6/0aCMzeHUnBRlwK6sIQfKs2gw2
+qgkFASjT7FFYnCYwq4Zn9/HcrcKXDcJNb03UIY0kLHLm/yUwxeH+sT5PhiLgaQpb
+do2LR0X3dc80q1KdXI6gyy9awvGFizzvxKmQV3uvBPo1acgEh6ILcpk3NHkiijVm
+fIDofFt5Ty4Tveiu
+-----END CERTIFICATE-----
+)pem";
+
+const char kTlsTestKeyPem[] = R"pem(-----BEGIN PRIVATE KEY-----
+MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQDv55Jwia4CNW1O
+BtcxkxqeJYU+fJdglpM6Qx3XJptEnD72PhGJeNHSZ3CUZVSFGhEKNpH0uR7wMBdK
+FR/ALSKOSzrLQMabrrNY2zkWrH5ZsYKNFsip7gS7Yg/d7gfjEQGWAfhQC8ceo860
+Xf1EkzcxlRJEoLvD7DJpeHGUi4Oy8ONWyJkJvFbRidn88TD6Gflem0zwEPfjLcr+
+W/d90SmGEhxdL2L32G3u21po890Z/otCtxZm6Vx5T9su+o5/acH1R4dt+0vTZy2B
+Jo1lXekBn2kAk6qsHc3VLt8qnZvx14HQAdvKJ/HD3adQ6xcVgv7SRlwaRlUeIJ1g
+JKSNc6k9AgMBAAECggEAapT7HjxMrnaGBTBM0p2EKdaJh+Vaa3L6HdxLmZZxTN4N
+quCQcf7XWR7TiVorXqbiAyOTXKIR+Kuk7SjNXlevDoClsj8o/Wl0DHn4tvYTfE28
+rmn85GH2gDlkyzhBEMQxbC+b3hQddqNX5hILvzeYQdL0tsCiKrz4+Jql+1SwQgKf
+Bl+etqiauWEFf74VuOp1HUAU3l6NCLNOGv4vqlc0T7IxWR3LBtvEujst47RkiWr1
+7N6mU7g5LxWo2WFF1cj6blNWBiK9UQHUw7pHLjWC5wJM7mB9wh+zDBZf07XtGhav
+JpirUp/78eYxFkdi7qEkn+QxOMM7RnirCZGbwCQ7kQKBgQD6oaADRbjJuxgXHaI9
+HB6/RYLoNI5ZnZwQaEPJqo2Jfwh8ffx40x7efdeOnyjdx9DyjqmL418tg60P3w+N
+vHfE8lbt9NsY2++UTIosZHxqg5/AqbE71S/gh0HwNsxO1M8UjAv00hbsCDEfXdK0
+XR50cHlw/87Q5eb9k4Bq2JHdlwKBgQD1CyAHe/4NcIQhMMzY3ZfI0bC612el+wGv
+NNAFzCt5s8Tbzps6Ag7itKWcUashqnVZMDtfzAmGXLp2xdK+KI+U6lc4tV1dLCip
+grIolkaG26UYoVOAk8cW4HcLoe1cBnS0DP3wb5RAxDOOaqr/UCYw+L3SH+EGcBw1
+iDsXeJnySwKBgCn6olOJ/Q6E8N8GTqNPr3K4ENoV23X1KSuyWxBPKc/K4EAB1iTi
+r7vydgVkcTLcggnujUVp+wojkPwkj3VdCO6K7LaEmaILTJCZVVdkKVap3zsk8ROl
+fJRt80Rp2USm7lxxrJsACWjVYmzviRg+tJgqMp0Tq69fopX8e7jpt1zXAoGAFt8b
+9Tbghpaa7pIkfJVqRmc0DKxwUzCzfov6YqAk6q4Z0L5fBLIOe6CK2KVSyMilPVbg
+I9fih7T9/noGapNUm3yn+XYMKdcmUHQPdvRXztyPc1YTeivQ6FS5J8/MXMuJdwjD
+Zv6zIrxtZ3yTS1NKzUVaSlOJaFVsfJ6jjVRHYjMCgYEAy9zCb63ga6+q+lYeiND4
+Ij+YEozadKehcVikwZJomoccq1gjrKPUau9JCi6uWOvXspB7JKEI0GCExcgZjP23
+UXC7QJQviwZlhEoOYAa4exbSG3Ponrxfc3fsTCDCiAazIbMAz7Au1y8Po7smWSbN
+gjdIxtoN9KuvYay1n0baK5k=
+-----END PRIVATE KEY-----
+)pem";
+
+// 把 PEM 写到临时文件（OpenSSL 不关心扩展名）；失败返回空串
+std::string write_tls_fixture(const char* prefix, const char* pem)
+{
+    const std::string path = libmini::unique_temp_path(prefix);
+    if (!libmini::write_file(path, pem)) {
+        return std::string();
+    }
+    return path;
+}
+
+}  // namespace
+
+// TLS 配置错误必须优雅失败（两种构建下都返回 false + 明确原因，不崩）
+TEST(HttpsTlsTest, BadCertificatesFailStartGracefully)
+{
+    using namespace libmini;
+    HttpServer server;
+    server.set_ssl_certificates("no/such/cert.pem", "no/such/key.pem");
+    EXPECT_FALSE(server.start_background(0));
+    EXPECT_FALSE(server.last_error().empty());
+    EXPECT_FALSE(server.is_running());
+    server.stop();  // 未启动的 stop 幂等无害
+}
+
+// 未启用 OpenSSL 的构建：https 请求与 TLS 服务端都给出明确错误，不静默
+TEST(HttpsTlsTest, HttpsWithoutSslBuildReportsClearError)
+{
+#ifdef LIBMINI_SSL_SUPPORT
+    GTEST_SKIP() << "SSL enabled; covered by HttpsRoundTrip test";
+#else
+    using namespace libmini;
+    HttpClient c("https://127.0.0.1:1");
+    const HttpResponse r = c.get("/");
+    EXPECT_EQ(r.status, 0);
+    EXPECT_NE(r.error.find("SSL"), std::string::npos);
+
+    HttpServer s;
+    s.set_ssl_certificates("whatever.pem", "whatever.key");
+    EXPECT_FALSE(s.start_background(0));
+    EXPECT_NE(s.last_error().find("TLS"), std::string::npos);
+#endif
+}
+
+// HTTPS 往返 + 证书校验强制生效（信任自签 CA 才能连上；不信任必失败，
+// 绝不降级明文）；明文客户端打 TLS 端口同样失败
+TEST(HttpsTlsTest, HttpsRoundTripAndVerificationEnforcement)
+{
+#ifndef LIBMINI_SSL_SUPPORT
+    GTEST_SKIP() << "built without OpenSSL; TLS unavailable";
+#else
+    using namespace libmini;
+    const std::string cert = write_tls_fixture("tls_cert_", kTlsTestCertPem);
+    const std::string key = write_tls_fixture("tls_key_", kTlsTestKeyPem);
+    ASSERT_FALSE(cert.empty());
+    ASSERT_FALSE(key.empty());
+
+    HttpServer server;
+    server.set_ssl_certificates(cert, key);
+    server.get("/who", [](const HttpRequest&) {
+        return HttpReply::text(200, "secure");
+    });
+    ASSERT_TRUE(server.start_background(0)) << server.last_error();
+    ASSERT_TRUE(server.wait_until_ready());
+    ASSERT_GT(server.port(), 0);
+    const std::string base =
+        "https://127.0.0.1:" + std::to_string(server.port());
+
+    // 信任自签 CA + SAN 含 IP:127.0.0.1 → 链式与主机名校验全过
+    HttpClient trusted(base);
+    trusted.set_ca_cert_path(cert);
+    const HttpResponse ok = trusted.get("/who");
+    ASSERT_EQ(ok.status, 200) << ok.error;
+    EXPECT_EQ(ok.body, "secure");
+
+    // 默认信任库不含自签证书 → 校验失败：status=0 + 错误，不降级明文
+    HttpClient hostile(base);
+    hostile.set_verify_server(true);
+    const HttpResponse bad = hostile.get("/who");
+    EXPECT_EQ(bad.status, 0);
+    EXPECT_FALSE(bad.error.empty());
+
+    // 关校验（联调用法）→ 通（set_verify_server 运行期可改）
+    HttpClient relaxed(base);
+    relaxed.set_verify_server(false);
+    EXPECT_EQ(relaxed.get("/who").status, 200);
+
+    // 明文 HTTP 客户端打 TLS 端口 → 协议不符，失败
+    HttpClient plain("127.0.0.1", server.port());
+    EXPECT_EQ(plain.get("/who").status, 0);
+
+    server.stop();
+#endif
+}
+
 int main(int argc, char** argv)
 {
     ::testing::InitGoogleTest(&argc, argv);

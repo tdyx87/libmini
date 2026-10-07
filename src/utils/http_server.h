@@ -130,6 +130,16 @@ public:
     //       503 {"status":"unavailable", ...}  任一检查失败即 503
     void enable_health_endpoints();
 
+    // ---------------- TLS ----------------
+
+    // 启用 HTTPS 监听：PEM 证书 + 私钥。须在 start_background 前调用；
+    // 证书/配置在首次 start 创建监听对象时定型，启动过的实例不可再改
+    //（改了下次 start 会报错，而非静默降级明文）。
+    // 失败语义：证书文件缺失/PEM 损坏、或本构建未启用 OpenSSL 时
+    // start_background 返回 false，原因见 last_error()
+    void set_ssl_certificates(const std::string& cert_path,
+                              const std::string& key_path);
+
     // ---------------- 生命周期 ----------------
 
     // 在另一线程启动监听并立即返回；port=0 时由系统分配，实际端口经 port() 取。

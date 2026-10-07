@@ -200,7 +200,9 @@ HttpReply HttpReply::error(int status, const std::string& message)
 class HttpServer::Impl
 {
 public:
-    httplib::Server svr;
+    // 监听对象在首次 start 时按 TLS 配置创建（SSLServer 构造期需要证书），
+    // 路由经 pending_routes 回放——注册顺序与 start 顺序无关
+    std::unique_ptr<httplib::Server> svr;
     int configured_port = 0;   // apply_config 的 web.port
     int actual_port = 0;       // 启动后真实监听端口
     std::string error_text;
@@ -210,6 +212,26 @@ public:
     HttpHandler fallback;                       // 未命中路由的兜底
     std::vector<HttpFilter> filters;            // 前置过滤器（按注册顺序）
     HttpAccessLogger access_logger;             // 访问日志钩子
+
+    // ------- 请求体上限（apply_config 可改，创建监听对象时施加） -------
+    std::size_t max_body_bytes = kDefaultMaxBodyBytes;  // 默认 64 MiB
+
+    // ------- TLS：set_ssl_certificates 记录，首次 start 生效 -------
+    // *_built 为创建时快照；启动后改动配置 → 下次 start 报错
+    //（拒绝而非静默降级成明文）
+    bool ssl_configured = false;
+    std::string ssl_cert_path;
+    std::string ssl_key_path;
+    bool ssl_active = false;
+    std::string ssl_cert_built;
+    std::string ssl_key_built;
+
+    struct PendingRoute {
+        std::string method;     // "GET"/"POST"/...
+        std::string pattern;
+        httplib::Server::Handler handler;  // route() 已包过滤器；健康端点为裸 handler
+    };
+    std::vector<PendingRoute> pending_routes;
 
     // ------- 健康检查状态（运行期可读写，health_mu 保护） -------
     HttpHandler liveness;                       // 空 = 默认 200 "ok"
@@ -223,18 +245,104 @@ public:
     bool healthz_registered = false;            // enable_health_endpoints 幂等
     bool readyz_registered = false;
 
-    Impl()
+    // ------- 监听对象创建、路由缓冲与回放 -------
+
+    // 首次调用时创建监听对象（含 TLS 校验）并回放全部已注册路由；
+    // 失败时 error_text 已置位。已创建过则复用（TLS/路由在首次启动时定型）
+    bool ensure_server()
     {
+        if (svr) {
+            const bool changed =
+                (ssl_active != ssl_configured) ||
+                (ssl_configured && (ssl_cert_built != ssl_cert_path ||
+                                    ssl_key_built != ssl_key_path));
+            if (changed) {
+                std::lock_guard<std::mutex> lock(error_mu);
+                error_text = "TLS configuration changed after first start; "
+                             "create a new HttpServer instead of "
+                             "reconfiguring a started one";
+                return false;
+            }
+            return true;
+        }
+        if (ssl_configured) {
+#ifdef CPPHTTPLIB_OPENSSL_SUPPORT
+            std::unique_ptr<httplib::SSLServer> s;
+            try {
+                s.reset(new httplib::SSLServer(ssl_cert_path.c_str(),
+                                               ssl_key_path.c_str()));
+            } catch (const std::exception& e) {
+                std::lock_guard<std::mutex> lock(error_mu);
+                error_text =
+                    std::string("SSL certificate load failed: ") + e.what();
+                return false;
+            }
+            if (s->ssl_last_error() != 0) {
+                std::lock_guard<std::mutex> lock(error_mu);
+                error_text = "SSL certificate/key load failed "
+                             "(missing file or bad PEM)";
+                return false;
+            }
+            svr = std::move(s);
+#else
+            std::lock_guard<std::mutex> lock(error_mu);
+            error_text =
+                "TLS support not built (OpenSSL unavailable at build time)";
+            return false;
+#endif
+        } else {
+            svr.reset(new httplib::Server);
+        }
+        ssl_active = ssl_configured;
+        ssl_cert_built = ssl_cert_path;
+        ssl_key_built = ssl_key_path;
+        svr->set_payload_max_length(max_body_bytes);
         bind_error_handlers();
-        // 默认请求体上限 64 MiB（httplib 默认无限制，防止内存被撑爆）
-        svr.set_payload_max_length(kDefaultMaxBodyBytes);
+        // 回放创建前注册的路由（保持注册顺序 = 匹配顺序）
+        for (std::size_t i = 0; i < pending_routes.size(); ++i) {
+            register_one(pending_routes[i].method, pending_routes[i].pattern,
+                         pending_routes[i].handler);
+        }
+        return true;
+    }
+
+    void register_one(const std::string& method, const std::string& pattern,
+                      const httplib::Server::Handler& handler)
+    {
+        if (method == "GET" || method == "HEAD") {
+            svr->Get(pattern, handler);
+        } else if (method == "POST") {
+            svr->Post(pattern, handler);
+        } else if (method == "PUT") {
+            svr->Put(pattern, handler);
+        } else if (method == "DELETE") {
+            svr->Delete(pattern, handler);
+        } else if (method == "OPTIONS") {
+            svr->Options(pattern, handler);
+        } else if (method == "PATCH") {
+            svr->Patch(pattern, handler);
+        }
+    }
+
+    // 注册路由：监听对象创建前缓冲（start 时回放），创建后立即施加
+    void add_route(const std::string& method, const std::string& pattern,
+                   httplib::Server::Handler handler)
+    {
+        PendingRoute entry;
+        entry.method = method;
+        entry.pattern = pattern;
+        entry.handler = handler;
+        pending_routes.push_back(entry);
+        if (svr) {
+            register_one(method, pattern, handler);
+        }
     }
 
     // ------- 异常与兜底响应的统一形态 -------
 
     void bind_error_handlers()
     {
-        svr.set_exception_handler(
+        svr->set_exception_handler(
             [](const httplib::Request&, httplib::Response& res,
                std::exception_ptr ep) {
                 std::string what = "internal error";
@@ -278,7 +386,7 @@ public:
 
     void install_access_logger()
     {
-        svr.set_logger(
+        svr->set_logger(
             [this](const httplib::Request& req, const httplib::Response& res) {
                 if (!access_logger) {
                     return;
@@ -305,7 +413,7 @@ public:
 
     void install_routing_error_handler()
     {
-        svr.set_error_handler(
+        svr->set_error_handler(
             [this](const httplib::Request& req, httplib::Response& res) {
                 if (!res.body.empty()) {
                     return;  // 处理器/过滤器已写响应体，不覆盖
@@ -325,23 +433,28 @@ public:
         error_text.clear();
         ready = false;
 
+        // 创建监听对象（含 TLS 校验）并回放创建前注册的路由
+        if (!ensure_server()) {
+            return false;
+        }
+
         install_routing_error_handler();
         install_access_logger();
 
         std::thread t([this, port] {
             if (port == 0) {
                 // bind_to_any_port 返回实际端口（<0 = 失败）
-                const int bound = svr.bind_to_any_port("0.0.0.0");
+                const int bound = svr->bind_to_any_port("0.0.0.0");
                 if (bound < 0) {
                     std::lock_guard<std::mutex> lock(error_mu);
                     error_text = "bind to any port failed";
                     return;
                 }
                 actual_port = bound;
-                svr.listen_after_bind();  // 阻塞至 stop()
+                svr->listen_after_bind();  // 阻塞至 stop()
             } else {
                 actual_port = port;
-                if (!svr.bind_to_port("0.0.0.0", port)) {
+                if (!svr->bind_to_port("0.0.0.0", port)) {
                     std::ostringstream os;
                     os << "bind failed on port " << port
                        << "（端口被占用或无权限）";
@@ -349,14 +462,14 @@ public:
                     error_text = os.str();
                     return;
                 }
-                svr.listen_after_bind();
+                svr->listen_after_bind();
             }
         });
         t.detach();
 
         // 等待监听就绪或显式失败（bind 通常瞬时完成）
         for (int i = 0; i < 300; ++i) {
-            if (svr.is_running()) {
+            if (svr->is_running()) {
                 ready = true;
                 return true;
             }
@@ -391,22 +504,7 @@ void HttpServer::route(const std::string& method, const std::string& pattern,
     if (method == "GET" || method == "HEAD") {
         impl_->get_routes.push_back(pattern);  // 内建健康端点「显式优先」的判据
     }
-    if (method == "GET") {
-        impl_->svr.Get(pattern, h);
-    } else if (method == "POST") {
-        impl_->svr.Post(pattern, h);
-    } else if (method == "PUT") {
-        impl_->svr.Put(pattern, h);
-    } else if (method == "DELETE") {
-        impl_->svr.Delete(pattern, h);
-    } else if (method == "HEAD") {
-        // 此版 httplib 无 Head() 注册；HEAD 请求内部按 GET 分发，路由到 GET 即可
-        impl_->svr.Get(pattern, h);
-    } else if (method == "OPTIONS") {
-        impl_->svr.Options(pattern, h);
-    } else if (method == "PATCH") {
-        impl_->svr.Patch(pattern, h);
-    }
+    impl_->add_route(method, pattern, h);  // 创建前缓冲，创建后直达（含回放）
 }
 
 void HttpServer::get(const std::string& pattern, HttpHandler handler)
@@ -480,7 +578,7 @@ void HttpServer::enable_health_endpoints()
         std::find(impl_->get_routes.begin(), impl_->get_routes.end(),
                   "/healthz") != impl_->get_routes.end();
     if (!impl_->healthz_registered && !have_healthz) {
-        impl_->svr.Get("/healthz",
+        impl_->add_route("GET", "/healthz",
                        [this](const httplib::Request&, httplib::Response& res) {
             HttpHandler handler;
             {
@@ -503,7 +601,7 @@ void HttpServer::enable_health_endpoints()
         std::find(impl_->get_routes.begin(), impl_->get_routes.end(),
                   "/readyz") != impl_->get_routes.end();
     if (!impl_->readyz_registered && !have_readyz) {
-        impl_->svr.Get("/readyz",
+        impl_->add_route("GET", "/readyz",
                        [this](const httplib::Request&, httplib::Response& res) {
             std::vector<Impl::ReadinessEntry> checks;
             {
@@ -552,6 +650,14 @@ void HttpServer::enable_health_endpoints()
     }
 }
 
+void HttpServer::set_ssl_certificates(const std::string& cert_path,
+                                      const std::string& key_path)
+{
+    impl_->ssl_cert_path = cert_path;
+    impl_->ssl_key_path = key_path;
+    impl_->ssl_configured = !cert_path.empty();  // 空证书路径 = 明文监听
+}
+
 // ---------------- 生命周期 ----------------
 
 bool HttpServer::start_background(int port)
@@ -579,10 +685,10 @@ bool HttpServer::wait_until_ready(int timeout_ms)
 void HttpServer::stop()
 {
     if (!impl_) return;
-    if (impl_->svr.is_running()) {
-        impl_->svr.stop();  // 关监听 fd，accept 循环退出后 is_running_ 复位
+    if (impl_->svr && impl_->svr->is_running()) {
+        impl_->svr->stop();  // 关监听 fd，accept 循环退出后 is_running_ 复位
         // 等内部线程真正收尾（stop 只发信号），避免析构竞态
-        for (int i = 0; i < 300 && impl_->svr.is_running(); ++i) {
+        for (int i = 0; i < 300 && impl_->svr->is_running(); ++i) {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
     }
@@ -590,12 +696,12 @@ void HttpServer::stop()
 
 bool HttpServer::is_running() const
 {
-    return impl_->svr.is_running();
+    return impl_->svr && impl_->svr->is_running();
 }
 
 int HttpServer::port() const
 {
-    if (impl_->svr.is_running() && impl_->actual_port > 0) {
+    if (impl_->svr && impl_->svr->is_running() && impl_->actual_port > 0) {
         return impl_->actual_port;
     }
     return impl_->configured_port;
@@ -623,7 +729,10 @@ void HttpServer::apply_config(const ConfigFacade& config,
     if (!config.get(body_key).empty()) {
         const std::int64_t bytes = config.get_int64(body_key, 0);
         if (bytes > 0) {
-            impl_->svr.set_payload_max_length(static_cast<std::size_t>(bytes));
+            impl_->max_body_bytes = static_cast<std::size_t>(bytes);
+            if (impl_->svr) {  // 已创建：同步施加；未创建：创建时用新值
+                impl_->svr->set_payload_max_length(impl_->max_body_bytes);
+            }
         }
     }
 }

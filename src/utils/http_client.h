@@ -55,6 +55,22 @@ public:
     // 是否跟随 3xx 重定向，默认 false
     void set_follow_location(bool follow);
 
+    // ---------------- TLS（需构建时启用 OpenSSL，见类注释） ----------------
+    // 均须在首个请求前设置；仅对 https 构造生效，http 构建忽略。
+    // 本构建未启用 SSL 时为记录性空操作（https 请求仍报 status=0 + error）
+
+    // 自定义 CA 证书（PEM）：自签/内网 CA 场景让客户端信任服务端证书
+    void set_ca_cert_path(const std::string& ca_cert_path);
+
+    // 是否校验服务端证书链，默认 true（生产勿关；临时联调可关，用完开回）
+    void set_verify_server(bool enable);
+
+    // mTLS 客户端证书 + 私钥（PEM）：服务端要求客户端证书时使用。
+    // httplib 的客户端证书在构造期绑定，本方法会重建底层客户端——
+    // 请在首个请求前调用（实例本就非线程安全）
+    void set_client_cert(const std::string& cert_path,
+                         const std::string& key_path);
+
     // 把 query 参数编码为 "k1=v1&k2=v2"（键值均 URL 编码）；空表返回空串
     static std::string build_query(
         const std::map<std::string, std::string>& params);

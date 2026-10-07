@@ -143,13 +143,52 @@ else()
     if(TARGET openssl::openssl)
         target_link_libraries(libmini PUBLIC openssl::openssl)
     else()
-        target_link_libraries(libmini PUBLIC OpenSSL::Crypto)
+        # 模块模式下 ssl+crypto 都要：httplib 的 TLS 路径链 libssl
+        target_link_libraries(libmini PUBLIC OpenSSL::Crypto OpenSSL::SSL)
     endif()
 
     # console 模块的 pthread_sigmask/sigwait（多数系统 libstdc++ 已带，
     # 显式声明保证 Linux/macOS 均链接正确）
     find_package(Threads REQUIRED)
     target_link_libraries(libmini PUBLIC Threads::Threads)
+endif()
+
+# ---------------- TLS（httplib 的 SSL 客户端/服务端） ----------------
+# CPPHTTPLIB_OPENSSL_SUPPORT 打开 httplib 的 SSLClient/SSLServer。必须 PUBLIC：
+# 消费者若直接包含 httplib.h，要与本库看到完全一致的类布局（内联版本漂移
+# 是 ODR 雷）。非 Windows 恒有 conan openssl（上方 aes_gcm 段已 find 并链上）；
+# Windows 查系统 OpenSSL（winget/Strawberry，可用 OPENSSL_ROOT_DIR 提示），
+# 查不到就整体关闭——https 请求在运行期给出明确错误，相关测试自动跳过
+set(_libmini_ssl OFF)
+if(WIN32)
+    find_package(OpenSSL CONFIG QUIET)
+    if(NOT TARGET openssl::openssl)
+        find_package(OpenSSL QUIET)  # 模块模式搜系统安装/OPENSSL_ROOT_DIR
+    endif()
+    if(TARGET openssl::openssl)
+        target_link_libraries(libmini PUBLIC openssl::openssl)
+        set(_libmini_ssl ON)
+    elseif(TARGET OpenSSL::SSL)
+        target_link_libraries(libmini PUBLIC OpenSSL::SSL OpenSSL::Crypto)
+        set(_libmini_ssl ON)
+    endif()
+else()
+    # aes_gcm 段已链接；openssl::openssl 聚合 ssl+crypto，模块模式补 ssl
+    if(TARGET openssl::openssl)
+        set(_libmini_ssl ON)
+    elseif(TARGET OpenSSL::SSL)
+        target_link_libraries(libmini PUBLIC OpenSSL::SSL)
+        set(_libmini_ssl ON)
+    endif()
+endif()
+if(_libmini_ssl)
+    target_compile_definitions(libmini PUBLIC
+        CPPHTTPLIB_OPENSSL_SUPPORT
+        LIBMINI_SSL_SUPPORT
+    )
+    message(STATUS "libmini: TLS/HTTPS enabled (OpenSSL found)")
+else()
+    message(STATUS "libmini: TLS/HTTPS disabled (OpenSSL not found; https reports a runtime error)")
 endif()
 
 # ---------------- 安装规则（下游 find_package(libmini) 支持） ----------------
