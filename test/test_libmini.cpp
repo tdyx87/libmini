@@ -3618,6 +3618,44 @@ TEST(SqliteTest_WMutex, WriteMutexGuardsBeginCommitProtocol)
     remove_file(path + ".wlock");
 }
 
+// 跨进程互斥的冒烟测试：同一 .wlock 上，父进程持锁期间子进程必须拿不到，
+// 释放后子进程应能拿到。用真实子进程验证 OS 级文件锁（而不是同进程内的锁语义）。
+#if defined(LIBMINI_SQLITE_CHILD_EXE)
+TEST(SqliteTest_WMutex, WriteMutexCrossProcessSerializesWriters)
+{
+    using namespace libmini;
+    const std::string path = sqlite_temp_path("_wmutex_xproc");
+    remove_file(path);
+    remove_file(path + ".wlock");
+    {
+        SqliteWriteMutex holder(path);
+        ASSERT_TRUE(holder.acquire(4000));
+
+        // 子进程输出码约定：1 = 拿不到锁，0 = 拿到了锁
+        const ProcessResult blocked = run_process(
+            LIBMINI_SQLITE_CHILD_EXE, {path, "acquire_then_exit"}, 15000);
+        if (blocked.timed_out) {
+            GTEST_SKIP() << "child process timed out";
+        }
+
+        holder.release();
+
+        const ProcessResult free_slot = run_process(
+            LIBMINI_SQLITE_CHILD_EXE, {path, "acquire_then_exit"}, 15000);
+        if (free_slot.timed_out) {
+            GTEST_SKIP() << "child process timed out";
+        }
+
+        EXPECT_EQ(blocked.exit_code, 1)
+            << "child stderr: " << blocked.stderr_text;
+        EXPECT_EQ(free_slot.exit_code, 0)
+            << "child stderr: " << free_slot.stderr_text;
+    }
+    remove_file(path);
+    remove_file(path + ".wlock");
+}
+#endif
+
 TEST(SqliteTest, InMemoryOpenAndExec)
 {
     using namespace libmini;

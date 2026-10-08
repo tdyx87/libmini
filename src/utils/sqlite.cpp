@@ -5,14 +5,23 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <iostream>
 #include <chrono>
 #include <thread>
+
+#include <spdlog/logger.h>
+
+#include "log_facade.h"
+
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <Windows.h>
+#else
+#include <cerrno>
+#include <fcntl.h>
+#include <sys/file.h>
+#include <unistd.h>
 #endif
 
 namespace libmini {
@@ -142,6 +151,11 @@ bool SqliteDatabase::open(const std::string& path, int flags)
     if (rc != SQLITE_OK) {
         status_ = map_status(rc);
         last_msg_ = db_ != nullptr ? ::sqlite3_errmsg(db_) : "sqlite3_open failed";
+        // 打开失败是生产环境最常见的故障之一，且库本身不抛异常——必须让
+        // 统一日志留下痕迹，否则失败会静默传播到调用方。
+        if (spdlog::logger* log = LogFacade::logger()) {
+            log->error("sqlite: open '{}' failed: {}", path, last_msg_);
+        }
         if (db_ != nullptr) {
             ::sqlite3_close(db_);  // 失败路径仍需释放部分构造的句柄
             db_ = nullptr;
@@ -172,6 +186,11 @@ void SqliteDatabase::close()
             last_msg_ = ::sqlite3_errmsg(nullptr);
             if (last_msg_.empty()) {
                 last_msg_ = "sqlite3_close failed";
+            }
+            // 非 OK 通常意味着仍有未 finalize 的语句占着连接；调用方很难
+            // 从返回值发现（close 无返回值），因此记一条告警。
+            if (spdlog::logger* log = LogFacade::logger()) {
+                log->warn("sqlite: close failed (rc={}): {}", rc, last_msg_);
             }
         }
     }
@@ -700,6 +719,10 @@ struct WLockHandle {
 #endif
 
 #ifdef _WIN32
+// 锁定的字节范围：1MB（从偏移 0 开始）。同步 LockFile/UnlockFile 必须成对
+// 使用同一范围。
+static const DWORD WLOCK_LEN = 0x100000;
+
 static void* wlock_create(const std::string& db) {
     const std::wstring w = [] (const std::string& p) {
         if (p.empty()) return std::wstring();
@@ -714,94 +737,118 @@ static void* wlock_create(const std::string& db) {
     void* h = ::CreateFileW(w.c_str(), GENERIC_READ | GENERIC_WRITE,
                             FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS,
                             FILE_ATTRIBUTE_NORMAL, nullptr);
-    return (h == INVALID_HANDLE_VALUE) ? nullptr : h;
-}
-static void wlock_destroy(void* h) {
-    if (h != nullptr && h != INVALID_HANDLE_VALUE) {
-        HANDLE fh = reinterpret_cast<HANDLE>(h);
-        // 纳入防御性解锁（若已释放则 Ignore）。随后关闭句柄。
-        const DWORD LOCK_LEN = 0x100000;
-        (void)::UnlockFile(fh, 0, 0, LOCK_LEN, 0);
-        ::CloseHandle(fh);
+    if (h == INVALID_HANDLE_VALUE) {
+        return nullptr;
     }
+    // 句柄放进堆对象：指针本身就是“创建成功与否”的判据，不再拿平台原始
+    // 值（HANDLE / fd）当指针用。
+    WLockHandle* handle = new WLockHandle();
+    handle->h = h;
+    return handle;
 }
-static bool wlock_try_acquire(void* h, int timeout_ms) {
-    if (h == nullptr || h == INVALID_HANDLE_VALUE) {
+static void wlock_destroy(void* p) {
+    if (p == nullptr) {
+        return;
+    }
+    WLockHandle* handle = static_cast<WLockHandle*>(p);
+    if (handle->h != nullptr && handle->h != INVALID_HANDLE_VALUE) {
+        HANDLE fh = reinterpret_cast<HANDLE>(handle->h);
+        // 防御性解锁（若已释放则忽略），随后关闭句柄
+        (void)::UnlockFile(fh, 0, 0, WLOCK_LEN, 0);
+        ::CloseHandle(fh);
+        handle->h = nullptr;
+    }
+    delete handle;
+}
+static bool wlock_try_lock(void* p, int timeout_ms) {
+    WLockHandle* handle = static_cast<WLockHandle*>(p);
+    if (handle->h == nullptr || handle->h == INVALID_HANDLE_VALUE) {
         return false;
     }
-    HANDLE fh = reinterpret_cast<HANDLE>(h);
+    HANDLE fh = reinterpret_cast<HANDLE>(handle->h);
     // 使用 LockFile（纯同步、无 OVERLAPPED）：锁定文件起始处的 1MB，足以覆盖
     // .wlock 文件（同步 API 不涉及异步事件句柄，避免访问空 hEvent 的 AV）。
-    const DWORD LOCK_LEN = 0x100000;   // 1MB
-    (void)LOCK_LEN;  // 静默未使用检测（始终被 LockFile/UnlockFile 引用）
     if (timeout_ms <= 0) {
-        const bool ok = ::LockFile(fh, 0, 0, LOCK_LEN, 0) != 0;
-        return ok;
+        return ::LockFile(fh, 0, 0, WLOCK_LEN, 0) != 0;
     }
-    auto start = std::chrono::steady_clock::now();
-    while (true) {
-        const bool ok = ::LockFile(fh, 0, 0, LOCK_LEN, 0) != 0;
-        if (ok) {
+    const auto start = std::chrono::steady_clock::now();
+    for (;;) {
+        if (::LockFile(fh, 0, 0, WLOCK_LEN, 0) != 0) {
             return true;
         }
         const DWORD err = ::GetLastError();
+        // 只有“被别人占着”才值得重试；其它错误立刻失败
         if (err != ERROR_LOCK_VIOLATION && err != ERROR_BUSY) {
             return false;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
-        auto now = std::chrono::steady_clock::now();
-        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - start);
+        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start);
         if (elapsed.count() >= static_cast<long long>(timeout_ms)) {
             return false;
         }
     }
 }
-static void wlock_release(void* h) {
-    if (h != nullptr && h != INVALID_HANDLE_VALUE) {
-        HANDLE fh = reinterpret_cast<HANDLE>(h);
-        // 解锁与 LockFile 锁定的范围一致（1MB，从偏移 0 开始）。
-        const DWORD LOCK_LEN = 0x100000;
-        (void)::UnlockFile(fh, 0, 0, LOCK_LEN, 0);
+static void wlock_unlock(void* p) {
+    WLockHandle* handle = static_cast<WLockHandle*>(p);
+    if (handle->h != nullptr && handle->h != INVALID_HANDLE_VALUE) {
+        // 解锁范围与 LockFile 一致（1MB，从偏移 0 开始）
+        (void)::UnlockFile(reinterpret_cast<HANDLE>(handle->h), 0, 0, WLOCK_LEN, 0);
     }
-}
-static bool wlock_is_held(void* h) {
-    return h != nullptr && h != INVALID_HANDLE_VALUE;
 }
 #else
-#include <unistd.h>
-#include <sys/file.h>
-#include <fcntl.h>
 static void* wlock_create(const std::string& db) {
-    int fd = ::open((db + ".wlock").c_str(), O_RDWR | O_CREAT, 0600);
-    return (fd < 0) ? nullptr : reinterpret_cast<void*>(fd);
+    const int fd = ::open((db + ".wlock").c_str(), O_RDWR | O_CREAT, 0600);
+    if (fd < 0) {
+        return nullptr;
+    }
+    // fd == 0 是合法结果（守护进程关掉 stdin 后 open 可能返回 0），因此
+    // 不能用 fd 本身当空指针判据——包进堆对象。
+    WLockHandle* handle = new WLockHandle();
+    handle->fd = fd;
+    return handle;
 }
-static void wlock_destroy(void* h) {
-    if (h) { int fd = reinterpret_cast<int>(h); ::close(fd); }
+static void wlock_destroy(void* p) {
+    if (p == nullptr) {
+        return;
+    }
+    WLockHandle* handle = static_cast<WLockHandle*>(p);
+    if (handle->fd >= 0) {
+        ::close(handle->fd);  // close 会释放该 fd 上持有的 flock
+        handle->fd = -1;
+    }
+    delete handle;
 }
-static bool wlock_try_acquire(void* h, int timeout_ms) {
-    if (!h) return false;
-    int fd = reinterpret_cast<int>(h);
+static bool wlock_try_lock(void* p, int timeout_ms) {
+    WLockHandle* handle = static_cast<WLockHandle*>(p);
+    if (handle->fd < 0) {
+        return false;
+    }
     if (timeout_ms <= 0) {
-        if (::flock(fd, LOCK_EX | LOCK_NB) != 0) return false;
-        return true;
+        return ::flock(handle->fd, LOCK_EX | LOCK_NB) == 0;
     }
-    auto start = std::chrono::steady_clock::now();
-    int tries = 0;
-    while (true) {
-        if (::flock(fd, LOCK_EX | LOCK_NB) == 0) return true;
-        if (errno != EAGAIN && errno != EWOULDBLOCK) return false;
+    const auto start = std::chrono::steady_clock::now();
+    for (;;) {
+        if (::flock(handle->fd, LOCK_EX | LOCK_NB) == 0) {
+            return true;
+        }
+        if (errno != EAGAIN && errno != EWOULDBLOCK) {
+            return false;
+        }
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
-        auto now = std::chrono::steady_clock::now();
-        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - start);
-        if (elapsed.count() >= static_cast<long long>(timeout_ms)) return false;
-        ++tries;
-        if (tries > 10000) return false;
+        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start);
+        if (elapsed.count() >= static_cast<long long>(timeout_ms)) {
+            return false;
+        }
     }
 }
-static void wlock_release(void* h) {
-    if (h) { int fd = reinterpret_cast<int>(h); ::flock(fd, LOCK_UN); ::close(fd); }
+static void wlock_unlock(void* p) {
+    WLockHandle* handle = static_cast<WLockHandle*>(p);
+    if (handle->fd >= 0) {
+        ::flock(handle->fd, LOCK_UN);
+    }
 }
-static bool wlock_is_held(void* h) { return h != nullptr; }
 #endif
 }  // namespace
 
@@ -815,31 +862,40 @@ SqliteWriteMutex::SqliteWriteMutex(const std::string& path)
 SqliteWriteMutex::~SqliteWriteMutex()
 {
     if (impl_ != nullptr) {
-        wlock_destroy(impl_);
+        wlock_destroy(impl_);  // 未显式 release 时这里一并解锁 + 关闭句柄
         impl_ = nullptr;
     }
+    held_ = false;
 }
 
 
 bool SqliteWriteMutex::acquire(int timeout_ms)
 {
-    if (impl_ == nullptr) return false;
-    return wlock_try_acquire(impl_, timeout_ms);
+    if (impl_ == nullptr) {
+        return false;  // 锁文件创建失败（路径不可写 / 目录不存在）
+    }
+    if (held_) {
+        return true;  // 已持有：幂等成功
+    }
+    held_ = wlock_try_lock(impl_, timeout_ms);
+    return held_;
 }
 
 void SqliteWriteMutex::release()
 {
-    if (impl_ != nullptr) {
-        wlock_release(impl_);
-        impl_ = nullptr;
+    // 只解锁、不销毁句柄：释放后仍可再次 acquire（拿到同一个锁文件的锁）。
+    // 未持有时是 no-op，重复 release 安全。
+    if (impl_ != nullptr && held_) {
+        wlock_unlock(impl_);
     }
+    held_ = false;
 }
 
 
 bool SqliteWriteMutex::is_held() const
 {
-    if (impl_ == nullptr) return false;
-    return wlock_is_held(impl_);
+    // 只有真正拿到过 OS 锁才算持有——构造出对象本身不算。
+    return held_;
 }
 
 const std::string& SqliteWriteMutex::path() const

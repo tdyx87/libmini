@@ -5,11 +5,14 @@
 #include <thread>
 #include <vector>
 
+#include <spdlog/logger.h>
+
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
 #endif
 
+#include "log_facade.h"
 #include "path_utils.h"
 #include "win_utf.h"
 
@@ -332,6 +335,10 @@ struct ServiceApp::Impl
     {
         if (log_callback) {
             log_callback(msg);
+        } else if (spdlog::logger* log = LogFacade::logger()) {
+            // 服务进程通常没有控制台，写 stderr 会直接丢失；优先走统一日志
+            // 门面（文件/事件日志 sink），未初始化时才退回 stderr。
+            log->warn("[service] {}", msg);
         } else {
             std::fprintf(stderr, "[service] %s\n", msg);
         }
@@ -620,6 +627,10 @@ struct ServiceApp::Impl
     {
         if (log_callback) {
             log_callback(msg);
+        } else if (spdlog::logger* log = LogFacade::logger()) {
+            // 服务进程通常没有控制台，写 stderr 会直接丢失；优先走统一日志
+            // 门面（文件/事件日志 sink），未初始化时才退回 stderr。
+            log->warn("[service] {}", msg);
         } else {
             std::fprintf(stderr, "[service] %s\n", msg);
         }

@@ -250,7 +250,7 @@ private:
 //   - 正常析构会释放并关闭 .wlock 句柄，但文件本身留在磁盘上。
 //   - 若持有写互斥器的进程异常终止（崩溃/杀掉/断电），OS 会释放 OS 级锁
 //     （LockFile），但 .wlock 文件会残留。残留文件不是错误状态——下一个进程
-//     仍然可以成功 acquire（その OS 锁是空的）。不过若实现依赖“文件存在与否”
+//     仍然可以成功 acquire（该 OS 锁是空的）。不过若实现依赖“文件存在与否”
 //     做额外判断时，可能需要手动删掉 <path>.wlock 后再重试。
 //   - 跨进程串行依赖的是 OS 级字节范围锁（Windows: LockFile，POSIX: flock），
 //     而非“文件是否存在”或“文件是否已被打开”。
@@ -268,15 +268,20 @@ public:
     // 返回是否拿到（超时/失败返回 false）。
     bool acquire(int timeout_ms);
 
-    // 释放写槽（事务结束后、commit/rollback 后调用；未持有时为 no-op）。
+    // 释放写槽（事务结束后、commit/rollback 后调用）。
+    // - 未持有时为 no-op，重复调用安全。
+    // - 只释放 OS 锁，不销毁锁句柄：释放后可以再次 acquire（得到同一个
+    //   <path>.wlock 上的锁）。锁句柄在析构时关闭。
     void release();
 
+    // 是否真正持有库级写槽（构造出对象本身不算持有）。
     bool is_held() const;
     const std::string& path() const;
 
 private:
     std::string path_;
-    void* impl_ = nullptr;  // 平台锁句柄
+    void* impl_ = nullptr;  // 平台锁句柄（内部为堆上的 WLockHandle）
+    bool held_ = false;     // 是否已实际取得 OS 锁
 };
 
 // RAII 写互斥器：构造时阻塞取得库级写槽，析构自动释放。

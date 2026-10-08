@@ -57,3 +57,17 @@ if(NOT LIBMINI_BUILD_SHARED)
 endif()
 target_link_libraries(test_args PRIVATE libmini GTest::gtest)
 add_test(NAME args_test COMMAND test_args)
+
+# 跨进程写锁行为测试所需的辅助进程（被 run_process 启动，不走 gtest）
+add_executable(test_sqlite_child test_sqlite_child.cpp)
+target_include_directories(test_sqlite_child PRIVATE ${CMAKE_SOURCE_DIR}/src)
+if(NOT LIBMINI_BUILD_SHARED)
+    target_compile_definitions(test_sqlite_child PRIVATE LIBMINI_STATIC)
+endif()
+target_link_libraries(test_sqlite_child PRIVATE libmini)
+
+# 跨进程写锁测试需要启动上面的辅助进程：用生成器表达式把其绝对路径注入测试，
+# 避免依赖 ctest 的工作目录（相对路径在 IDE/不同 ctest 调用下都能工作）
+target_compile_definitions(test_libmini PRIVATE
+    LIBMINI_SQLITE_CHILD_EXE="$<TARGET_FILE:test_sqlite_child>")
+add_dependencies(test_libmini test_sqlite_child)
