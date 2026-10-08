@@ -120,6 +120,8 @@ SqliteDatabase& SqliteDatabase::operator=(SqliteDatabase&& other) noexcept
     return *this;
 }
 
+static const int DEFAULT_BUSY_TIMEOUT_MS = 5000;
+
 bool SqliteDatabase::open(const std::string& path, int flags)
 {
     close();
@@ -146,6 +148,13 @@ bool SqliteDatabase::open(const std::string& path, int flags)
         }
         return false;
     }
+    // 默认启用 busy 超时：多进程/多线程写场景下，写意向冲突时不立刻返回
+    // SQLITE_BUSY，而在有限时间内重试。调用方可通过 set_busy_timeout_ms(0)
+    // 关闭此行为（恢复立刻失败语义）。只对写/读写连接设；只读连接不涉及写
+    // 冲突，跳过以免无意义调用。
+    if (!(flags & OpenReadOnly)) {
+        ::sqlite3_busy_timeout(db_, DEFAULT_BUSY_TIMEOUT_MS);
+    }
     status_ = SqliteStatus::OK;
     last_msg_.clear();
     return true;
@@ -155,9 +164,16 @@ void SqliteDatabase::close()
 {
     if (db_ != nullptr) {
         // SQLITE_OK 表示所有语句已 finalize；有遗留语句时返回 SQLITE_BUSY，
-        // 析构顺序由调用方保证，这里尽力关闭
-        (void)::sqlite3_close(db_);
+        // 析构顺序由调用方保证，这里尽力关闭。若未能顺利关闭（例如仍有
+        // 未 finalize 的语句），把错误码记到 last_msg_ 以便外部诊断。
+        const int rc = ::sqlite3_close(db_);
         db_ = nullptr;
+        if (rc != SQLITE_OK) {
+            last_msg_ = ::sqlite3_errmsg(nullptr);
+            if (last_msg_.empty()) {
+                last_msg_ = "sqlite3_close failed";
+            }
+        }
     }
 }
 
