@@ -30,10 +30,15 @@
 #### 新增
 
 - Add SQLite write mutex for cross-process multi-threaded writes（[30cb23a](https://github.com/tdyx87/libmini/commit/30cb23a0a2f15493da5fb11dd022ce97b0108297)）
+- Add default busy timeout for write connections and record close errors（[23904d1](https://github.com/tdyx87/libmini/commit/23904d15f9ddf171c9fe1e488b77ed76cfdc4a89)）
 
 #### 修复
 
 - Fix Windows SqliteWriteMutex to use real file locks（[1552567](https://github.com/tdyx87/libmini/commit/155256799cd05af728a4596c582382d77009c3db)）
+
+#### 内部
+
+- Document SqliteWriteMutex usage contract and .wlock file lifecycle（[6ee55b4](https://github.com/tdyx87/libmini/commit/6ee55b401b0ffeacff783b84515a594b2f1ffe21)）
 
 <!-- END generated:unreleased -->
 
