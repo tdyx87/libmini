@@ -233,10 +233,31 @@ private:
 // 时第二个进程会挂在 busy 上直至超时——由调用方决定是否友好。应用程序若希望
 // 「至多一个写入事务在库级工作、其他写请求排队/失败」的语义，可在事务外用
 // 下面的写互斥器抢占库级写槽；持有写互斥器的线程/进程才允许 BEGIN ... COMMIT。
+//
+// 用法约定：
+//   - 打开库后，只有在成功 acquire(wm, timeout) 之后才对该库执行 BEGIN，
+//     写入事务完成（COMMIT/ROLLBACK）后再 release(wm)。acquire/release 的配对
+//     由调用方保证；库本身不检查“未持锁时写事务”。
+//   - acquire 的超时是阻塞等待时长；拿不到则返回 false，此时不应开始写事务。
+//   - 默认每个数据库连接都会启用 busy_timeout（目前 5000ms），所以即便不配
+//     写互斥器，SQLite 层的并发写冲突也会在超时内重试而非立即失败。
+//     需要立即失败语义时可在该连接上调用 set_busy_timeout_ms(0)。
+//
+// .wlock 文件语义：
+//   - 锁文件是 <path>.wlock，CreateFileW/OPEN_ALWAYS 语义，所以第一次使用时
+//     创建，之后持久存在（不会由库自动删除）。这是故意的设计——把“谁曾经
+//     拥有过写槽”保留在磁盘上，避免不同进程之间互相误判锁已释放。
+//   - 正常析构会释放并关闭 .wlock 句柄，但文件本身留在磁盘上。
+//   - 若持有写互斥器的进程异常终止（崩溃/杀掉/断电），OS 会释放 OS 级锁
+//     （LockFile），但 .wlock 文件会残留。残留文件不是错误状态——下一个进程
+//     仍然可以成功 acquire（その OS 锁是空的）。不过若实现依赖“文件存在与否”
+//     做额外判断时，可能需要手动删掉 <path>.wlock 后再重试。
+//   - 跨进程串行依赖的是 OS 级字节范围锁（Windows: LockFile，POSIX: flock），
+//     而非“文件是否存在”或“文件是否已被打开”。
 class LIBMINI_API SqliteWriteMutex
 {
 public:
-    // path：要保护的共享数据库文件路径（锁文件是 <path>.wlock，持久不删）
+    // path：要保护的共享数据库文件路径（锁文件是 <path>.wlock，持久不删）。
     explicit SqliteWriteMutex(const std::string& path);
     ~SqliteWriteMutex();
 
