@@ -27,7 +27,9 @@
 
 ### 提交清单
 
-（暂无提交）
+#### 新增
+
+- Add SQLite write mutex for cross-process multi-threaded writes（[30cb23a](https://github.com/tdyx87/libmini/commit/30cb23a0a2f15493da5fb11dd022ce97b0108297)）
 
 <!-- END generated:unreleased -->
 
