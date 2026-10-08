@@ -31,6 +31,7 @@
 
 - Add SQLite write mutex for cross-process multi-threaded writes（[30cb23a](https://github.com/tdyx87/libmini/commit/30cb23a0a2f15493da5fb11dd022ce97b0108297)）
 - Add default busy timeout for write connections and record close errors（[23904d1](https://github.com/tdyx87/libmini/commit/23904d15f9ddf171c9fe1e488b77ed76cfdc4a89)）
+- Add cross-platform charset conversion (UTF-8 / UTF-16 / GBK)（[67e5bd4](https://github.com/tdyx87/libmini/commit/67e5bd4dfa04bfc27cc7cfdf95704f3f962e7d70)）
 
 #### 修复
 
