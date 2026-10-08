@@ -35,6 +35,7 @@
 #### 修复
 
 - Fix Windows SqliteWriteMutex to use real file locks（[1552567](https://github.com/tdyx87/libmini/commit/155256799cd05af728a4596c582382d77009c3db)）
+- Fix SqliteWriteMutex held-state tracking and log SQLite open/close failures（[95f8e2a](https://github.com/tdyx87/libmini/commit/95f8e2a5f8c4d6b7b5642dc0a86ac36e7b14ee9b)）
 
 #### 内部
 
