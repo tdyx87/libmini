@@ -31,6 +31,10 @@
 
 - Add SQLite write mutex for cross-process multi-threaded writes（[30cb23a](https://github.com/tdyx87/libmini/commit/30cb23a0a2f15493da5fb11dd022ce97b0108297)）
 
+#### 修复
+
+- Fix Windows SqliteWriteMutex to use real file locks（[1552567](https://github.com/tdyx87/libmini/commit/155256799cd05af728a4596c582382d77009c3db)）
+
 <!-- END generated:unreleased -->
 
 ## [1.0.0] - 2026-10-07
