@@ -142,7 +142,7 @@ target_link_libraries(app PRIVATE libmini::libmini)
 | 模块 | 头文件 | 内容 |
 |---|---|---|
 | string_utils | `utils/string_utils.h` | split / trim / replace / to_upper / to_lower |
-| string_algo | `utils/string_algo.h` | starts_with / ends_with / iequals / replace_all / split_string / join |
+| string_algo | `utils/string_algo.h` | starts_with / ends_with / iequals / replace_all / split_string / join；**UTF-8 感知**的 utf8_is_valid / utf8_length / utf8_byte_offset / utf8_substr / utf8_slice / utf8_truncate / utf8_truncate_bytes / utf8_tail（按码点计数与切分，绝不会把多字节序列切成两半） |
 | lexical_cast | `utils/lexical_cast.h` | 字符串↔数值转换（严格模式，失败抛 bad_lexical_cast） |
 | time_utils | `utils/time_utils.h` | 时间戳、格式化 + ISO-8601/RFC-3339 格式化与解析（Z/±HH:MM 偏移、基本与扩展格式）+ 日历运算（月份加减/星期/月末/日期串互转） |
 | stopwatch | `utils/stopwatch.h` | 高精度计时（pause/resume/restart） |
@@ -218,6 +218,13 @@ EXPECT_EQ(join(parts, "|"), "a|b|c");
 
 int n = lexical_cast<int>("42");                 // 失败抛 bad_lexical_cast
 int safe = lexical_cast_or<int>("x", -1);        // 失败返回默认值
+
+// UTF-8 感知：按「字符」而非字节计数、截断、取子串（另见 utils/string_algo.h）
+std::size_t chars = utf8_length(text);           // "中文" → 2，不是 6
+std::string cut   = utf8_truncate(text, 20);     // 截到 20 个字，不会切坏序列
+std::string fit   = utf8_truncate_bytes(text, 255);  // 适合 DB VARCHAR(255)
+std::string page  = utf8_slice(text, 10, 20);    // Python 风格 [10, 20)
+if (!utf8_is_valid(text)) { /* 输入不是合法 UTF-8 */ }
 ```
 
 ### 时间与计时

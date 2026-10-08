@@ -92,6 +92,131 @@ TEST(StringAlgoTest, SplitJoin)
     EXPECT_EQ(join({"only"}, "-"), "only");
 }
 
+// ------------------------- string_algo（UTF-8 感知） -------------------------
+//
+// 核心主张：按码点切分不会破坏多字节序列——任意切点下，输出必须仍是合法
+// UTF-8，且是原串的字节前缀。
+
+TEST(Utf8Test, ValidityDetection)
+{
+    using namespace libmini;
+    EXPECT_TRUE(utf8_is_valid(""));
+    EXPECT_TRUE(utf8_is_valid("plain ascii"));
+    EXPECT_TRUE(utf8_is_valid("中文测试"));          // 3 字节序列
+    EXPECT_TRUE(utf8_is_valid("\xF0\x9F\x98\x80"));  // U+1F600，4 字节
+
+    EXPECT_FALSE(utf8_is_valid("\x80"));              // 孤立续字节
+    EXPECT_FALSE(utf8_is_valid("\xE4\xB8"));          // 被截断的三字节序列
+    EXPECT_FALSE(utf8_is_valid("\xC0\x80"));          // 过长编码（overlong NUL）
+    EXPECT_FALSE(utf8_is_valid("\xED\xA0\x80"));      // U+D800，代理项区间
+    EXPECT_FALSE(utf8_is_valid("\xF4\x90\x80\x80"));  // U+110000，超出码点上限
+    EXPECT_FALSE(utf8_is_valid("ok\xFF"));            // 0xFF 不是合法首字节
+}
+
+TEST(Utf8Test, LengthCountsCodePoints)
+{
+    using namespace libmini;
+    EXPECT_EQ(utf8_length(""), 0u);
+    EXPECT_EQ(utf8_length("abc"), 3u);
+    EXPECT_EQ(utf8_length("中文"), 2u);
+    EXPECT_EQ(utf8_length("a中b"), 3u);
+    EXPECT_EQ(utf8_length("\xF0\x9F\x98\x80"), 1u);  // emoji：1 个字符、4 字节
+
+    // 对照：字节长度随内容膨胀，界面上的「几个字」要用 utf8_length
+    EXPECT_EQ(std::string("中文").size(), 6u);
+}
+
+TEST(Utf8Test, ByteOffsetMapping)
+{
+    using namespace libmini;
+    const std::string s = "a中文";  // 1 + 3 + 3 = 7 字节，3 个字符
+    EXPECT_EQ(s.size(), 7u);
+    EXPECT_EQ(utf8_byte_offset(s, 0), 0u);
+    EXPECT_EQ(utf8_byte_offset(s, 1), 1u);
+    EXPECT_EQ(utf8_byte_offset(s, 2), 4u);
+    EXPECT_EQ(utf8_byte_offset(s, 3), 7u);                 // == size()
+    EXPECT_EQ(utf8_byte_offset(s, 4), std::string::npos);  // 越界
+}
+
+TEST(Utf8Test, SubstrAndSliceByCodePoint)
+{
+    using namespace libmini;
+    const std::string s = "中文测试";  // 4 个字符、12 字节
+
+    EXPECT_EQ(utf8_substr(s, 1, 2), "文测");
+    EXPECT_EQ(utf8_substr(s, 2), "测试");  // count 默认到末尾
+    EXPECT_EQ(utf8_substr(s, 0), s);
+    EXPECT_EQ(utf8_substr(s, 4), "");  // 刚好落在末尾
+    EXPECT_EQ(utf8_substr(s, 9), "");  // 越界 → 空串
+
+    EXPECT_EQ(utf8_slice(s, 1, 3), "文测");
+    EXPECT_EQ(utf8_slice(s, 2, std::string::npos), "测试");
+    EXPECT_EQ(utf8_slice(s, 3, 1), "");  // end <= begin
+    EXPECT_EQ(utf8_slice(s, 0, 0), "");
+    EXPECT_EQ(utf8_slice(s, 9, std::string::npos), "");
+}
+
+TEST(Utf8Test, TruncateNeverSplitsSequences)
+{
+    using namespace libmini;
+    const std::string s = "中a文b";  // 4 个字符、8 字节
+
+    EXPECT_EQ(utf8_truncate(s, 0), "");
+    EXPECT_EQ(utf8_truncate(s, 1), "中");
+    EXPECT_EQ(utf8_truncate(s, 3), "中a文");
+    EXPECT_EQ(utf8_truncate(s, 10), s);
+
+    // 任意切点：输出必须是合法 UTF-8，且是原串的字节前缀
+    for (std::size_t n = 0; n <= utf8_length(s) + 1; ++n) {
+        const std::string cut = utf8_truncate(s, n);
+        const std::size_t expected = n > utf8_length(s) ? utf8_length(s) : n;
+        EXPECT_TRUE(utf8_is_valid(cut)) << "n=" << n;
+        EXPECT_EQ(s.compare(0, cut.size(), cut), 0) << "n=" << n;
+        EXPECT_EQ(utf8_length(cut), expected) << "n=" << n;
+    }
+
+    // 对照：字节级截断会把序列切坏（这正是要避免的）
+    EXPECT_FALSE(utf8_is_valid(std::string("中文").substr(0, 1)));
+}
+
+TEST(Utf8Test, TruncateBytesRespectsBoundary)
+{
+    using namespace libmini;
+    const std::string s = "中文";  // 6 字节，2 个字符
+
+    EXPECT_EQ(utf8_truncate_bytes(s, 0), "");
+    EXPECT_EQ(utf8_truncate_bytes(s, 2), "");   // 放不下第一个 3 字节字符
+    EXPECT_EQ(utf8_truncate_bytes(s, 3), "中");
+    EXPECT_EQ(utf8_truncate_bytes(s, 5), "中");  // 宁可短一点，也不切半个「文」
+    EXPECT_EQ(utf8_truncate_bytes(s, 6), s);
+    EXPECT_EQ(utf8_truncate_bytes(s, 99), s);
+
+    EXPECT_EQ(utf8_truncate_bytes("abcdef", 3), "abc");  // 纯 ASCII 按字节切
+}
+
+TEST(Utf8Test, TailKeepsWholeCharacters)
+{
+    using namespace libmini;
+    const std::string s = "中文测试";
+    EXPECT_EQ(utf8_tail(s, 0), "");
+    EXPECT_EQ(utf8_tail(s, 2), "测试");
+    EXPECT_EQ(utf8_tail(s, 3), "文测试");
+    EXPECT_EQ(utf8_tail(s, 4), s);
+    EXPECT_EQ(utf8_tail(s, 99), s);
+}
+
+TEST(Utf8Test, TolerantOnInvalidInput)
+{
+    using namespace libmini;
+    // 非法字节按 1 个「字符」计：不丢字节，也不会让后面的位置整体错位
+    const std::string bad = "a\x80\xE4\xB8\xAD";  // 'a' + 孤立续字节 + "中"
+    EXPECT_FALSE(utf8_is_valid(bad));
+    EXPECT_EQ(utf8_length(bad), 3u);  // 'a'、0x80、'中'
+    EXPECT_EQ(utf8_substr(bad, 1, 1), "\x80");
+    EXPECT_EQ(utf8_substr(bad, 2, 1), "中");  // 坏字节没让后面错位
+    EXPECT_TRUE(utf8_is_valid(utf8_substr(bad, 2, 1)));
+}
+
 // ------------------------------ lexical_cast ------------------------------
 
 TEST(LexicalCastTest, BasicConversions)
