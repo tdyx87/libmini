@@ -5,6 +5,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <iostream>
+#include <chrono>
+#include <thread>
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -153,7 +156,7 @@ void SqliteDatabase::close()
     if (db_ != nullptr) {
         // SQLITE_OK 表示所有语句已 finalize；有遗留语句时返回 SQLITE_BUSY，
         // 析构顺序由调用方保证，这里尽力关闭
-        ::sqlite3_close(db_);
+        (void)::sqlite3_close(db_);
         db_ = nullptr;
     }
 }
@@ -689,19 +692,62 @@ static void* wlock_create(const std::string& db) {
         ::MultiByteToWideChar(CP_UTF8, 0, p.c_str(), -1, &buf[0], n);
         return buf;
     }(db + ".wlock");
+    // 共享读/写模式：允许多个进程打开同一个 .wlock 文件（获得各自的句柄），
+    // 但真正的互斥由后续 LockFile 锁定字节范围来保障（系统范围的字节范围锁，
+    // 跨进程、跨线程）。OPEN_ALWAYS 语义：文件不存在则创建，存在则打开。
     void* h = ::CreateFileW(w.c_str(), GENERIC_READ | GENERIC_WRITE,
-                            0, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+                            FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS,
+                            FILE_ATTRIBUTE_NORMAL, nullptr);
     return (h == INVALID_HANDLE_VALUE) ? nullptr : h;
 }
 static void wlock_destroy(void* h) {
-    if (h != nullptr && h != INVALID_HANDLE_VALUE) ::CloseHandle(reinterpret_cast<void*>(h));
+    if (h != nullptr && h != INVALID_HANDLE_VALUE) {
+        HANDLE fh = reinterpret_cast<HANDLE>(h);
+        // 纳入防御性解锁（若已释放则 Ignore）。随后关闭句柄。
+        const DWORD LOCK_LEN = 0x100000;
+        (void)::UnlockFile(fh, 0, 0, LOCK_LEN, 0);
+        ::CloseHandle(fh);
+    }
 }
 static bool wlock_try_acquire(void* h, int timeout_ms) {
-    (void)timeout_ms;
-    if (h == nullptr || h == INVALID_HANDLE_VALUE) return false;
-    return true;
+    if (h == nullptr || h == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+    HANDLE fh = reinterpret_cast<HANDLE>(h);
+    // 使用 LockFile（纯同步、无 OVERLAPPED）：锁定文件起始处的 1MB，足以覆盖
+    // .wlock 文件（同步 API 不涉及异步事件句柄，避免访问空 hEvent 的 AV）。
+    const DWORD LOCK_LEN = 0x100000;   // 1MB
+    (void)LOCK_LEN;  // 静默未使用检测（始终被 LockFile/UnlockFile 引用）
+    if (timeout_ms <= 0) {
+        const bool ok = ::LockFile(fh, 0, 0, LOCK_LEN, 0) != 0;
+        return ok;
+    }
+    auto start = std::chrono::steady_clock::now();
+    while (true) {
+        const bool ok = ::LockFile(fh, 0, 0, LOCK_LEN, 0) != 0;
+        if (ok) {
+            return true;
+        }
+        const DWORD err = ::GetLastError();
+        if (err != ERROR_LOCK_VIOLATION && err != ERROR_BUSY) {
+            return false;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        auto now = std::chrono::steady_clock::now();
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - start);
+        if (elapsed.count() >= static_cast<long long>(timeout_ms)) {
+            return false;
+        }
+    }
 }
-static void wlock_release(void* h) { wlock_destroy(h); }
+static void wlock_release(void* h) {
+    if (h != nullptr && h != INVALID_HANDLE_VALUE) {
+        HANDLE fh = reinterpret_cast<HANDLE>(h);
+        // 解锁与 LockFile 锁定的范围一致（1MB，从偏移 0 开始）。
+        const DWORD LOCK_LEN = 0x100000;
+        (void)::UnlockFile(fh, 0, 0, LOCK_LEN, 0);
+    }
+}
 static bool wlock_is_held(void* h) {
     return h != nullptr && h != INVALID_HANDLE_VALUE;
 }
@@ -752,8 +798,12 @@ SqliteWriteMutex::SqliteWriteMutex(const std::string& path)
 
 SqliteWriteMutex::~SqliteWriteMutex()
 {
-    if (impl_ != nullptr) { wlock_destroy(impl_); impl_ = nullptr; }
+    if (impl_ != nullptr) {
+        wlock_destroy(impl_);
+        impl_ = nullptr;
+    }
 }
+
 
 bool SqliteWriteMutex::acquire(int timeout_ms)
 {
@@ -768,6 +818,7 @@ void SqliteWriteMutex::release()
         impl_ = nullptr;
     }
 }
+
 
 bool SqliteWriteMutex::is_held() const
 {
