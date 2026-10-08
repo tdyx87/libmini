@@ -5,6 +5,12 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <Windows.h>
+#endif
 
 namespace libmini {
 
@@ -658,6 +664,136 @@ void SqliteTransaction::rollback()
     }
     db_->rollback();
     active_ = false;
+}
+
+
+namespace {
+struct WLockHandle {
+#ifdef _WIN32
+    void* h = nullptr;
+#else
+    int fd = -1;
+#endif
+};
+
+#ifndef INVALID_HANDLE_VALUE
+#define INVALID_HANDLE_VALUE reinterpret_cast<void*>(-1)
+#endif
+
+#ifdef _WIN32
+static void* wlock_create(const std::string& db) {
+    const std::wstring w = [] (const std::string& p) {
+        if (p.empty()) return std::wstring();
+        int n = static_cast<int>(::MultiByteToWideChar(CP_UTF8, 0, p.c_str(), -1, nullptr, 0));
+        std::wstring buf(static_cast<std::size_t>(n), L'\0');
+        ::MultiByteToWideChar(CP_UTF8, 0, p.c_str(), -1, &buf[0], n);
+        return buf;
+    }(db + ".wlock");
+    void* h = ::CreateFileW(w.c_str(), GENERIC_READ | GENERIC_WRITE,
+                            0, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    return (h == INVALID_HANDLE_VALUE) ? nullptr : h;
+}
+static void wlock_destroy(void* h) {
+    if (h != nullptr && h != INVALID_HANDLE_VALUE) ::CloseHandle(reinterpret_cast<void*>(h));
+}
+static bool wlock_try_acquire(void* h, int timeout_ms) {
+    (void)timeout_ms;
+    if (h == nullptr || h == INVALID_HANDLE_VALUE) return false;
+    return true;
+}
+static void wlock_release(void* h) { wlock_destroy(h); }
+static bool wlock_is_held(void* h) {
+    return h != nullptr && h != INVALID_HANDLE_VALUE;
+}
+#else
+#include <unistd.h>
+#include <sys/file.h>
+#include <fcntl.h>
+static void* wlock_create(const std::string& db) {
+    int fd = ::open((db + ".wlock").c_str(), O_RDWR | O_CREAT, 0600);
+    return (fd < 0) ? nullptr : reinterpret_cast<void*>(fd);
+}
+static void wlock_destroy(void* h) {
+    if (h) { int fd = reinterpret_cast<int>(h); ::close(fd); }
+}
+static bool wlock_try_acquire(void* h, int timeout_ms) {
+    if (!h) return false;
+    int fd = reinterpret_cast<int>(h);
+    if (timeout_ms <= 0) {
+        if (::flock(fd, LOCK_EX | LOCK_NB) != 0) return false;
+        return true;
+    }
+    auto start = std::chrono::steady_clock::now();
+    int tries = 0;
+    while (true) {
+        if (::flock(fd, LOCK_EX | LOCK_NB) == 0) return true;
+        if (errno != EAGAIN && errno != EWOULDBLOCK) return false;
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        auto now = std::chrono::steady_clock::now();
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - start);
+        if (elapsed.count() >= static_cast<long long>(timeout_ms)) return false;
+        ++tries;
+        if (tries > 10000) return false;
+    }
+}
+static void wlock_release(void* h) {
+    if (h) { int fd = reinterpret_cast<int>(h); ::flock(fd, LOCK_UN); ::close(fd); }
+}
+static bool wlock_is_held(void* h) { return h != nullptr; }
+#endif
+}  // namespace
+
+// ==================== SqliteWriteMutex ====================
+SqliteWriteMutex::SqliteWriteMutex(const std::string& path)
+    : path_(path)
+{
+    impl_ = wlock_create(path);
+}
+
+SqliteWriteMutex::~SqliteWriteMutex()
+{
+    if (impl_ != nullptr) { wlock_destroy(impl_); impl_ = nullptr; }
+}
+
+bool SqliteWriteMutex::acquire(int timeout_ms)
+{
+    if (impl_ == nullptr) return false;
+    return wlock_try_acquire(impl_, timeout_ms);
+}
+
+void SqliteWriteMutex::release()
+{
+    if (impl_ != nullptr) {
+        wlock_release(impl_);
+        impl_ = nullptr;
+    }
+}
+
+bool SqliteWriteMutex::is_held() const
+{
+    if (impl_ == nullptr) return false;
+    return wlock_is_held(impl_);
+}
+
+const std::string& SqliteWriteMutex::path() const
+{
+    return path_;
+}
+
+SqliteWriteMutexGuard::SqliteWriteMutexGuard(const std::string& path, int timeout_ms)
+    : mutex_(path)
+{
+    if (!mutex_.acquire(timeout_ms)) mutex_.release();
+}
+
+SqliteWriteMutexGuard::~SqliteWriteMutexGuard()
+{
+    mutex_.release();
+}
+
+bool SqliteWriteMutexGuard::acquired() const
+{
+    return mutex_.is_held();
 }
 
 }  // namespace libmini

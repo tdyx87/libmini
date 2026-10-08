@@ -228,6 +228,52 @@ private:
     bool active_ = false;
 };
 
+// 跨进程/线程共享数据库文件时的写互斥器。
+// SQLite 的文件级锁（WAL + busy）能串行写事务，但两进程同时持有「写意向」
+// 时第二个进程会挂在 busy 上直至超时——由调用方决定是否友好。应用程序若希望
+// 「至多一个写入事务在库级工作、其他写请求排队/失败」的语义，可在事务外用
+// 下面的写互斥器抢占库级写槽；持有写互斥器的线程/进程才允许 BEGIN ... COMMIT。
+class LIBMINI_API SqliteWriteMutex
+{
+public:
+    // path：要保护的共享数据库文件路径（锁文件是 <path>.wlock，持久不删）
+    explicit SqliteWriteMutex(const std::string& path);
+    ~SqliteWriteMutex();
+
+    SqliteWriteMutex(const SqliteWriteMutex&) = delete;
+    SqliteWriteMutex& operator=(const SqliteWriteMutex&) = delete;
+
+    // 阻塞获取库级写槽——拿到后方可在对应数据库上 BEGIN 写入事务。
+    // 返回是否拿到（超时/失败返回 false）。
+    bool acquire(int timeout_ms);
+
+    // 释放写槽（事务结束后、commit/rollback 后调用；未持有时为 no-op）。
+    void release();
+
+    bool is_held() const;
+    const std::string& path() const;
+
+private:
+    std::string path_;
+    void* impl_ = nullptr;  // 平台锁句柄
+};
+
+// RAII 写互斥器：构造时阻塞取得库级写槽，析构自动释放。
+class LIBMINI_API SqliteWriteMutexGuard
+{
+public:
+    explicit SqliteWriteMutexGuard(const std::string& path, int timeout_ms);
+    ~SqliteWriteMutexGuard();
+
+    SqliteWriteMutexGuard(const SqliteWriteMutexGuard&) = delete;
+    SqliteWriteMutexGuard& operator=(const SqliteWriteMutexGuard&) = delete;
+
+    bool acquired() const;
+
+private:
+    SqliteWriteMutex mutex_;
+};
+
 }  // namespace libmini
 
 #endif  // LIBMINI_SQLITE_H

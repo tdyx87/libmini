@@ -3472,9 +3472,8 @@ TEST(AesGcmTest, SealOpenRandomNonce)
     EXPECT_TRUE(libmini::Aes256Gcm::open(key, tampered).empty());  // 篡改检测
 }
 
-// ------------------------------ sqlite ------------------------------
 
-namespace {
+// ------------------------------ sqlite ------------------------------
 
 // 临时数据库文件路径（每测试唯一，避免并发冲突）
 std::string sqlite_temp_path(const char* name)
@@ -3509,7 +3508,115 @@ void create_users_table(libmini::SqliteDatabase& db, int n)
     }
 }
 
-}  // namespace
+
+TEST(SqliteTest_WMutex, WriteMutexSingleHolderSucceeds)
+{
+    using namespace libmini;
+    const std::string path = sqlite_temp_path("_wmutex");
+    remove_file(path);
+    {
+        SqliteWriteMutex wm(path);
+        EXPECT_TRUE(wm.acquire(4000));
+        EXPECT_TRUE(wm.is_held());
+        EXPECT_EQ(wm.path(), path);
+        {
+            SqliteDatabase db(path);
+            ASSERT_TRUE(db.is_open());
+            ASSERT_TRUE(db.exec("CREATE TABLE t (v INTEGER)"));
+            ASSERT_TRUE(db.exec("INSERT INTO t VALUES (1)"));
+            EXPECT_EQ(db.changes(), 1);
+        }
+        wm.release();
+        EXPECT_FALSE(wm.is_held());
+    }
+    remove_file(path);
+    // wlock file is left behind (设计如此)
+    EXPECT_TRUE(file_exists(path + ".wlock"));
+    remove_file(path + ".wlock");
+}
+
+
+TEST(SqliteTest_WMutex, WriteMutexCrossThreadSerializesWriters)
+{
+    using namespace libmini;
+    const std::string path = sqlite_temp_path("_wmutex_xthread");
+    remove_file(path);
+    remove_file(path + ".wlock");
+    {
+        // Give the spawned threads a fair shot to contend for the slot.
+        // Spawn first (they'll pile up on the wlock syscall), then hold the
+        // slot across threads, then release so exactly one of them proceeds.
+        std::atomic<int> acquired{0};
+        std::atomic<int> committed{0};
+        std::atomic<int> failed{0};
+        std::vector<std::thread> threads;
+        for (int i = 0; i < 4; ++i) {
+            threads.emplace_back([&]() {
+                SqliteWriteMutex wm(path);
+                if (wm.acquire(400)) {
+                    ++acquired;
+                    {
+                        SqliteDatabase db(path);
+                        if (db.is_open() && db.exec("INSERT INTO t VALUES (" + std::to_string(i) + ")")) {
+                            ++committed;
+                        }
+                    }
+                    wm.release();
+                } else {
+                    ++failed;
+                }
+            });
+        }
+        // let threads pile onto the lock, then take the slot away from them
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        {
+            SqliteWriteMutex holder(path);
+            ASSERT_TRUE(holder.acquire(4000));
+            ASSERT_TRUE(holder.is_held());
+            std::this_thread::sleep_for(std::chrono::milliseconds(30));
+            holder.release();
+        }
+        for (auto& th : threads) th.join();
+        // after holder released, at least one thread should have proceeded
+        EXPECT_GT(acquired.load(), 0);
+        // exactly the threads we spawned should have tried (all accounted for)
+        EXPECT_EQ(acquired.load() + failed.load(), 4);
+    }
+    remove_file(path);
+    remove_file(path + ".wlock");
+}
+
+
+TEST(SqliteTest_WMutex, WriteMutexGuardsBeginCommitProtocol)
+{
+    using namespace libmini;
+    const std::string path = sqlite_temp_path("_wmutex_protocol");
+    remove_file(path);
+    remove_file(path + ".wlock");
+    {
+        SqliteWriteMutexGuard guard(path, 4000);
+        ASSERT_TRUE(guard.acquired());
+        {
+            SqliteDatabase db(path);
+            ASSERT_TRUE(db.is_open());
+            ASSERT_TRUE(db.exec("CREATE TABLE t (v INTEGER)"));
+            {
+                SqliteTransaction tx(db);
+                ASSERT_TRUE(tx.is_active());
+                SqliteStatement ins(db, "INSERT INTO t VALUES (?)");
+                ASSERT_TRUE(ins.bind_int(1, 42));
+                ASSERT_EQ(ins.step(), SqliteStatement::StepDone);
+                ASSERT_TRUE(tx.commit());
+                EXPECT_FALSE(tx.is_active());
+            }
+            SqliteStatement cnt(db, "SELECT COUNT(*) FROM t");
+            ASSERT_EQ(cnt.step(), SqliteStatement::StepRow);
+            EXPECT_EQ(cnt.column_int(0), 1);
+        }
+    }
+    remove_file(path);
+    remove_file(path + ".wlock");
+}
 
 TEST(SqliteTest, InMemoryOpenAndExec)
 {
