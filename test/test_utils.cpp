@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "libmini.h"
+#include "utils/charset.h"
 
 // ------------------------------ string_algo ------------------------------
 
@@ -338,6 +339,155 @@ TEST(UrlEncodeTest, RoundTrip)
     // 非法转义原样保留
     EXPECT_EQ(UrlEncode::decode("100%"), "100%");
     EXPECT_EQ(UrlEncode::decode("%G1"), "%G1");
+}
+
+// -------------------------------- charset --------------------------------
+
+namespace {
+
+// 用字节值拼接字符串：十六进制转义（\x87 之类）与相邻十六进制字符极易看错
+std::string byte_string(std::initializer_list<int> values)
+{
+    std::string out;
+    for (int v : values) {
+        out.push_back(static_cast<char>(v));
+    }
+    return out;
+}
+
+// 精简 libc（如 musl）可能没带 GBK 模块，相关用例整体跳过
+bool gbk_supported()
+{
+    return libmini::CharsetConverter::is_supported(libmini::Charset::Utf8,
+                                                   libmini::Charset::Gbk);
+}
+
+}  // namespace
+
+TEST(CharsetTest, Utf8ToUtf16KnownBytes)
+{
+    using namespace libmini;
+    const std::string utf8 = byte_string({0xE4, 0xB8, 0xAD, 0xE6, 0x96, 0x87});
+
+    std::string out;
+    ASSERT_EQ(CharsetConverter::convert(utf8, Charset::Utf8, Charset::Utf16Le, out),
+              CharsetStatus::Ok);
+    EXPECT_EQ(out, byte_string({0x2D, 0x4E, 0x87, 0x65}));  // 中文（小端）
+
+    ASSERT_EQ(CharsetConverter::convert(utf8, Charset::Utf8, Charset::Utf16Be, out),
+              CharsetStatus::Ok);
+    EXPECT_EQ(out, byte_string({0x4E, 0x2D, 0x65, 0x87}));  // 中文（大端）
+}
+
+TEST(CharsetTest, Utf16EndiannessSwap)
+{
+    using namespace libmini;
+    const std::string le = byte_string({0x2D, 0x4E, 0x87, 0x65});
+
+    std::string out;
+    ASSERT_EQ(CharsetConverter::convert(le, Charset::Utf16Le, Charset::Utf16Be, out),
+              CharsetStatus::Ok);
+    EXPECT_EQ(out, byte_string({0x4E, 0x2D, 0x65, 0x87}));
+
+    ASSERT_EQ(CharsetConverter::convert(out, Charset::Utf16Be, Charset::Utf16Le, out),
+              CharsetStatus::Ok);
+    EXPECT_EQ(out, le);
+}
+
+TEST(CharsetTest, GbkRoundTripThroughUtf8)
+{
+    using namespace libmini;
+    if (!gbk_supported()) {
+        GTEST_SKIP() << "GBK not available on this platform";
+    }
+    const std::string gbk = byte_string({0xD6, 0xD0, 0xCE, 0xC4});
+    const std::string utf8 = byte_string({0xE4, 0xB8, 0xAD, 0xE6, 0x96, 0x87});
+
+    bool ok = false;
+    EXPECT_EQ(CharsetConverter::to_utf8(gbk, Charset::Gbk, &ok), utf8);
+    EXPECT_TRUE(ok);
+
+    ok = false;
+    EXPECT_EQ(CharsetConverter::from_utf8(utf8, Charset::Gbk, &ok), gbk);
+    EXPECT_TRUE(ok);
+
+    // 经 UTF-16 中转应与直转结果一致
+    std::string via_utf16;
+    ASSERT_EQ(CharsetConverter::convert(gbk, Charset::Gbk, Charset::Utf16Le, via_utf16),
+              CharsetStatus::Ok);
+    std::string back;
+    ASSERT_EQ(CharsetConverter::convert(via_utf16, Charset::Utf16Le, Charset::Gbk, back),
+              CharsetStatus::Ok);
+    EXPECT_EQ(back, gbk);
+}
+
+TEST(CharsetTest, SameCharsetIsPassthrough)
+{
+    using namespace libmini;
+    const std::string raw = byte_string({0x00, 0xFF, 0x80});  // 非法 UTF-8 也原样返回
+    std::string out;
+    EXPECT_EQ(CharsetConverter::convert(raw, Charset::Utf8, Charset::Utf8, out),
+              CharsetStatus::Ok);
+    EXPECT_EQ(out, raw);
+}
+
+TEST(CharsetTest, RejectsInvalidInput)
+{
+    using namespace libmini;
+    std::string out;
+
+    // UTF-8：0xFF 不是合法首字节；0xE4 0xB8 是被截断的三字节序列
+    EXPECT_EQ(CharsetConverter::convert(byte_string({0xFF}), Charset::Utf8,
+                                        Charset::Utf16Le, out),
+              CharsetStatus::InvalidSequence);
+    EXPECT_EQ(CharsetConverter::convert(byte_string({0xE4, 0xB8}), Charset::Utf8,
+                                        Charset::Utf16Le, out),
+              CharsetStatus::InvalidSequence);
+
+    // UTF-16：奇数长度、孤立高代理项
+    EXPECT_EQ(CharsetConverter::convert(byte_string({0x2D}), Charset::Utf16Le,
+                                        Charset::Utf8, out),
+              CharsetStatus::InvalidSequence);
+    EXPECT_EQ(CharsetConverter::convert(byte_string({0x00, 0xD8}), Charset::Utf16Le,
+                                        Charset::Utf8, out),
+              CharsetStatus::InvalidSequence);
+    EXPECT_EQ(CharsetConverter::convert(byte_string({0xD8, 0x00}), Charset::Utf16Be,
+                                        Charset::Utf8, out),
+              CharsetStatus::InvalidSequence);
+
+    if (gbk_supported()) {
+        // GBK：半截双字节序列
+        EXPECT_EQ(CharsetConverter::convert(byte_string({0xD6}), Charset::Gbk,
+                                            Charset::Utf8, out),
+                  CharsetStatus::InvalidSequence);
+        // 目标编码装不下：U+1F600 不在 GBK 里，不得静默替换成 '?'
+        EXPECT_EQ(CharsetConverter::convert(byte_string({0xF0, 0x9F, 0x98, 0x80}),
+                                            Charset::Utf8, Charset::Gbk, out),
+                  CharsetStatus::InvalidSequence);
+    }
+}
+
+TEST(CharsetTest, OutputUntouchedOnFailure)
+{
+    using namespace libmini;
+    std::string out = "keep-me";
+    EXPECT_EQ(CharsetConverter::convert(byte_string({0xFF}), Charset::Utf8,
+                                        Charset::Utf16Le, out),
+              CharsetStatus::InvalidSequence);
+    EXPECT_EQ(out, "keep-me");
+}
+
+TEST(CharsetTest, EmptyInputAndNames)
+{
+    using namespace libmini;
+    std::string out;
+    EXPECT_EQ(CharsetConverter::convert(std::string(), Charset::Utf8, Charset::Gbk, out),
+              CharsetStatus::Ok);
+    EXPECT_TRUE(out.empty());
+
+    EXPECT_STREQ(CharsetConverter::name(Charset::Gbk), "GBK");
+    EXPECT_STREQ(CharsetConverter::name(Charset::Utf16Be), "UTF-16BE");
+    EXPECT_TRUE(CharsetConverter::is_supported(Charset::Utf8, Charset::Utf16Le));
 }
 
 // ------------------------------- stopwatch -------------------------------

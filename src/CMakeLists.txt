@@ -21,6 +21,7 @@ set(LIBMINI_SOURCES
     utils/uuid.cpp
     utils/crc.cpp
     utils/encoding.cpp
+    utils/charset.cpp
     utils/random_utils.cpp
     utils/secure_random.cpp
     utils/env.cpp    utils/digest.cpp
@@ -152,6 +153,12 @@ else()
     # 显式声明保证 Linux/macOS 均链接正确）
     find_package(Threads REQUIRED)
     target_link_libraries(libmini PUBLIC Threads::Threads)
+
+    # charset 的 GBK ↔ Unicode 转换在非 Windows 平台走 iconv：glibc 内建
+    # （Iconv::Iconv 是空接口目标，不引入额外链接），其余平台由 libiconv 提供。
+    # Windows 侧用 Win32 代码页 API，不依赖 iconv
+    find_package(Iconv REQUIRED)
+    target_link_libraries(libmini PUBLIC Iconv::Iconv)
 endif()
 
 # ---------------- TLS（httplib 的 SSL 客户端/服务端） ----------------

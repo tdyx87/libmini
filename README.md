@@ -158,6 +158,7 @@ target_link_libraries(app PRIVATE libmini::libmini)
 | uuid | `utils/uuid.h` | v4 随机生成与解析；**v7 时间有序**（RFC 9562，前 48 位 Unix 毫秒 + 进程内计数器，单进程内严格单调递增，写密集场景当主键时索引体积与写入放大远优于 v4）；**v5 命名空间派生**（含 DNS/URL/OID/X500 四个预定义命名空间，同输入恒等输出）；另有 `version()` / `variant()` / `timestamp_ms()` |
 | crc | `utils/crc.h` | CRC-32（zlib）/ CRC-16 Modbus / CRC-64 XZ / Adler-32，均支持增量计算 |
 | encoding | `utils/encoding.h` | Base64 / Base64url（JWT/URL 安全，默认无填充）/ Hex / URL 编解码 |
+| charset | `utils/charset.h` | 字符编码转换（UTF-8 / UTF-16LE / UTF-16BE / GBK 任意互转）：Windows 走 Win32 代码页、其它平台走 iconv，均不新增依赖；非法/截断输入返回 `InvalidSequence` 而不是静默替换成 `?` |
 | scope_guard | `utils/scope_guard.h` | RAII 作用域守卫（dismiss / 可移动） |
 | optional | `utils/optional.h` | C++11 版 optional（value_or / emplace） |
 | random_utils | `utils/random_utils.h` | 随机整数/浮点/字符串/挑选 |
@@ -508,6 +509,15 @@ const RpcClientPoolStats pls = tcp_client.pool_stats();
 std::string b64 = Base64::encode(raw);
 Hex::decode("DEADBEEF", out);
 std::string q = UrlEncode::encode("a b&c=中文");
+
+// 字符编码转换（另见 utils/charset.h）：库对外统一 UTF-8，其它编码只在边界转
+std::string utf8 = CharsetConverter::to_utf8(gbk_bytes, Charset::Gbk);
+std::string gbk  = CharsetConverter::from_utf8(utf8, Charset::Gbk);
+std::string out;
+if (CharsetConverter::convert(utf8, Charset::Utf8, Charset::Utf16Le, out) !=
+    CharsetStatus::Ok) {
+    // 非法/截断输入：不静默替换成 '?'，交给调用方处置
+}
 
 std::string md5 = Md5::hex(data);                  // 32 位小写
 Md5 m; m.update(chunk1); m.update(chunk2);         // 增量
