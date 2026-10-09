@@ -45,6 +45,20 @@ jobs:
           - name: ubuntu-warnings-strict
             os: ubuntu-latest
             warnings_as_errors: true
+          # 完整 UAX #29 属性表（-DLIBMINI_UNICODE_FULL_GRAPHEME=ON）：默认的
+          # 启发式表之外还有一条编译分支（src/utils/grapheme_tables_full.inc，
+          # 由 ci/gen_grapheme_tables.py 从 UCD 生成），之前没有任何 CI 变体编译过
+          # 它。这里在两个平台各跑一份：全量 CTest + 安装冒烟，数据驱动的
+          # GraphemeTest.Uax29OfficialTestFile 在该模式下要求 853/853 零偏差
+          #（启发式模式只白名单放行补充平面的 Indic 连字那一条）。
+          # 不复用 Release 基线变体：基线要覆盖用户默认拿到的配置，这条是
+          # 另一种构建，单独列出来在 job 名上就看得见
+          - name: ubuntu-full-grapheme
+            os: ubuntu-latest
+            full_grapheme: true
+          - name: windows-full-grapheme
+            os: windows-latest
+            full_grapheme: true
 
     env:
       # 冒烟消费者与安装树的构建目录（路径含空格风险，统一放工作区根下）
@@ -109,6 +123,19 @@ jobs:
           -DLIBMINI_BUILD_SWF_VIEWER=OFF
           -DLIBMINI_BUILD_SHARED=${{ matrix.lib_type == 'shared' && 'ON' || 'OFF' }}
           -DLIBMINI_WARNINGS_AS_ERRORS=${{ matrix.warnings_as_errors && 'ON' || 'OFF' }}
+          -DLIBMINI_UNICODE_FULL_GRAPHEME=${{ matrix.full_grapheme && 'ON' || 'OFF' }}
+
+      # 开关静默失效是这条变体唯一的假绿方式：若 -D 没真正落到编译命令行，
+      # 库会照旧编启发式表，而 GraphemeTest（只看运行期结果）仍会通过
+      # ——full 模式要求的 853/853 就形同虚设。这里直接查 ninja 编译数据库：
+      # 该定义是 PUBLIC，libmini 与 test_utils 都在用，计数必须 > 0
+      - name: Verify the full grapheme table is compiled in
+        if: matrix.full_grapheme
+        shell: bash
+        run: |
+          count=$(grep -c 'LIBMINI_UNICODE_FULL_GRAPHEME=1' build/build.ninja || true)
+          echo "compile rules carrying LIBMINI_UNICODE_FULL_GRAPHEME=1: $count"
+          test "${count:-0}" -gt 0
 
       - name: Build
         run: cmake --build build --parallel

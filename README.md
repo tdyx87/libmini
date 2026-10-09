@@ -95,11 +95,12 @@ cmake --build --preset conan-debug
   白名单放行上面那一条已知缺口，其它偏差一律判失败；用例集与属性表的版本也必须
   一致。换别的 UCD 版本测：`-DLIBMINI_GRAPHEME_TEST_DATA_FILE=<GraphemeBreakTest.txt>`
 - C++ 标准为 C++11（MSVC 2017 兼容），源码统一 `/utf-8` 编译
-- CI：`.github/workflows/ci.yml` —— 9 个 job：`build-test` 的 8 个变体
+- CI：`.github/workflows/ci.yml` —— 11 个 job：`build-test` 的 10 个变体
   （三平台 Release 基线、Debug、Shared（DLL/SO 导出面）、warnings-strict
-  `-Wall -Wextra -Werror`）全部走 conan + Ninja 构建、CTest 全套、安装后
-  `find_package` 冒烟（`ci/smoke_consumer`），外加秒级的 `changelog`
-  文档闸门（见下）；push/PR 到 main 时自动运行
+  `-Wall -Wextra -Werror`、以及 `ubuntu-full-grapheme` / `windows-full-grapheme`
+  两份 `-DLIBMINI_UNICODE_FULL_GRAPHEME=ON` 完整表构建）全部走 conan + Ninja
+  构建、CTest 全套、安装后 `find_package` 冒烟（`ci/smoke_consumer`），外加秒级的
+  `changelog` 文档闸门（见下）；push/PR 到 main 时自动运行
 - 发布：`.github/workflows/release.yml` —— tag 触发（`v*`），先以可复用
   工作流门禁重跑同提交的完整 CI（全绿才打包）；三平台 CPack 产物
   （ZIP/TGZ）逐包带 `.sha256` 并在 publish 阶段验证 artifact 传输完整性，

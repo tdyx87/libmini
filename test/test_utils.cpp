@@ -406,6 +406,16 @@ TEST(GraphemeTest, ReportsTableProvenance)
     const bool says_heuristic =
         std::string(version).find("heuristic") != std::string::npos;
     EXPECT_EQ(full, !says_heuristic);
+
+    // 构建期开关（-DLIBMINI_UNICODE_FULL_GRAPHEME=ON，PUBLIC 定义一路传到本
+    // 文件）与运行期实际用的表必须一致。只查运行期结果的话，下面的一致性用例
+    // 会「开关空转」——选了启发式分支却仍按运行时判定走白名单，安安静静通过；
+    // CI 的 full-grapheme 变体正是靠这条断言保证自己验的是完整表
+#if defined(LIBMINI_UNICODE_FULL_GRAPHEME)
+    EXPECT_TRUE(full) << "LIBMINI_UNICODE_FULL_GRAPHEME is defined at build "
+                      << "time but the runtime tables report \"" << version
+                      << "\"";
+#endif
 }
 
 // ------------------- UAX #29 符合性测试（数据驱动） -------------------
