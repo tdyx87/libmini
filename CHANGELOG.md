@@ -36,6 +36,10 @@
 - Add grapheme cluster aware UTF-8 operations（[52cd59a](https://github.com/tdyx87/libmini/commit/52cd59a97cc22f08bd6e1087892e83edd6a47f69)）
 - Add data-driven UAX #29 grapheme cluster conformance tests（[b8abfc7](https://github.com/tdyx87/libmini/commit/b8abfc7fa0ea832257a35d8718fedbcf0d35bb78)）
 
+#### 变更
+
+- Cover the full UAX #29 grapheme table in CI（[65cd4de](https://github.com/tdyx87/libmini/commit/65cd4de8b0599aa22bafafae7e8d1b6ffd185e04)）
+
 #### 修复
 
 - Fix Windows SqliteWriteMutex to use real file locks（[1552567](https://github.com/tdyx87/libmini/commit/155256799cd05af728a4596c582382d77009c3db)）
