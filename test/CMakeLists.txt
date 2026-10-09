@@ -40,6 +40,15 @@ endif()
 target_link_libraries(test_utils PRIVATE libmini GTest::gtest)
 add_test(NAME utils_test COMMAND test_utils)
 
+# UAX #29 符合性测试的数据文件：Unicode 官方 GraphemeBreakTest.txt 随仓库提交，
+# 这里注入绝对路径（与下面子进程路径同理），免得依赖 ctest 的工作目录。
+# 用 cache 变量是为了能换成别的（例如新版 UCD）的副本，而不必改这个文件。
+set(LIBMINI_GRAPHEME_TEST_DATA_FILE
+    "${CMAKE_CURRENT_SOURCE_DIR}/data/GraphemeBreakTest.txt"
+    CACHE FILEPATH "GraphemeBreakTest.txt used by the UAX #29 conformance test")
+target_compile_definitions(test_utils PRIVATE
+    LIBMINI_GRAPHEME_TEST_DATA="${LIBMINI_GRAPHEME_TEST_DATA_FILE}")
+
 # 第二批常用模块测试（optional / random / env / digest / ini / gzip）
 add_executable(test_common test_common.cpp)
 target_include_directories(test_common PRIVATE ${CMAKE_SOURCE_DIR}/src)

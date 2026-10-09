@@ -87,6 +87,13 @@ cmake --build --preset conan-debug
   `auxiliary/GraphemeBreakTest.txt`（Unicode 18.0.0，853 条）验证：完整表
   853/853，启发式 852/853（唯一差集是补充平面的 Indic 连字）。
   刷新/校验：`python ci/gen_grapheme_tables.py [--check]`
+
+  符合性是可回归的，不是一次性验证：官方用例文件随仓库提交
+  （`test/data/GraphemeBreakTest.txt`），`utils_test` 的
+  `GraphemeTest.Uax29OfficialTestFile` 每次构建都逐条断言——完整表要求
+  853/853（`grapheme_full_conformance()` 为真时容不下任何偏差），启发式表只
+  白名单放行上面那一条已知缺口，其它偏差一律判失败；用例集与属性表的版本也必须
+  一致。换别的 UCD 版本测：`-DLIBMINI_GRAPHEME_TEST_DATA_FILE=<GraphemeBreakTest.txt>`
 - C++ 标准为 C++11（MSVC 2017 兼容），源码统一 `/utf-8` 编译
 - CI：`.github/workflows/ci.yml` —— 9 个 job：`build-test` 的 8 个变体
   （三平台 Release 基线、Debug、Shared（DLL/SO 导出面）、warnings-strict

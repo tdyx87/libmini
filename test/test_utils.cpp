@@ -2,11 +2,16 @@
 #include <gtest/gtest.h>
 
 #include <chrono>
+#include <cstdlib>
+#include <fstream>
 #include <functional>
+#include <iomanip>
 #include <map>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "libmini.h"
@@ -402,6 +407,306 @@ TEST(GraphemeTest, ReportsTableProvenance)
         std::string(version).find("heuristic") != std::string::npos;
     EXPECT_EQ(full, !says_heuristic);
 }
+
+// ------------------- UAX #29 符合性测试（数据驱动） -------------------
+//
+// 上面的用例挑的是典型场景，但「典型」证明不了符合性——UAX #29 的正确性只能
+// 让官方用例集自己说话。这里逐条跑 Unicode 官方的 GraphemeBreakTest.txt
+//（随仓库提交，见 test/data/），把当初探针一次性跑出来的结论变成每次构建都会
+// 重跑的断言：属性表换了、规则改了、生成器漂移了，都会立刻在这里红掉。
+//
+// 数据文件路径由 CMake 注入（见 test/CMakeLists.txt），不用相对路径猜工作目录；
+// 未注入时（例如手工单独编译本文件）整个套件不参与编译。
+
+#if defined(LIBMINI_GRAPHEME_TEST_DATA)
+
+namespace {
+
+// 一条官方用例：码点序列 + 拼出来的 UTF-8 文本 + 期望的簇边界（字节偏移）
+struct GraphemeCase
+{
+    std::vector<unsigned long> code_points;
+    std::string text;
+    std::vector<std::size_t> expected_breaks;
+};
+
+enum CaseLineResult
+{
+    kNotACase,    // 注释或空行
+    kCaseParsed,  // 一条完整用例
+    kCaseBroken   // 有 token 但不是合法用例——不能被静默跳过
+};
+
+std::string utf8_encode(unsigned long cp)
+{
+    std::string out;
+    if (cp < 0x80) {
+        out += static_cast<char>(cp);
+    } else if (cp < 0x800) {
+        out += static_cast<char>(0xC0 | (cp >> 6));
+        out += static_cast<char>(0x80 | (cp & 0x3F));
+    } else if (cp < 0x10000) {
+        out += static_cast<char>(0xE0 | (cp >> 12));
+        out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+        out += static_cast<char>(0x80 | (cp & 0x3F));
+    } else {
+        out += static_cast<char>(0xF0 | (cp >> 18));
+        out += static_cast<char>(0x80 | ((cp >> 12) & 0x3F));
+        out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+        out += static_cast<char>(0x80 | (cp & 0x3F));
+    }
+    return out;
+}
+
+std::string code_point_name(unsigned long cp)
+{
+    std::ostringstream os;
+    os << "U+" << std::uppercase << std::hex << std::setfill('0')
+       << std::setw(cp > 0xFFFF ? 5 : 4) << cp;
+    return os.str();
+}
+
+// 官方文件里每条用例的写法：`÷ 0061 × 0301 ÷ 0062 ÷  # ÷ 0061 × 0301 ÷ 0062 ÷`
+// 其中 ÷（U+00F7）表示「允许在此断开」，×（U+00D7）表示「不允许断开」，标记出现
+// 在被判定字符的前面。'#' 之后是重复用例本身的注释，丢掉即可。
+CaseLineResult parse_case_line(const std::string& raw, GraphemeCase& out)
+{
+    const std::string line = raw.substr(0, raw.find('#'));
+    const std::string kBreak = "\xC3\xB7";     // U+00F7 ÷
+    const std::string kNoBreak = "\xC3\x97";   // U+00D7 ×
+
+    std::istringstream tokens(line);
+    std::string token;
+    bool break_before_next = false;
+    bool saw_token = false;
+
+    while (tokens >> token) {
+        saw_token = true;
+        if (token == kBreak) {
+            break_before_next = true;
+            continue;
+        }
+        if (token == kNoBreak) {
+            break_before_next = false;
+            continue;
+        }
+        if (token.size() > 8) {
+            return kCaseBroken;  // 十六进制码点不会这么长
+        }
+        char* end = nullptr;
+        const unsigned long cp = std::strtoul(token.c_str(), &end, 16);
+        if (end == token.c_str() || *end != '\0' || cp > 0x10FFFF ||
+            (cp >= 0xD800 && cp <= 0xDFFF)) {
+            return kCaseBroken;
+        }
+        const std::size_t offset = out.text.size();
+        out.code_points.push_back(cp);
+        out.text += utf8_encode(cp);
+        if (break_before_next) {
+            out.expected_breaks.push_back(offset);
+        }
+        break_before_next = false;
+    }
+
+    if (!saw_token) {
+        return kNotACase;
+    }
+    if (out.code_points.empty()) {
+        return kCaseBroken;  // 只有断点标记、没有码点
+    }
+    out.expected_breaks.push_back(out.text.size());  // 串尾永远是边界
+    return kCaseParsed;
+}
+
+// 只关心返回值时用这个，避免把上一条用例的状态带进下一条
+CaseLineResult parse_one(const std::string& line, GraphemeCase* out = nullptr)
+{
+    GraphemeCase parsed;
+    const CaseLineResult result = parse_case_line(line, parsed);
+    if (out != nullptr) {
+        *out = parsed;
+    }
+    return result;
+}
+
+std::string describe_mismatch(const GraphemeCase& c,
+                              const std::vector<std::size_t>& actual)
+{
+    std::ostringstream os;
+    os << "  case:";
+    for (std::size_t i = 0; i < c.code_points.size(); ++i) {
+        os << " " << code_point_name(c.code_points[i]);
+    }
+    os << "\n    expected breaks:";
+    for (std::size_t i = 0; i < c.expected_breaks.size(); ++i) {
+        os << " " << c.expected_breaks[i];
+    }
+    os << "\n    actual   breaks:";
+    for (std::size_t i = 0; i < actual.size(); ++i) {
+        os << " " << actual[i];
+    }
+    os << "\n";
+    return os.str();
+}
+
+// 失败信息里最多列 limit 条，其余折叠成一行计数
+std::string summarize(const std::vector<GraphemeCase>& cases,
+                      const std::vector<std::vector<std::size_t> >& actuals,
+                      std::size_t limit)
+{
+    std::ostringstream os;
+    const std::size_t shown = cases.size() < limit ? cases.size() : limit;
+    for (std::size_t i = 0; i < shown; ++i) {
+        os << describe_mismatch(cases[i], actuals[i]);
+    }
+    if (cases.size() > shown) {
+        os << "  ... and " << (cases.size() - shown) << " more\n";
+    }
+    return os.str();
+}
+
+}  // namespace
+
+// 解析器自己也要可信：读错的用例必须报出来，否则「全通过」可能只是没读到
+TEST(GraphemeTest, Uax29TestFileParser)
+{
+    GraphemeCase parsed;
+    // 末尾的注释是「原样重复用例」，其中也有断点标记——必须被忽略
+    EXPECT_EQ(parse_one("\xC3\xB7 0061 \xC3\x97 0301 \xC3\xB7 0062 \xC3\xB7\t"
+                        "# \xC3\xB7 0061 \xC3\x97 0301 \xC3\xB7 0062 \xC3\xB7",
+                        &parsed),
+              kCaseParsed);
+    ASSERT_EQ(parsed.code_points.size(), 3u);
+    EXPECT_EQ(parsed.code_points[0], 0x61ul);
+    EXPECT_EQ(parsed.code_points[1], 0x301ul);
+    EXPECT_EQ(parsed.code_points[2], 0x62ul);
+    EXPECT_EQ(parsed.text, std::string("a\xCC\x81") + "b");  // 3 字节 + 1 字节
+    const std::size_t expected[] = {0, 3, 4};
+    EXPECT_TRUE(parsed.expected_breaks ==
+                std::vector<std::size_t>(expected, expected + 3));
+
+    // 注释、空行、纯空白都不算用例
+    EXPECT_EQ(parse_one("# Verifying UAX #29 rules"), kNotACase);
+    EXPECT_EQ(parse_one(""), kNotACase);
+    EXPECT_EQ(parse_one("   \t  "), kNotACase);
+
+    // 残缺 / 越界 / 代理区输入必须报错，而不是被当成注释跳过
+    EXPECT_EQ(parse_one("\xC3\xB7 0061 zz"), kCaseBroken);
+    EXPECT_EQ(parse_one("\xC3\xB7 1 x"), kCaseBroken);
+    EXPECT_EQ(parse_one("\xC3\xB7 110000"), kCaseBroken);
+    EXPECT_EQ(parse_one("\xC3\xB7 D800"), kCaseBroken);
+    EXPECT_EQ(parse_one("\xC3\xB7"), kCaseBroken);
+}
+
+// 官方用例集本身就是规格：每条用例的期望断点全部来自文件，逐条断言。
+TEST(GraphemeTest, Uax29OfficialTestFile)
+{
+    using namespace libmini;
+
+    const std::string path = LIBMINI_GRAPHEME_TEST_DATA;
+    std::ifstream in(path.c_str(), std::ios::binary);
+    ASSERT_TRUE(in.is_open()) << "cannot open the official UAX #29 data file: "
+                              << path;
+
+    const std::string kVersionPrefix = "# GraphemeBreakTest-";
+    std::vector<GraphemeCase> cases;
+    std::vector<std::string> malformed;
+    std::string data_version;
+    std::size_t declared_lines = 0;
+    std::string line;
+    while (std::getline(in, line)) {
+        if (!line.empty() && line[line.size() - 1] == '\r') {
+            line.erase(line.size() - 1);  // 容忍 CRLF 检出
+        }
+        if (line.compare(0, kVersionPrefix.size(), kVersionPrefix) == 0) {
+            const std::size_t dot = line.find(".txt");
+            if (dot != std::string::npos && dot > kVersionPrefix.size()) {
+                data_version = line.substr(kVersionPrefix.size(),
+                                           dot - kVersionPrefix.size());
+            }
+            continue;
+        }
+        if (line.compare(0, 8, "# Lines:") == 0) {
+            declared_lines = static_cast<std::size_t>(
+                std::strtoul(line.c_str() + 8, nullptr, 10));
+            continue;
+        }
+        GraphemeCase parsed;
+        switch (parse_case_line(line, parsed)) {
+            case kCaseParsed:
+                cases.push_back(parsed);
+                break;
+            case kCaseBroken:
+                malformed.push_back(line);
+                break;
+            case kNotACase:
+                break;
+        }
+    }
+
+    EXPECT_TRUE(malformed.empty())
+        << "could not parse " << malformed.size() << " line(s), first: "
+        << (malformed.empty() ? std::string() : malformed[0]);
+    ASSERT_FALSE(cases.empty()) << "no cases parsed from " << path;
+    // 文件头声明了多少条，就必须真跑多少条
+    if (declared_lines != 0) {
+        EXPECT_EQ(cases.size(), declared_lines) << "official cases went missing";
+    }
+
+    // 逐条跑：断点集合 = 串首 + 每个允许断的位置 + 串尾
+    std::vector<GraphemeCase> failed_cases;
+    std::vector<std::vector<std::size_t> > failed_actual;
+    for (std::size_t i = 0; i < cases.size(); ++i) {
+        const GraphemeCase& c = cases[i];
+        std::vector<std::size_t> actual;
+        for (std::size_t pos = 0; pos < c.text.size();) {
+            actual.push_back(pos);
+            const std::size_t step = grapheme_cluster_step(c.text, pos);
+            if (step == 0) {
+                break;  // 防御：真发生了也不该变成死循环
+            }
+            pos += step;
+        }
+        if (actual.empty() || actual[actual.size() - 1] != c.text.size()) {
+            actual.push_back(c.text.size());
+        }
+        if (actual == c.expected_breaks) {
+            continue;
+        }
+        failed_cases.push_back(c);
+        failed_actual.push_back(actual);
+    }
+
+    if (grapheme_full_conformance()) {
+        EXPECT_TRUE(failed_cases.empty())
+            << "the full UAX #29 tables must satisfy every official case, "
+            << failed_cases.size() << " failed:\n"
+            << summarize(failed_cases, failed_actual, 8);
+    } else {
+        // 启发式表只收 BMP 的 InCB / SpacingMark 属性（见
+        // grapheme_tables_heuristic.inc 顶部说明），所以补充平面的 Indic 连字
+        // 用例过不了。这不是放宽标准：除这一条之外任何偏差都算回归。
+        const std::vector<unsigned long> known_gap = {0x11A3A, 0x11A0B};
+        for (std::size_t i = 0; i < failed_cases.size(); ++i) {
+            EXPECT_EQ(failed_cases[i].code_points, known_gap)
+                << "heuristic tables deviate from the official file:\n"
+                << describe_mismatch(failed_cases[i], failed_actual[i]);
+        }
+        // 已知缺口必须真的还在，免得表被悄悄换成完整表也当成通过
+        EXPECT_FALSE(failed_cases.empty())
+            << "heuristic tables now pass the whole official file? "
+            << "update this expectation (and the README) accordingly";
+    }
+
+    // 表和用例集必须是同一版 Unicode，否则这个测试比的不是同一套数据
+    ASSERT_FALSE(data_version.empty()) << "the data file has no version header";
+    const std::string table_version = grapheme_data_version();
+    EXPECT_EQ(table_version.compare(0, data_version.size(), data_version), 0)
+        << "tables report \"" << table_version << "\" but the test data is Unicode "
+        << data_version;
+}
+
+#endif  // LIBMINI_GRAPHEME_TEST_DATA
 
 // ------------------------------ lexical_cast ------------------------------
 
