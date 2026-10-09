@@ -34,6 +34,7 @@
 - Add cross-platform charset conversion (UTF-8 / UTF-16 / GBK)（[67e5bd4](https://github.com/tdyx87/libmini/commit/67e5bd4dfa04bfc27cc7cfdf95704f3f962e7d70)）
 - Add UTF-8 aware string operations to string_algo（[541a96c](https://github.com/tdyx87/libmini/commit/541a96cdc4b39d66371da17ba0c854ae5e42a169)）
 - Add grapheme cluster aware UTF-8 operations（[52cd59a](https://github.com/tdyx87/libmini/commit/52cd59a97cc22f08bd6e1087892e83edd6a47f69)）
+- Add data-driven UAX #29 grapheme cluster conformance tests（[b8abfc7](https://github.com/tdyx87/libmini/commit/b8abfc7fa0ea832257a35d8718fedbcf0d35bb78)）
 
 #### 修复
 
