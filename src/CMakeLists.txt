@@ -22,6 +22,7 @@ set(LIBMINI_SOURCES
     utils/crc.cpp
     utils/encoding.cpp
     utils/charset.cpp
+    utils/grapheme.cpp
     utils/random_utils.cpp
     utils/secure_random.cpp
     utils/env.cpp    utils/digest.cpp
@@ -90,6 +91,17 @@ set_target_properties(libmini PROPERTIES
 # 静态库消费方需要 LIBMINI_STATIC（否则 libmini.h 把 LIBMINI_API 展开为 dllimport）
 if(NOT LIBMINI_BUILD_SHARED)
     target_compile_definitions(libmini PUBLIC LIBMINI_STATIC)
+endif()
+
+# 字形簇属性表：默认用内置的启发式表（无外部依赖）；打开本选项换成
+# ci/gen_grapheme_tables.py 从 UCD 生成的完整表（src/utils/grapheme_tables_full.inc，
+# 随仓库提交，编译时不需要联网），与 UAX #29 逐条对齐。
+# 作为 PUBLIC 定义传出，保证所有翻译单元与下游消费者看到同一份表。
+if(LIBMINI_UNICODE_FULL_GRAPHEME)
+    target_compile_definitions(libmini PUBLIC LIBMINI_UNICODE_FULL_GRAPHEME=1)
+    message(STATUS "libmini: grapheme clusters use the full UAX #29 UCD tables")
+else()
+    message(STATUS "libmini: grapheme clusters use the built-in heuristic tables")
 endif()
 
 # 链接第三方库（均被实际使用：json/xml/rpc 日志/rpc 传输/crc+gzip/测试）
@@ -219,6 +231,8 @@ install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
     COMPONENT devel
     FILES_MATCHING PATTERN "*.h"
+    # 内部实现细节（共享的 utf8 解码器）不对外安装
+    PATTERN "utils/utf8_codec.h" EXCLUDE
 )
 
 # 导出 target 集合（libminiTargets.cmake）

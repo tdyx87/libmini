@@ -36,6 +36,9 @@ endif()
 option(LIBMINI_BUILD_SHARED "Build libmini as a shared library" OFF)
 option(LIBMINI_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" OFF)
 option(BUILD_TESTING "Build tests" ON)
+# 字形簇分割默认用内置启发式表；打开后换成 UCD 生成的完整表（严格对齐 UAX #29）
+option(LIBMINI_UNICODE_FULL_GRAPHEME
+    "Use the full generated UAX #29 grapheme cluster tables" OFF)
 
 # 库版本号（src/CMakeLists 的 set_target_properties 与下方 CPack 共用）
 set(LIBMINI_VERSION 1.0.0)

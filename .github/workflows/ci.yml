@@ -150,8 +150,9 @@ jobs:
           done
           ./smoke/build/consumer
 
-  # CHANGELOG 漂移闸门：未发布段的提交清单必须与 git log 一致。
-  # 与 build-test 分开跑：这是秒级的文档检查，不该和 8 个编译变体抢机器，
+  # CHANGELOG 漂移闸门 + 构建期脚本自测：未发布段的提交清单必须与 git log 一致，
+  # 生成 CHANGELOG / 字形簇属性表的脚本本身也必须先通过自测。
+  # 与 build-test 分开跑：这些是秒级的检查，不该和 8 个编译变体抢机器，
   # 但 release.yml 的 ci-gate 要求本工作流**全部** job 全绿，所以它同样是门。
   changelog:
     name: changelog
@@ -174,3 +175,8 @@ jobs:
 
       - name: Unreleased section matches the commit log
         run: python ci/gen_changelog.py --check
+
+      # 同样地：字形簇属性表生成器的解析/合并/渲染与 --check 闸门先自测。
+      # 不联网（用内联 UCD 片段），因此没有外部依赖带来的抖动
+      - name: Self-test the grapheme table generator
+        run: python ci/test_gen_grapheme_tables.py

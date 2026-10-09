@@ -84,6 +84,49 @@ LIBMINI_API std::string utf8_truncate_bytes(const std::string& str, std::size_t 
 // 尾部保留最多 max_chars 个码点（日志/摘要里保留结尾比保留开头更常见）
 LIBMINI_API std::string utf8_tail(const std::string& str, std::size_t max_chars);
 
+// ------------------ 字形簇级操作 ------------------
+//
+// 上面一组以「码点」为单位，仍然可能把一个字形簇切成两半：'e' + 组合重音会
+// 被拆开（重音落到下一个字符上），emoji ZWJ 序列（👨‍👩‍👧）会散成几个人，
+// 国旗会只剩一半。下面一组以「字形簇」（UAX #29 extended grapheme cluster，
+// 即用户感知的一个字符）为单位，专治这类「合法但残缺」的截断——截头像
+// 用户名、消息预览、表格单元格这类场景都应该用它。
+//
+// 实现在 grapheme.cpp：默认用内置的启发式属性表，打开
+// -DLIBMINI_UNICODE_FULL_GRAPHEME=ON 后换成 UCD 生成的完整表（见
+// grapheme.h 的 grapheme_full_conformance()）。非法输入的处理与 utf8_* /
+// grapheme_cluster_step 完全一致：坏字节单独算一个字符。
+
+// 字形簇个数。对纯 ASCII 与 utf8_length 相同；对 "e\u0301" 是 1（utf8_length 是 2）
+LIBMINI_API std::size_t utf8_grapheme_length(const std::string& str);
+
+// 第 index 个字形簇（0 起）的起始字节偏移；index == 簇数时返回 size()，
+// 越界返回 std::string::npos
+LIBMINI_API std::size_t utf8_grapheme_byte_offset(const std::string& str,
+                                                  std::size_t index);
+
+// 从第 index 个字形簇起取 count 个；count == npos 表示到末尾。越界返回空串
+LIBMINI_API std::string utf8_grapheme_substr(const std::string& str,
+                                             std::size_t index,
+                                             std::size_t count = std::string::npos);
+
+// Python 风格切片：取字形簇区间 [begin, end)；end == npos 表示到末尾
+LIBMINI_API std::string utf8_grapheme_slice(const std::string& str,
+                                            std::size_t begin, std::size_t end);
+
+// 截到最多 max_graphemes 个字形簇（超出部分整体丢弃）
+LIBMINI_API std::string utf8_grapheme_truncate(const std::string& str,
+                                               std::size_t max_graphemes);
+
+// 截到最多 max_bytes 字节，且不切坏字形簇与码点序列——结果可能比 max_bytes
+// 更短，但不会把 emoji 家庭截成一个成员。用于按字节长度受限的场景
+LIBMINI_API std::string utf8_grapheme_truncate_bytes(const std::string& str,
+                                                     std::size_t max_bytes);
+
+// 尾部保留最多 max_graphemes 个字形簇
+LIBMINI_API std::string utf8_grapheme_tail(const std::string& str,
+                                           std::size_t max_graphemes);
+
 }  // namespace libmini
 
 #endif  // LIBMINI_STRING_ALGO_H

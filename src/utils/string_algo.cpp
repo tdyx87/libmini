@@ -4,6 +4,9 @@
 #include <cctype>
 #include <cstdint>
 
+#include "grapheme.h"
+#include "utf8_codec.h"
+
 namespace libmini {
 
 namespace {
@@ -151,71 +154,16 @@ std::string join(const std::vector<std::string>& parts,
 }
 
 // ------------------------------ UTF-8 感知操作 ------------------------------
-
-namespace {
-
-// 严格解码 pos 处的 UTF-8 字符：成功返回占用的字节数（1~4）并写入码点；
-// 非法（非法首/续字节、被截断、过长编码、代理项、超出 U+10FFFF）返回 0
-std::size_t utf8_decode(const std::string& str, std::size_t pos,
-                        std::uint32_t& code_point)
-{
-    const unsigned char first = static_cast<unsigned char>(str[pos]);
-    if (first < 0x80) {
-        code_point = first;
-        return 1;
-    }
-
-    std::size_t length = 0;
-    std::uint32_t value = 0;
-    if ((first & 0xE0) == 0xC0) {
-        length = 2;
-        value = first & 0x1Fu;
-    } else if ((first & 0xF0) == 0xE0) {
-        length = 3;
-        value = first & 0x0Fu;
-    } else if ((first & 0xF8) == 0xF0) {
-        length = 4;
-        value = first & 0x07u;
-    } else {
-        return 0;  // 0x80~0xBF（孤立续字节）或 0xF8~0xFF（非法首字节）
-    }
-    if (str.size() - pos < length) {
-        return 0;  // 末尾被截断
-    }
-    for (std::size_t i = 1; i < length; ++i) {
-        const unsigned char cont = static_cast<unsigned char>(str[pos + i]);
-        if ((cont & 0xC0) != 0x80) {
-            return 0;  // 续字节格式错误
-        }
-        value = (value << 6) | (cont & 0x3Fu);
-    }
-    // 过长编码下限：同样的码点必须用最短形式编码（入参是否合法的重要判据）
-    static const std::uint32_t kMinCodePoint[5] = {0, 0, 0x80, 0x800, 0x10000};
-    if (value < kMinCodePoint[length] || value > 0x10FFFF ||
-        (value >= 0xD800 && value <= 0xDFFF)) {
-        return 0;
-    }
-    code_point = value;
-    return length;
-}
-
-// 容错步长：合法字符取其字节长度，非法字节按 1 前进
-//（不丢字节，也不会因一个坏字节让后面的位置整体错位）
-std::size_t utf8_step(const std::string& str, std::size_t pos)
-{
-    std::uint32_t code_point = 0;
-    const std::size_t length = utf8_decode(str, pos, code_point);
-    return length == 0 ? 1 : length;
-}
-
-}  // namespace
+//
+// 严格解码与容错步长放在 utf8_codec.h，字形簇分割放在 grapheme.cpp——
+// 三者对非法输入的处理必须一致，所以只允许有一份实现。
 
 bool utf8_is_valid(const std::string& str)
 {
     std::size_t pos = 0;
     while (pos < str.size()) {
         std::uint32_t code_point = 0;
-        const std::size_t length = utf8_decode(str, pos, code_point);
+        const std::size_t length = utf8_detail::decode(str, pos, code_point);
         if (length == 0) {
             return false;
         }
@@ -229,7 +177,7 @@ std::size_t utf8_length(const std::string& str)
     std::size_t count = 0;
     std::size_t pos = 0;
     while (pos < str.size()) {
-        pos += utf8_step(str, pos);
+        pos += utf8_detail::step(str, pos);
         ++count;
     }
     return count;
@@ -240,7 +188,7 @@ std::size_t utf8_byte_offset(const std::string& str, std::size_t index)
     std::size_t pos = 0;
     std::size_t chars = 0;
     while (pos < str.size() && chars < index) {
-        pos += utf8_step(str, pos);
+        pos += utf8_detail::step(str, pos);
         ++chars;
     }
     if (chars < index) {
@@ -262,7 +210,7 @@ std::string utf8_substr(const std::string& str, std::size_t index,
     std::size_t pos = begin;
     std::size_t taken = 0;
     while (pos < str.size() && taken < count) {
-        pos += utf8_step(str, pos);
+        pos += utf8_detail::step(str, pos);
         ++taken;
     }
     return str.substr(begin, pos - begin);
@@ -292,7 +240,7 @@ std::string utf8_truncate_bytes(const std::string& str, std::size_t max_bytes)
     }
     std::size_t pos = 0;
     while (pos < str.size()) {
-        const std::size_t step = utf8_step(str, pos);
+        const std::size_t step = utf8_detail::step(str, pos);
         if (pos + step > max_bytes) {
             break;  // 再放一个字符就超了：宁可短一点，也不切成半个序列
         }
@@ -308,6 +256,84 @@ std::string utf8_tail(const std::string& str, std::size_t max_chars)
         return str;
     }
     return utf8_substr(str, total - max_chars, std::string::npos);
+}
+
+// ------------------------------ 字形簇级操作 ------------------------------
+
+std::size_t utf8_grapheme_length(const std::string& str)
+{
+    return grapheme_cluster_count(str);
+}
+
+std::size_t utf8_grapheme_byte_offset(const std::string& str,
+                                      std::size_t index)
+{
+    return grapheme_byte_offset(str, index);
+}
+
+std::string utf8_grapheme_substr(const std::string& str, std::size_t index,
+                                 std::size_t count)
+{
+    const std::size_t begin = grapheme_byte_offset(str, index);
+    if (begin == std::string::npos) {
+        return std::string();
+    }
+    if (count == std::string::npos) {
+        return str.substr(begin);
+    }
+    std::size_t cursor = begin;
+    std::size_t taken = 0;
+    while (cursor < str.size() && taken < count) {
+        cursor += grapheme_cluster_step(str, cursor);
+        ++taken;
+    }
+    return str.substr(begin, cursor - begin);
+}
+
+std::string utf8_grapheme_slice(const std::string& str, std::size_t begin,
+                                std::size_t end)
+{
+    if (end == std::string::npos) {
+        const std::size_t start = grapheme_byte_offset(str, begin);
+        return start == std::string::npos ? std::string() : str.substr(start);
+    }
+    if (end <= begin) {
+        return std::string();
+    }
+    return utf8_grapheme_substr(str, begin, end - begin);
+}
+
+std::string utf8_grapheme_truncate(const std::string& str,
+                                   std::size_t max_graphemes)
+{
+    return utf8_grapheme_substr(str, 0, max_graphemes);
+}
+
+std::string utf8_grapheme_truncate_bytes(const std::string& str,
+                                         std::size_t max_bytes)
+{
+    if (str.size() <= max_bytes) {
+        return str;
+    }
+    std::size_t cursor = 0;
+    while (cursor < str.size()) {
+        const std::size_t step = grapheme_cluster_step(str, cursor);
+        if (cursor + step > max_bytes) {
+            break;  // 再放一个字形簇就超了：宁可短一点，也不拆散它
+        }
+        cursor += step;
+    }
+    return str.substr(0, cursor);
+}
+
+std::string utf8_grapheme_tail(const std::string& str,
+                               std::size_t max_graphemes)
+{
+    const std::size_t total = grapheme_cluster_count(str);
+    if (total <= max_graphemes) {
+        return str;
+    }
+    return utf8_grapheme_substr(str, total - max_graphemes, std::string::npos);
 }
 
 }  // namespace libmini

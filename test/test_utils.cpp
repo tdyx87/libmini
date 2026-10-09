@@ -11,6 +11,7 @@
 
 #include "libmini.h"
 #include "utils/charset.h"
+#include "utils/grapheme.h"
 
 // ------------------------------ string_algo ------------------------------
 
@@ -215,6 +216,191 @@ TEST(Utf8Test, TolerantOnInvalidInput)
     EXPECT_EQ(utf8_substr(bad, 1, 1), "\x80");
     EXPECT_EQ(utf8_substr(bad, 2, 1), "中");  // 坏字节没让后面错位
     EXPECT_TRUE(utf8_is_valid(utf8_substr(bad, 2, 1)));
+}
+
+// ------------------------- string_algo（字形簇感知） -------------------------
+//
+// 核心主张：码点级截断虽然不会切坏字节序列，却会把一个「用户感知的字符」
+// 拆开（组合重音、emoji ZWJ 序列、国旗、Hangul 音节…）。字形簇级操作要么
+// 完整保留一个字形簇，要么整个丢弃它——绝不产生「半个字符」。
+//
+// 下面的样例统一写成显式字节转义，避免源文件编码与编辑器差异影响结果。
+
+namespace {
+
+const char* kEAcute = "e\xCC\x81";                    // e + U+0301 组合重音
+const char* kFamily =
+    "\xF0\x9F\x91\xA8\xE2\x80\x8D\xF0\x9F\x91\xA9\xE2\x80\x8D\xF0\x9F\x91\xA7";
+const char* kFlagCN = "\xF0\x9F\x87\xA8\xF0\x9F\x87\xB3";  // 两个区域指示符
+const char* kHeartVs = "\xE2\x9D\xA4\xEF\xB8\x8F";        // U+2764 + VS16
+const char* kThumbTone = "\xF0\x9F\x91\x8D\xF0\x9F\x8F\xBD";  // 👍 + 肤色修饰符
+const char* kHangulJamo = "\xE1\x84\x92\xE1\x85\xA1\xE1\x86\xAB";  // L + V + T
+const char* kIndicConjunct = "\xE0\xA4\x95\xE0\xA5\x8D\xE0\xA4\xB7";  // क + ् + ष
+
+}  // namespace
+
+TEST(GraphemeTest, CountsUserPerceivedCharacters)
+{
+    using namespace libmini;
+    EXPECT_EQ(utf8_grapheme_length(""), 0u);
+    EXPECT_EQ(utf8_grapheme_length("abc"), 3u);
+    EXPECT_EQ(utf8_grapheme_length("中文测试"), 4u);
+
+    // 组合字符：两个码点、一个字形簇
+    EXPECT_EQ(std::string(kEAcute).size(), 3u);
+    EXPECT_EQ(utf8_length(kEAcute), 2u);
+    EXPECT_EQ(utf8_grapheme_length(kEAcute), 1u);
+
+    // emoji ZWJ 序列：5 个码点、一个字形簇
+    EXPECT_EQ(utf8_length(kFamily), 5u);
+    EXPECT_EQ(utf8_grapheme_length(kFamily), 1u);
+
+    // 国旗：两个区域指示符成对
+    EXPECT_EQ(utf8_grapheme_length(kFlagCN), 1u);
+
+    // 变体选择符（U+FE0F）与 emoji 肤色修饰符都黏在基字符上
+    EXPECT_EQ(utf8_grapheme_length(kHeartVs), 1u);
+    EXPECT_EQ(utf8_grapheme_length(kThumbTone), 1u);
+
+    // Hangul：分解的 Jamo（L + V + T）合起来是一个音节
+    EXPECT_EQ(utf8_length(kHangulJamo), 3u);
+    EXPECT_EQ(utf8_grapheme_length(kHangulJamo), 1u);
+
+    // Indic 连字（GB9c）：辅音 + virama + 辅音
+    EXPECT_EQ(utf8_length(kIndicConjunct), 3u);
+    EXPECT_EQ(utf8_grapheme_length(kIndicConjunct), 1u);
+
+    // 三个国旗是 3 个字形簇（区域指示符成对，不越界黏连）
+    const std::string three_flags =
+        std::string(kFlagCN) + kFlagCN + kFlagCN;
+    EXPECT_EQ(utf8_grapheme_length(three_flags), 3u);
+}
+
+TEST(GraphemeTest, ControlCharactersBreakClusters)
+{
+    using namespace libmini;
+    EXPECT_EQ(utf8_grapheme_length("\r\n"), 1u);  // GB3：CR LF 是一簇
+    EXPECT_EQ(utf8_grapheme_length("a\r\nb"), 3u);
+    EXPECT_EQ(utf8_grapheme_length("a\rb"), 3u);       // GB4：CR 之后必断
+    EXPECT_EQ(utf8_grapheme_length("a\nb"), 3u);
+    EXPECT_EQ(utf8_grapheme_length("a\tb"), 3u);
+    // 控制字符之后即使跟组合字符也不会黏上（GB4 优先于 GB9）
+    EXPECT_EQ(utf8_grapheme_length(std::string("\r") + kEAcute), 2u);
+
+    // Prepend：U+0600 与其后的字符同簇（GB9b）
+    EXPECT_EQ(utf8_grapheme_length("\xD8\x80" "0"), 1u);
+
+    // SpacingMark：天城文元音符号（GB9a），且它不是 Extend
+    EXPECT_EQ(utf8_grapheme_length("\xE0\xA4\x95\xE0\xA4\xBE"), 1u);
+
+    // ZWJ 只在两个图形字符之间才黏合：a + ZWJ 仍与 b 断开
+    EXPECT_EQ(utf8_grapheme_length("a\xE2\x80\x8D" "b"), 2u);
+}
+
+TEST(GraphemeTest, TruncateNeverSplitsClusters)
+{
+    using namespace libmini;
+    const std::string s = std::string("a") + kEAcute + kFlagCN + kThumbTone;
+    const std::size_t clusters = 4;
+    EXPECT_EQ(utf8_grapheme_length(s), clusters);
+
+    EXPECT_EQ(utf8_grapheme_truncate(s, 0), "");
+    EXPECT_EQ(utf8_grapheme_truncate(s, 1), "a");
+    EXPECT_EQ(utf8_grapheme_truncate(s, 2), std::string("a") + kEAcute);
+    EXPECT_EQ(utf8_grapheme_truncate(s, clusters), s);
+    EXPECT_EQ(utf8_grapheme_truncate(s, 99), s);
+
+    // 任意切点：输出必须是合法 UTF-8、是原串的字节前缀，且簇数恰为 min(n, 总数)
+    for (std::size_t n = 0; n <= clusters + 1; ++n) {
+        const std::string cut = utf8_grapheme_truncate(s, n);
+        const std::size_t expected = n > clusters ? clusters : n;
+        EXPECT_TRUE(utf8_is_valid(cut)) << "n=" << n;
+        EXPECT_EQ(s.compare(0, cut.size(), cut), 0) << "n=" << n;
+        EXPECT_EQ(utf8_grapheme_length(cut), expected) << "n=" << n;
+    }
+
+    // 对照：码点级截断会把 emoji 家庭切成「一个男人 + 悬空的连接符」——
+    // 结果是合法 UTF-8，却不是原来那个字形族
+    const std::string by_code_point = utf8_truncate(kFamily, 2);
+    EXPECT_TRUE(utf8_is_valid(by_code_point));
+    EXPECT_NE(by_code_point, std::string(kFamily));
+    EXPECT_EQ(by_code_point, "\xF0\x9F\x91\xA8\xE2\x80\x8D");
+}
+
+TEST(GraphemeTest, SubstrSliceAndTail)
+{
+    using namespace libmini;
+    const std::string s = std::string(kEAcute) + "x" + kFamily;  // 3 个簇
+    EXPECT_EQ(utf8_grapheme_length(s), 3u);
+
+    EXPECT_EQ(utf8_grapheme_byte_offset(s, 0), 0u);
+    EXPECT_EQ(utf8_grapheme_byte_offset(s, 1), 3u);  // kEAcute 占 3 字节
+    EXPECT_EQ(utf8_grapheme_byte_offset(s, 2), 4u);
+    EXPECT_EQ(utf8_grapheme_byte_offset(s, 3), s.size());
+    EXPECT_EQ(utf8_grapheme_byte_offset(s, 4), std::string::npos);
+
+    EXPECT_EQ(utf8_grapheme_substr(s, 0, 1), kEAcute);
+    EXPECT_EQ(utf8_grapheme_substr(s, 1, 1), "x");
+    EXPECT_EQ(utf8_grapheme_substr(s, 2), kFamily);
+    EXPECT_EQ(utf8_grapheme_substr(s, 3), "");   // 刚好落在末尾
+    EXPECT_EQ(utf8_grapheme_substr(s, 9), "");   // 越界 → 空串
+
+    EXPECT_EQ(utf8_grapheme_slice(s, 1, 3), std::string("x") + kFamily);
+    EXPECT_EQ(utf8_grapheme_slice(s, 0, 0), "");
+    EXPECT_EQ(utf8_grapheme_slice(s, 2, 1), "");  // end <= begin
+
+    EXPECT_EQ(utf8_grapheme_tail(s, 0), "");
+    EXPECT_EQ(utf8_grapheme_tail(s, 2), std::string("x") + kFamily);
+    EXPECT_EQ(utf8_grapheme_tail(s, 3), s);
+    EXPECT_EQ(utf8_grapheme_tail(s, 99), s);
+}
+
+TEST(GraphemeTest, TruncateBytesKeepsWholeClusters)
+{
+    using namespace libmini;
+    const std::string family = kFamily;  // 18 字节、1 个字形簇
+    ASSERT_EQ(family.size(), 18u);
+
+    // 放不下整个字形簇就一点都不放——绝不交出「半个 emoji」
+    EXPECT_EQ(utf8_grapheme_truncate_bytes(family, 0), "");
+    EXPECT_EQ(utf8_grapheme_truncate_bytes(family, 17), "");
+    EXPECT_EQ(utf8_grapheme_truncate_bytes(family, 18), family);
+    EXPECT_EQ(utf8_grapheme_truncate_bytes(family, 99), family);
+
+    const std::string mixed = std::string("ab") + kFamily;
+    EXPECT_EQ(utf8_grapheme_truncate_bytes(mixed, 2), "ab");
+    EXPECT_EQ(utf8_grapheme_truncate_bytes(mixed, 4), "ab");
+    EXPECT_EQ(utf8_grapheme_truncate_bytes(mixed, 20), mixed);
+
+    EXPECT_EQ(utf8_grapheme_truncate_bytes("abcdef", 3), "abc");
+}
+
+TEST(GraphemeTest, TolerantOnInvalidInput)
+{
+    using namespace libmini;
+    // 坏字节单独算一个「字形簇」，且不影响后面的位置——与 utf8_* 完全一致
+    const std::string bad = std::string("e\x80") + kEAcute;
+    EXPECT_FALSE(utf8_is_valid(bad));
+    EXPECT_EQ(utf8_grapheme_length(bad), 3u);  // 'e'、坏字节、U+0301
+    EXPECT_EQ(utf8_grapheme_truncate(bad, 1), "e");
+    EXPECT_EQ(utf8_grapheme_truncate(bad, 2), "e\x80");
+    EXPECT_EQ(utf8_grapheme_truncate(bad, 3), bad);
+    EXPECT_EQ(grapheme_cluster_step("\x80\x80", 0), 1u);
+    EXPECT_EQ(grapheme_cluster_step("abc", 3), 0u);  // 已在末尾
+}
+
+TEST(GraphemeTest, ReportsTableProvenance)
+{
+    using namespace libmini;
+    const char* version = grapheme_data_version();
+    ASSERT_NE(version, nullptr);
+    EXPECT_GT(std::string(version).size(), 0u);
+
+    // 完整模式与启发式模式的说明串必须能区分开，且与 full_conformance 一致
+    const bool full = grapheme_full_conformance();
+    const bool says_heuristic =
+        std::string(version).find("heuristic") != std::string::npos;
+    EXPECT_EQ(full, !says_heuristic);
 }
 
 // ------------------------------ lexical_cast ------------------------------

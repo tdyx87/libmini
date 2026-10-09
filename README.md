@@ -80,6 +80,13 @@ cmake --build --preset conan-debug
 - 动态库：`-DLIBMINI_BUILD_SHARED=ON`（同时定义 `LIBMINI_EXPORTS` 导出符号）。
   导出面 = 公开头里标注 `LIBMINI_API` 的符号（宏定义见 `utils/export.h`，
   新增公开 API 必须标注，否则 DLL 不导出、消费者链接失败）
+- 字形簇属性表：默认用内置的启发式表（`src/utils/grapheme_tables_heuristic.inc`，
+  人工维护、无外部依赖；补充平面的 Indic 连字与 SpacingMark 简化成断点）；
+  `-DLIBMINI_UNICODE_FULL_GRAPHEME=ON` 改用 `ci/gen_grapheme_tables.py` 从 UCD
+  生成的完整表（随仓库提交，编译不需要联网）。两者都对照官方用例
+  `auxiliary/GraphemeBreakTest.txt`（Unicode 18.0.0，853 条）验证：完整表
+  853/853，启发式 852/853（唯一差集是补充平面的 Indic 连字）。
+  刷新/校验：`python ci/gen_grapheme_tables.py [--check]`
 - C++ 标准为 C++11（MSVC 2017 兼容），源码统一 `/utf-8` 编译
 - CI：`.github/workflows/ci.yml` —— 9 个 job：`build-test` 的 8 个变体
   （三平台 Release 基线、Debug、Shared（DLL/SO 导出面）、warnings-strict
@@ -142,7 +149,7 @@ target_link_libraries(app PRIVATE libmini::libmini)
 | 模块 | 头文件 | 内容 |
 |---|---|---|
 | string_utils | `utils/string_utils.h` | split / trim / replace / to_upper / to_lower |
-| string_algo | `utils/string_algo.h` | starts_with / ends_with / iequals / replace_all / split_string / join；**UTF-8 感知**的 utf8_is_valid / utf8_length / utf8_byte_offset / utf8_substr / utf8_slice / utf8_truncate / utf8_truncate_bytes / utf8_tail（按码点计数与切分，绝不会把多字节序列切成两半） |
+| string_algo | `utils/string_algo.h` | starts_with / ends_with / iequals / replace_all / split_string / join；**UTF-8 感知**的 utf8_is_valid / utf8_length / utf8_byte_offset / utf8_substr / utf8_slice / utf8_truncate / utf8_truncate_bytes / utf8_tail（按码点计数与切分，绝不会把多字节序列切成两半）；**字形簇感知**的 utf8_grapheme_length / utf8_grapheme_byte_offset / utf8_grapheme_substr / utf8_grapheme_slice / utf8_grapheme_truncate / utf8_grapheme_truncate_bytes / utf8_grapheme_tail（按「用户感知的一个字符」计数与切分，组合字符、emoji ZWJ 序列、国旗、Hangul 音节都不会被拆开） |
 | lexical_cast | `utils/lexical_cast.h` | 字符串↔数值转换（严格模式，失败抛 bad_lexical_cast） |
 | time_utils | `utils/time_utils.h` | 时间戳、格式化 + ISO-8601/RFC-3339 格式化与解析（Z/±HH:MM 偏移、基本与扩展格式）+ 日历运算（月份加减/星期/月末/日期串互转） |
 | stopwatch | `utils/stopwatch.h` | 高精度计时（pause/resume/restart） |
@@ -159,6 +166,7 @@ target_link_libraries(app PRIVATE libmini::libmini)
 | crc | `utils/crc.h` | CRC-32（zlib）/ CRC-16 Modbus / CRC-64 XZ / Adler-32，均支持增量计算 |
 | encoding | `utils/encoding.h` | Base64 / Base64url（JWT/URL 安全，默认无填充）/ Hex / URL 编解码 |
 | charset | `utils/charset.h` | 字符编码转换（UTF-8 / UTF-16LE / UTF-16BE / GBK 任意互转）：Windows 走 Win32 代码页、其它平台走 iconv，均不新增依赖；非法/截断输入返回 `InvalidSequence` 而不是静默替换成 `?` |
+| grapheme | `utils/grapheme.h` | UAX #29 扩展字形簇（extended grapheme cluster）分割：grapheme_cluster_step / grapheme_cluster_count / grapheme_byte_offset；`grapheme_full_conformance()` 与 `grapheme_data_version()` 报告当前用的是内置启发式表还是完整表 |
 | scope_guard | `utils/scope_guard.h` | RAII 作用域守卫（dismiss / 可移动） |
 | optional | `utils/optional.h` | C++11 版 optional（value_or / emplace） |
 | random_utils | `utils/random_utils.h` | 随机整数/浮点/字符串/挑选 |
@@ -219,12 +227,23 @@ EXPECT_EQ(join(parts, "|"), "a|b|c");
 int n = lexical_cast<int>("42");                 // 失败抛 bad_lexical_cast
 int safe = lexical_cast_or<int>("x", -1);        // 失败返回默认值
 
-// UTF-8 感知：按「字符」而非字节计数、截断、取子串（另见 utils/string_algo.h）
+// UTF-8 感知：按「码点」而非字节计数、截断、取子串（另见 utils/string_algo.h）
 std::size_t chars = utf8_length(text);           // "中文" → 2，不是 6
-std::string cut   = utf8_truncate(text, 20);     // 截到 20 个字，不会切坏序列
+std::string cut   = utf8_truncate(text, 20);     // 截到 20 个码点，不会切坏序列
 std::string fit   = utf8_truncate_bytes(text, 255);  // 适合 DB VARCHAR(255)
 std::string page  = utf8_slice(text, 10, 20);    // Python 风格 [10, 20)
 if (!utf8_is_valid(text)) { /* 输入不是合法 UTF-8 */ }
+
+// 字形簇感知：按「用户感知的一个字符」计数与截断（另见 utils/grapheme.h）。
+// 码点级截断虽然不会切坏字节序列，却会把 'e' + 组合重音拆成「e」、把 emoji
+// 家庭（👨‍👩‍👧）拆成「一个男人 + 悬空的连接符」。截头像/消息预览/表格单元格
+// 这类「看着必须完整」的场景应该用这一组。
+std::size_t looks  = utf8_grapheme_length("e\u0301");          // 1（utf8_length 是 2）
+std::string nick   = utf8_grapheme_truncate(name, 12);          // 截到 12 个字形簇
+std::string banner = utf8_grapheme_tail(text, 8);              // 尾部保留 8 个字形簇
+std::string cell   = utf8_grapheme_truncate_bytes(text, 255);   // 字节受限，但不交出半个 emoji
+// 当前属性表来源（启发式默认表 / UCD 完整表），用于日志与排查
+std::string table  = grapheme_data_version();
 ```
 
 ### 时间与计时
