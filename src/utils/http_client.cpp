@@ -73,6 +73,52 @@ HttpResponse make_error(const std::string& msg)
     return r;
 }
 
+// httplib::Error → 统一 StatusCode。分类只供调用方分支（重试/降级/上报），
+// 具体原因永远看 message（保留 httplib 原文，便于对照其文档排障）。
+// 注意 httplib 把读超时也报成 Error::Read（"Failed to read connection"），
+// 此处无法区分，故 Read 归 Io 而非 Timeout；连接超时才是 Timeout。
+StatusCode classify_error(httplib::Error err)
+{
+    switch (err) {
+        case httplib::Error::Success:              return StatusCode::Ok;
+        case httplib::Error::Connection:           return StatusCode::Unavailable;
+        case httplib::Error::ProxyConnection:      return StatusCode::Unavailable;
+        case httplib::Error::ConnectionTimeout:    return StatusCode::Timeout;
+        case httplib::Error::Read:
+        case httplib::Error::Write:                return StatusCode::Io;
+        case httplib::Error::Canceled:             return StatusCode::Cancelled;
+        case httplib::Error::SSLConnection:        return StatusCode::Unavailable;
+        case httplib::Error::SSLLoadingCerts:      return StatusCode::Unavailable;
+        case httplib::Error::SSLServerVerification:
+        case httplib::Error::SSLServerHostnameVerification:
+                                                   return StatusCode::PermissionDenied;
+        case httplib::Error::UnsupportedAddressFamily:
+                                                   return StatusCode::Unsupported;
+        case httplib::Error::ResourceExhaustion:
+        case httplib::Error::ExceedMaxSocketDescriptorCount:
+        case httplib::Error::Listen:               return StatusCode::Unavailable;
+        case httplib::Error::BindIPAddress:
+        case httplib::Error::InvalidRequestLine:
+        case httplib::Error::InvalidHTTPMethod:
+        case httplib::Error::InvalidHTTPVersion:
+        case httplib::Error::InvalidHeaders:
+        case httplib::Error::InvalidRangeHeader:
+        case httplib::Error::MultipartParsing:
+        case httplib::Error::HTTPParsing:
+        case httplib::Error::UnsupportedMultipartBoundaryChars:
+        case httplib::Error::TooManyFormDataFiles:
+        case httplib::Error::ExceedMaxPayloadSize:
+        case httplib::Error::ExceedUriMaxLength:   return StatusCode::InvalidArgument;
+        case httplib::Error::OpenFile:
+        case httplib::Error::Compression:          return StatusCode::Io;
+        case httplib::Error::ExceedRedirectCount:
+        case httplib::Error::GetSockName:
+        case httplib::Error::Unknown:
+        case httplib::Error::SSLPeerCouldBeClosed_:
+        default:                                   return StatusCode::Failure;
+    }
+}
+
 // httplib::Result → HttpResponse 统一转换
 HttpResponse convert_result(const httplib::Result& result)
 {
@@ -86,6 +132,16 @@ HttpResponse convert_result(const httplib::Result& result)
     r.body = result->body;
     r.headers = lower_headers(result->headers);
     return r;
+}
+
+// Result → 旧的 HttpResponse 形状：传输层失败仍写成 status == 0 + error 文本，
+// 与改造前逐字节一致（error == Status::message()），既有调用方零改动
+HttpResponse unwrap(const Result<HttpResponse>& result)
+{
+    if (result.ok()) {
+        return *result;
+    }
+    return make_error(result.status().message());
 }
 
 }  // namespace
@@ -269,19 +325,24 @@ HttpResponse HttpClient::get(const std::string& path)
 HttpResponse HttpClient::get(
     const std::string& path, const std::map<std::string, std::string>& query)
 {
+    return unwrap(try_get(path, query));
+}
+
+Result<HttpResponse> HttpClient::try_get(const std::string& path)
+{
+    return try_get(path, std::map<std::string, std::string>());
+}
+
+Result<HttpResponse> HttpClient::try_get(
+    const std::string& path, const std::map<std::string, std::string>& query)
+{
     std::string full = path;
     const std::string q = build_query(query);
     if (!q.empty()) {
         full += (full.find('?') == std::string::npos) ? '?' : '&';
         full += q;
     }
-    if (!impl_->client) {
-        return make_error("client not usable: bad base URL or SSL unavailable");
-    }
-    httplib::Headers headers;
-    impl_->add_default_headers(headers);
-    const httplib::Result result = impl_->client->Get(full.c_str(), headers);
-    return convert_result(result);
+    return send("GET", full, std::string(), std::string());
 }
 
 HttpResponse HttpClient::post(const std::string& path, const std::string& body,
@@ -312,8 +373,33 @@ HttpResponse HttpClient::request(const std::string& method,
                                  const std::string& body,
                                  const std::string& content_type)
 {
+    return unwrap(send(method, path, body, content_type));
+}
+
+Result<HttpResponse> HttpClient::try_request(const std::string& method,
+                                             const std::string& path,
+                                             const std::string& body,
+                                             const std::string& content_type)
+{
+    return send(method, path, body, content_type);
+}
+
+Result<HttpResponse> HttpClient::try_post_json(const std::string& path,
+                                               const std::string& body)
+{
+    return send("POST", path, body, "application/json");
+}
+
+Result<HttpResponse> HttpClient::send(const std::string& method,
+                                      const std::string& path,
+                                      const std::string& body,
+                                      const std::string& content_type)
+{
+    const std::string context = "HttpClient::" + method + " " + path;
     if (!impl_->client) {
-        return make_error("client not usable: bad base URL or SSL unavailable");
+        return Status::unavailable(
+                   "client not usable: bad base URL or SSL unavailable")
+            .with_context(context);
     }
     httplib::Headers headers;
     impl_->add_default_headers(headers);
@@ -341,7 +427,13 @@ HttpResponse HttpClient::request(const std::string& method,
         result = impl_->client->Patch(path.c_str(), headers, body,
                                       content_type.c_str());
     } else {
-        return make_error("unsupported method: " + method);
+        return Status::invalid_argument("unsupported method: " + method)
+            .with_context(context);
+    }
+    if (!result) {
+        return Status(classify_error(result.error()),
+                      httplib::to_string(result.error()))
+            .with_context(context);
     }
     return convert_result(result);
 }

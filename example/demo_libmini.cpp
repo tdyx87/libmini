@@ -522,6 +522,53 @@ LIBMINI_DEMO(optional_scope)
               << guard_calls << "\n";
 }
 
+LIBMINI_DEMO(result_status)
+{
+    // 统一错误类型：失败 = 分类 + 原因 + 出错位置；成功 = 直接带值
+    const Status nf = Status::not_found("no such table: users")
+                          .with_context("SqliteStatement::prepare")
+                          .with_context("load_users");
+    std::cout << "Status        : " << nf.to_string() << "\n";
+    std::cout << "Status        : code=" << status_code_name(nf.code())
+              << ", ok=" << (nf.ok() ? "true" : "false") << "\n";
+
+    // Result<T>：函数体内直接 return 值或错误，调用方一次判完
+    const auto load_setting = [](const std::string& key) -> Result<std::string> {
+        if (key.empty()) {
+            return Status::invalid_argument("key is empty")
+                .with_context("load_setting");
+        }
+        return "value-of-" + key;
+    };
+    const Result<std::string> setting = load_setting("port");
+    if (setting.ok()) {
+        std::cout << "Result<T>     : ok → \"" << setting.value() << "\"\n";
+    }
+    const Result<std::string> missing = load_setting("");
+    std::cout << "Result<T>     : " << missing.status().to_string()
+              << " → value_or=\"" << missing.value_or("-") << "\"\n";
+
+    // 迁移示范：Sqlite 的 try_* 与旧 bool 接口并存，失败原因一次带全
+    SqliteDatabase db;
+    const Status opened = db.try_open(":memory:");
+    const Status created =
+        db.try_exec("CREATE TABLE t (k TEXT UNIQUE)");
+    std::cout << "Sqlite try_*  : open=" << opened.to_string()
+              << ", create=" << created.to_string() << "\n";
+    const Status bad_sql = db.try_exec("INSERT INTO nope VALUES (1)");
+    std::cout << "Sqlite try_*  : " << bad_sql.to_string() << "\n";
+    std::cout << "Sqlite 旧接口 : last_status()="
+              << static_cast<int>(db.last_status())
+              << " + error_message() 仍然可用，值与改造前一致\n";
+
+    // try_query_all：空结果集是「成功的空值」，查询失败才是错误
+    SqliteStatement rows(db, "SELECT k FROM t");
+    const Result<std::vector<std::vector<SqliteValue>>> result =
+        rows.try_query_all();
+    std::cout << "try_query_all : ok=" << (result.ok() ? "true" : "false")
+              << ", rows=" << (result.ok() ? result->size() : 0u) << "\n";
+}
+
 LIBMINI_DEMO(args_self)
 {
     std::cout << "本程序入口即用 Args 解析：\n";

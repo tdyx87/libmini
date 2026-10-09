@@ -5,6 +5,7 @@
 #include <string>
 
 #include "export.h"
+#include "result.h"
 
 namespace libmini {
 
@@ -96,7 +97,33 @@ public:
                          const std::string& body,
                          const std::string& content_type);
 
+    // ---------------- Result 接口（统一错误面） ----------------
+    // 与上面返回 HttpResponse 的方法一一对应，区别只在失败怎么表达：
+    //   - 传输层失败（连接被拒 / 超时 / 读写失败 / TLS 不通过）→ 错误 Status：
+    //     分类见 http_client.cpp 的 classify_error，message 保留 httplib 原文，
+    //     context 记下 "HttpClient::<方法> <路径>"；
+    //   - 拿到 HTTP 响应（含 4xx/5xx）→ 成功，状态码在 response.status 里。
+    //     4xx/5xx 是有效结果而非“传输错误”：要看的是状态码和响应体。
+    // 注意：httplib 把读超时也归入 Error::Read，故读超时在这里报 Io 而不是
+    // Timeout；只有连接超时才是 Timeout。
+    Result<HttpResponse> try_get(const std::string& path);
+    Result<HttpResponse> try_get(
+        const std::string& path,
+        const std::map<std::string, std::string>& query);
+    Result<HttpResponse> try_post_json(const std::string& path,
+                                       const std::string& body);
+    Result<HttpResponse> try_request(const std::string& method,
+                                     const std::string& path,
+                                     const std::string& body,
+                                     const std::string& content_type);
+
 private:
+    // 所有请求的唯一出口：返回 Result（传输层失败即错误），供 try_* 与旧的
+    // HttpResponse 接口共用
+    Result<HttpResponse> send(const std::string& method,
+                              const std::string& path,
+                              const std::string& body,
+                              const std::string& content_type);
     struct Impl;
     Impl* impl_;
 };

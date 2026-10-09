@@ -3923,6 +3923,93 @@ TEST(SqliteTest, MisuseErrorsAreReported)
     EXPECT_EQ(mem.last_status(), SqliteStatus::Error);
 }
 
+// 统一错误面：SqliteStatus → StatusCode 的映射、上下文与新旧接口并存
+TEST(SqliteTest, TryApiMapsStatusCodes)
+{
+    using namespace libmini;
+
+    // 成功路径：Status::success()，与旧接口的成功返回值一一对应
+    SqliteDatabase db;
+    const Status opened = db.try_open(":memory:");
+    EXPECT_TRUE(opened.ok());
+    EXPECT_TRUE(db.last_error().ok());
+    EXPECT_TRUE(db.try_exec("CREATE TABLE t (k TEXT UNIQUE)").ok());
+
+    // 打开失败：CannotOpen → Io，且 context 带路径（打不开时 message 只有
+    // 泛泛的 errmsg，路径往往是排障的第一信息）
+    SqliteDatabase missing;
+    const Status open_failed =
+        missing.try_open(temp_directory_path() + "/no_such_dir_99123/x.db");
+    EXPECT_FALSE(open_failed.ok());
+    EXPECT_EQ(open_failed.code(), StatusCode::Io);
+    EXPECT_EQ(missing.last_status(), SqliteStatus::CannotOpen);  // 旧接口不变
+    EXPECT_FALSE(open_failed.message().empty());
+    EXPECT_NE(open_failed.context().find("no_such_dir_99123"), std::string::npos);
+
+    // 约束冲突：Constraint → InvalidArgument，原因细节留在 message
+    ASSERT_TRUE(db.try_exec("INSERT INTO t VALUES ('dup')").ok());
+    const Status dup = db.try_exec("INSERT INTO t VALUES ('dup')");
+    EXPECT_FALSE(dup.ok());
+    EXPECT_EQ(dup.code(), StatusCode::InvalidArgument);
+    EXPECT_NE(dup.message().find("UNIQUE"), std::string::npos);
+    EXPECT_EQ(dup.context(), "SqliteDatabase::exec");
+
+    // 没有更精确分类的失败（表不存在）→ Failure，而不是假装知道原因
+    const Status no_table = db.try_exec("SELECT * FROM nope");
+    EXPECT_FALSE(no_table.ok());
+    EXPECT_EQ(no_table.code(), StatusCode::Failure);
+
+    // 空结果集是「带空值的成功」，不是错误
+    SqliteStatement none(db, "SELECT k FROM t WHERE k = 'absent'");
+    ASSERT_TRUE(none.is_prepared());
+    const Result<std::vector<std::vector<SqliteValue>>> no_rows =
+        none.try_query_all();
+    ASSERT_TRUE(no_rows.ok());
+    EXPECT_TRUE(no_rows->empty());
+    EXPECT_EQ(no_rows.value().size(), 0u);
+
+    // 执行期失败：唯一约束 → InvalidArgument，context 标明是哪个入口
+    SqliteStatement dup_ins(db, "INSERT INTO t VALUES ('dup')");
+    ASSERT_TRUE(dup_ins.is_prepared());
+    const Result<std::vector<std::vector<SqliteValue>>> dup_rows =
+        dup_ins.try_query_all();
+    EXPECT_FALSE(dup_rows.ok());
+    EXPECT_EQ(dup_rows.code(), StatusCode::InvalidArgument);
+    EXPECT_EQ(dup_rows.status().context(), "SqliteStatement::query_all");
+    EXPECT_NE(dup_rows.status().message().find("UNIQUE"), std::string::npos);
+    EXPECT_THROW(dup_rows.value(), bad_result_access);
+
+    // 从未 prepare 的语句：没有可记录状态的宿主连接
+    SqliteStatement unprepared;
+    const Result<std::vector<std::vector<SqliteValue>>> no_owner =
+        unprepared.try_query_all();
+    EXPECT_FALSE(no_owner.ok());
+    EXPECT_EQ(no_owner.code(), StatusCode::InvalidArgument);
+    EXPECT_EQ(no_owner.status().message(), "statement has no owning database");
+
+    // 并发写冲突：Busy → Conflict——调用方据此决定重试而不是报错
+    const std::string busy_path = sqlite_temp_path("tryapi_busy");
+    remove_file(busy_path);
+    {
+        SqliteDatabase holder(busy_path);
+        ASSERT_TRUE(holder.is_open());
+        ASSERT_TRUE(holder.try_exec("CREATE TABLE t (v INTEGER)").ok());
+        ASSERT_TRUE(holder.begin());
+        // BEGIN 是惰性的：必须真的写一次，写锁才会被持有，否则 other 能自由写
+        ASSERT_TRUE(holder.exec("INSERT INTO t VALUES (1)"));
+
+        SqliteDatabase other(busy_path);
+        ASSERT_TRUE(other.is_open());
+        other.set_busy_timeout_ms(30);
+        const Status busy = other.try_exec("INSERT INTO t VALUES (2)");
+        EXPECT_FALSE(busy.ok());
+        EXPECT_EQ(busy.code(), StatusCode::Conflict);
+        EXPECT_EQ(other.last_status(), SqliteStatus::Busy);  // 旧接口同一结论
+        holder.rollback();
+    }
+    remove_file(busy_path);
+}
+
 int main(int argc, char** argv)
 {
     ::testing::InitGoogleTest(&argc, argv);

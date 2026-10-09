@@ -3375,6 +3375,63 @@ TEST(HttpClientTest, BadUrlReportsError)
     EXPECT_FALSE(r.error.empty());
 }
 
+// Result 接口：传输层失败才叫错误，HTTP 语义错误是有效响应
+TEST(HttpClientTest, TryApiCarriesTransportErrors)
+{
+    using namespace libmini;
+    LocalHttpServer srv;
+    HttpClient c("127.0.0.1", srv.port);
+
+    const Result<HttpResponse> hello = c.try_get("/hello");
+    ASSERT_TRUE(hello.ok());
+    EXPECT_EQ(hello->status, 200);
+    EXPECT_EQ(hello.value().body, "hello http");
+    EXPECT_TRUE(hello.status().ok());
+
+    // 404 不是传输错误：状态码是载荷的一部分，照样是成功的结果
+    const Result<HttpResponse> nf = c.try_get("/no_such_path");
+    ASSERT_TRUE(nf.ok());
+    EXPECT_EQ(nf->status, 404);
+    EXPECT_TRUE(nf->error.empty());
+
+    const Result<HttpResponse> query = c.try_get("/query", {{"k", "v"}});
+    ASSERT_TRUE(query.ok());
+    EXPECT_EQ(query->body, "k=v");
+
+    // 传输层失败：分类 + httplib 原文 + 出错的调用点都带回来
+    c.set_timeout_ms(100);   // /slow 睡 400ms：必超时
+    const Result<HttpResponse> slow = c.try_get("/slow");
+    ASSERT_FALSE(slow.ok());
+    // httplib 把读超时也报成 Error::Read，故这里是 Io 而非 Timeout
+    EXPECT_EQ(slow.code(), StatusCode::Io);
+    EXPECT_FALSE(slow.status().message().empty());
+    EXPECT_EQ(slow.status().context(), "HttpClient::GET /slow");
+    EXPECT_THROW(slow.value(), bad_result_access);
+
+    // 旧接口行为逐字节保留：status == 0，且 error 就是同一个原因文本
+    const HttpResponse legacy = c.get("/slow");
+    EXPECT_EQ(legacy.status, 0);
+    EXPECT_FALSE(legacy.ok());
+    EXPECT_EQ(legacy.error, slow.status().message());
+
+    // 构造时就无效的目标（无 scheme）→ Unavailable
+    HttpClient bad("host_without_scheme");
+    const Result<HttpResponse> bad_r = bad.try_get("/x");
+    ASSERT_FALSE(bad_r.ok());
+    EXPECT_EQ(bad_r.code(), StatusCode::Unavailable);
+    EXPECT_EQ(bad_r.status().context(), "HttpClient::GET /x");
+
+    // 不支持的方法属于调用方参数错误，不该被当成传输失败去重试
+    const Result<HttpResponse> unsupported =
+        c.try_request("FOO", "/hello", std::string(), std::string());
+    ASSERT_FALSE(unsupported.ok());
+    EXPECT_EQ(unsupported.code(), StatusCode::InvalidArgument);
+    EXPECT_NE(unsupported.status().message().find("unsupported method"),
+              std::string::npos);
+    EXPECT_EQ(c.request("FOO", "/hello", std::string(), std::string()).error,
+              unsupported.status().message());
+}
+
 // ------------------------------- LogFacade ---------------------------------
 
 TEST(LogFacadeTest, FileLoggingAndLevelFilter)

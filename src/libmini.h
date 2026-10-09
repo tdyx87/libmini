@@ -6,6 +6,10 @@
 // DLL export macro（定义见 utils/export.h，此处引用单一来源）
 #include "utils/export.h"
 
+// 统一错误类型（Status/Result）放在最前：它是叶子头 + 全内联，模块头可以在
+// 自己的正文里直接用 Result；见 result.h 顶部关于包含时序的说明
+#include "utils/result.h"
+
 // Include utility modules
 #include "utils/string_utils.h"
 #include "utils/string_algo.h"

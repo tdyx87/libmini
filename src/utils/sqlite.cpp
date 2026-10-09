@@ -248,6 +248,51 @@ std::string SqliteDatabase::error_message() const
     return last_msg_.empty() ? "no error" : last_msg_;
 }
 
+// SqliteStatus → 统一 StatusCode。粗分类只负责让调用方能分支（重试/放弃/
+// 上报），具体原因（哪张表、哪条约束）永远在 message 里
+static StatusCode to_status_code(SqliteStatus status)
+{
+    switch (status) {
+        case SqliteStatus::OK:           return StatusCode::Ok;
+        case SqliteStatus::CannotOpen:   return StatusCode::Io;
+        case SqliteStatus::Busy:         return StatusCode::Conflict;
+        case SqliteStatus::Constraint:   return StatusCode::InvalidArgument;
+        case SqliteStatus::Misuse:       return StatusCode::InvalidArgument;
+        case SqliteStatus::Corrupt:      return StatusCode::Corrupt;
+        case SqliteStatus::NotADatabase: return StatusCode::Corrupt;
+        case SqliteStatus::ReadOnly:     return StatusCode::PermissionDenied;
+        case SqliteStatus::Error:        return StatusCode::Failure;
+        case SqliteStatus::Unknown:      return StatusCode::Failure;
+    }
+    return StatusCode::Failure;  // 新增枚举值时走这里（-Wall 下不会漏告警）
+}
+
+Status SqliteDatabase::last_error(const std::string& context) const
+{
+    if (status_ == SqliteStatus::OK) {
+        return Status::success();
+    }
+    return Status(to_status_code(status_), error_message(),
+                  context.empty() ? std::string("SqliteDatabase") : context);
+}
+
+Status SqliteDatabase::try_open(const std::string& path, int flags)
+{
+    open(path, flags);  // 失败原因已记在 status_/last_msg_ 上
+    Status st = last_error("SqliteDatabase::open");
+    if (st.ok()) {
+        return st;
+    }
+    // 路径是排障的第一信息（打不开时 message 里常常只有泛泛的 errmsg）
+    return Status(st.code(), st.message(), "SqliteDatabase::open(" + path + ")");
+}
+
+Status SqliteDatabase::try_exec(const std::string& sql)
+{
+    exec(sql);
+    return last_error("SqliteDatabase::exec");
+}
+
 std::int64_t SqliteDatabase::last_insert_rowid() const
 {
     return db_ != nullptr ? ::sqlite3_last_insert_rowid(db_) : 0;
@@ -638,6 +683,22 @@ std::string SqliteStatement::column_name(int col) const
     }
     const char* name = ::sqlite3_column_name(stmt_, col);
     return name != nullptr ? name : std::string();
+}
+
+Result<std::vector<std::vector<SqliteValue>>> SqliteStatement::try_query_all(
+    const std::string& context)
+{
+    const std::vector<std::vector<SqliteValue>> rows = query_all();
+    if (owner_ == nullptr) {
+        // 没有宿主库可记录状态：语句从未 prepare 过
+        return Status::invalid_argument("statement has no owning database")
+            .with_context(context);
+    }
+    // query_all 成功时 check() 已把宿主库的状态复位为 OK，失败时状态在宿主库上
+    if (owner_->last_status() != SqliteStatus::OK) {
+        return owner_->last_error(context);
+    }
+    return rows;
 }
 
 std::vector<std::vector<SqliteValue>> SqliteStatement::query_all()

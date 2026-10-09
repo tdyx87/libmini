@@ -117,7 +117,7 @@ cmake --build --preset conan-debug
 可运行的完整示例见 `example/demo_libmini.cpp`（构建后为 `example`，即 `bin/Debug/example.exe`）：
 
 ```bat
-example --list               # 列出 23 个演示节
+example --list               # 列出 25 个演示节
 example                      # 全部运行
 example --only rpc,sqlite    # 只看指定节
 example --only hardware      # 硬件查看器（CPU/网卡/磁盘/卷/BIOS）
@@ -177,6 +177,7 @@ target_link_libraries(app PRIVATE libmini::libmini)
 | grapheme | `utils/grapheme.h` | UAX #29 扩展字形簇（extended grapheme cluster）分割：grapheme_cluster_step / grapheme_cluster_count / grapheme_byte_offset；`grapheme_full_conformance()` 与 `grapheme_data_version()` 报告当前用的是内置启发式表还是完整表 |
 | scope_guard | `utils/scope_guard.h` | RAII 作用域守卫（dismiss / 可移动） |
 | optional | `utils/optional.h` | C++11 版 optional（value_or / emplace） |
+| result | `utils/result.h` | 统一错误类型：Status（分类 + 原因 + 出错位置，with_context 逐层累加）+ Result<T>（值或错误二选一，C++11 版 expected）；全内联零依赖，模块以 `try_*` 出口返回它（见「统一错误类型」） |
 | random_utils | `utils/random_utils.h` | 随机整数/浮点/字符串/挑选 |
 | secure_random | `utils/secure_random.h` | 密码学安全随机源（Windows BCrypt / Linux getrandom / macOS arc4random_buf）：随机字节、十六进制串、Base64url 令牌；按字母表取样用拒绝采样消除取模偏置；熵源不可用时返回失败而不是退化成弱随机 |
 | kdf | `utils/kdf.h` | PBKDF2-HMAC-SHA256 密钥派生（零新增依赖，迭代次数带上下限钳制防 CPU DoS）+ 版本化口令密封（口令 → PBKDF2 → AES-256-GCM，自带 magic/版本/算法 ID 的落盘格式，迭代次数与盐进 AAD 防篡改降级）；另含常量时间比较 `constant_time_equals` |
@@ -209,11 +210,11 @@ target_link_libraries(app PRIVATE libmini::libmini)
 | zip | `utils/zip.h` | ZIP 包读写（zlib deflate/store，UTF-8 文件名，CRC 校验），零新增依赖 |
 | tar | `utils/tar.h` | tar（ustar）读写：文件/目录/符号链接，prefix 拆支持 255 字节长路径，头部 checksum 校验，零新增依赖 |
 | aes_gcm | `utils/aes_gcm.h` | AES-256-GCM 认证加密（Windows CNG / OpenSSL EVP），seal/open 落盘格式 |
-| sqlite | `utils/sqlite.h` | SQLite 封装：参数绑定（索引/命名）、事务 RAII、行遍历、带类型值读取，错误不抛异常 |
+| sqlite | `utils/sqlite.h` | SQLite 封装：参数绑定（索引/命名）、事务 RAII、行遍历、带类型值读取，错误不抛异常；`try_open`/`try_exec`/`try_query_all` 返回 Status/Result |
 | system_info | `utils/system_info.h` | 主机名/PID/可执行文件路径/CPU 数/物理内存/磁盘容量与剩余 |
 | hardware_info | `utils/hardware_info.h` | 硬件清单：CPU 型号与拓扑、网卡（MAC/IPv4/IPv6）、物理磁盘（型号/序列号/总线）、卷（盘符/文件系统/标识）、主板与 BIOS |
 | machine_fingerprint | `utils/machine_fingerprint.h` | 机器指纹（许可证绑定 / 席位去重）：主板序列号 + CPU 型号 + 物理网卡 MAC（+ 物理盘序列号）经占位符过滤与虚拟网卡排除后派生 SHA-256 标识；`FingerprintPolicy` 三档控制易变信号是否参与，`confidence` 标可信度，`signals` 暴露归一化中间层供跨版本迁移 |
-| http_client | `utils/http_client.h` | HttpClient：GET/POST/PUT/DELETE/通用方法、query 编码拼装、默认头、超时、重定向；headers 键统一小写；status=0 表示传输层错误；TLS（https 基址自动切换，自定义 CA / 服务端校验开关 / 客户端证书） |
+| http_client | `utils/http_client.h` | HttpClient：GET/POST/PUT/DELETE/通用方法、query 编码拼装、默认头、超时、重定向；headers 键统一小写；status=0 表示传输层错误；TLS（https 基址自动切换，自定义 CA / 服务端校验开关 / 客户端证书）；`try_get`/`try_post_json`/`try_request` 返回 Result<HttpResponse>（传输层失败才算错误） |
 | http_server | `utils/http_server.h` | HttpServer：路径参数（`:name`）/query 解析、前置过滤器、fallback、访问日志钩子、请求体上限、健康检查（/healthz 存活 + /readyz 就绪检查 JSON，探针绕过过滤器、显式路由优先、存活可运行期翻转）、apply_config（port/max_body_bytes）；TLS（set_ssl_certificates，首次 start 前生效，证书无效拒绝启动） |
 | log_facade | `utils/log_facade.h` | LogFacade：一行初始化 spdlog（控制台+滚动文件、级别、格式、可选异步），运行期调级，幂等 init/shutdown |
 | config_facade | `utils/config_facade.h` | 分层配置门面：默认值 → 文件（JSON/INI 按扩展名）→ 环境变量三层合并，键路径取值（get_int/get_bool/...），source_of 查来源 |
@@ -604,6 +605,56 @@ auto guard = make_scope_guard([f] { if (f) fclose(f); });
 // 异常/提前 return 均保证 fclose；成功路径 guard.dismiss();
 ```
 
+### 统一错误类型（Status / Result）
+
+```cpp
+using namespace libmini;
+
+// 失败 = 分类 + 原因 + 出错位置；with_context 逐层累加，读出来就是调用链
+Status check_db(SqliteDatabase& db)
+{
+    if (!db.is_open()) {
+        return Status::io(db.error_message()).with_context("check_db");
+    }
+    if (!db.exec("CREATE TABLE IF NOT EXISTS t (a INTEGER)")) {
+        return db.last_error("check_db");   // 模块自带的分类映射，见下
+    }
+    return Status::success();               // 成功值就是默认构造的 Status
+}
+
+// Result<T>：函数体内直接 return 值或错误，调用方一次判完
+Result<std::string> read_setting(const std::string& key)
+{
+    if (key.empty()) {
+        return Status::invalid_argument("key is empty").with_context("read_setting");
+    }
+    return "value-of-" + key;               // 能构造 T，就能隐式构造 Result<T>
+}
+
+const Result<std::string> v = read_setting("");
+if (!v) {
+    log(v.status().to_string());
+    // → "InvalidArgument: key is empty [read_setting]"
+    //   兜底取值用 v.value_or("-")
+}
+use(*v);              // 或 v.value()：不 ok 时抛 bad_result_access（what() 同 to_string()）
+
+// 泛型代码里 T 可能是 void：Result<void> 与 Status 可互换
+Result<void> ensure_dir(const std::string& path);
+```
+
+- **分类**：`StatusCode` 共 15 档（`InvalidArgument` / `NotFound` / `Conflict` /
+  `Unavailable` / `Timeout` / `Io` / `Corrupt` / … / `Failure`）。调用方按分类做分支
+  （重试 / 放弃 / 降级 / 上报），细节永远看 `message()`——它是底层库原文
+  （SQLite / httplib 的错误文本，原样保留，便于对照上游文档排障）。`Failure` 是
+  「确有失败但无更精确分类」的兜底，宁可粗分也不为了填分类而说谎。
+- **取值约定**与 `optional<T>` 一致：先判 `ok()` / `operator bool`；`operator*` / `->`
+  不检查（与 optional 同约定）。
+- **迁移状态**：`SqliteDatabase::try_open` / `try_exec`、`SqliteStatement::try_query_all`、
+  `HttpClient::try_get` / `try_post_json` / `try_request` 已返回 Status/Result；旧的
+  `bool` / `last_status()` / `HttpResponse::error` 接口**行为逐字节保留**（`error` 即
+  `Status::message()`），既有调用方零改动。新增模块请以 `try_*` 作为出口。
+
 ### 配置与环境
 
 ```cpp
@@ -661,6 +712,16 @@ q.bind_text_by_name(":name", "user42");
 auto rows = q.query_all();          // vector<vector<SqliteValue>>，type 区分 Null/Integer/Real/Text/Blob
 db.set_busy_timeout_ms(2000);       // 多连接写冲突的等待上限
 db.last_insert_rowid(); db.changes();
+
+// 同一批操作的 Result 版本：失败原因一次带全，调用方按分类决定重试还是上报
+//   Busy→Conflict、Constraint/Misuse→InvalidArgument、Corrupt/NotADatabase→Corrupt、
+//   ReadOnly→PermissionDenied、CannotOpen→Io、其余→Failure
+const Status st = db.try_exec("INSERT INTO users(name) VALUES ('x')");
+if (!st.ok()) {
+    use(st.to_string());            // "Conflict: database is locked [SqliteDatabase::exec]"
+}
+auto rows = q.try_query_all();      // Result<...>：空结果集是成功，查询失败才是错误
+if (rows) { use(*rows); } else { use(rows.status()); }
 ```
 
 ### 网络与重试
@@ -903,6 +964,12 @@ HttpResponse r = c.get("/items", {{"page", "1"}});   // query 自动编码拼装
 if (r.ok()) { use(r.body); }                          // 2xx；r.headers 键统一小写
 
 HttpResponse p = c.post_json("/items", R"({"name":"x"})");
+
+// Result 版本：传输层失败才是错误，拿到响应（含 4xx/5xx）即成功
+Result<HttpResponse> ok = c.try_get("/items", {{"page", "1"}});
+if (ok) { use(ok->body); }                       // 4xx/5xx 看 ok->status
+else { use(ok.status().to_string()); }           // 分类 + httplib 原文 + "HttpClient::GET /path"
+// 注意：httplib 把读超时也报成 Error::Read，故读超时归类为 Io；只有连接超时是 Timeout
 
 // TLS（基址为 https 时自动走 SSL；编译时检测到 OpenSSL 才可用）
 HttpClient s("https://api.example.com");

@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "libmini.h"
+#include "result.h"   // 统一错误面（Status/Result<T>）；叶子头，无包含时序问题
 
 struct sqlite3;
 struct sqlite3_stmt;
@@ -118,6 +119,23 @@ public:
     SqliteStatus last_status() const { return status_; }
     std::string error_message() const;   // 含 SQLite 原生错误文本
 
+    // ---------------- 统一错误面（Status / Result） ----------------
+    // 上面的 bool + last_status() 接口保持不变（既有调用方零改动）；下面这几个
+    // 是同一批操作的 Result 形状，专供跨模块传递错误：分类、原因、出错位置
+    // 一次带全，不必调用方逐层转述。SqliteStatus → StatusCode 的映射见
+    // sqlite.cpp：Busy→Conflict、Constraint/Misuse→InvalidArgument、
+    // Corrupt/NotADatabase→Corrupt、ReadOnly→PermissionDenied、
+    // CannotOpen→Io、其余→Failure（原因细节仍在 message 里）。
+
+    // 最近一次失败的统一描述（成功时 Status::success()）；
+    // context 为空时记作 "SqliteDatabase"
+    Status last_error(const std::string& context = std::string()) const;
+
+    // 与 open()/exec() 一一对应：成功返回 Status::success()，失败返回 classify 后的
+    // Status（含路径与出错位置）
+    Status try_open(const std::string& path, int flags = 0);
+    Status try_exec(const std::string& sql);
+
     // 最近一次插入的 rowid / 影响的行数
     std::int64_t last_insert_rowid() const;
     int changes() const;
@@ -194,6 +212,11 @@ public:
     // 小结果集一次性读取：每行按列值读取（类型保留）。游标位置不变，
     // 内部会 reset 后重新遍历，可在 step() 前后任意时刻调用
     std::vector<std::vector<SqliteValue>> query_all();
+
+    // query_all() 的 Result 版本：把「空结果集」与「查询失败」分开——前者是带
+    // 空值的成功，后者是错误（分类与原因见 SqliteDatabase::last_error）
+    Result<std::vector<std::vector<SqliteValue>>> try_query_all(
+        const std::string& context = std::string("SqliteStatement::query_all"));
 
 private:
     bool check(int rc);                  // SQLite 返回码 → 状态记录 + bool

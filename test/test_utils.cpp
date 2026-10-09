@@ -1218,6 +1218,146 @@ TEST(ScopeGuardTest, MoveTransfersOwnership)
     EXPECT_EQ(calls, 1);
 }
 
+// --------------------------------- Result ---------------------------------
+// 统一错误类型本身的语义（各模块的 Status 映射在各自的套件里验证）
+
+TEST(ResultTest, StatusClassifiesAndFormats)
+{
+    using namespace libmini;
+
+    const Status ok = Status::success();
+    EXPECT_TRUE(ok.ok());
+    EXPECT_EQ(ok.code(), StatusCode::Ok);
+    EXPECT_EQ(ok.to_string(), "Ok");
+
+    const Status nf = Status::not_found("no such table: users")
+                          .with_context("SqliteStatement::prepare");
+    EXPECT_FALSE(nf.ok());
+    EXPECT_FALSE(static_cast<bool>(nf));
+    EXPECT_EQ(nf.code(), StatusCode::NotFound);
+    EXPECT_EQ(nf.message(), "no such table: users");
+    EXPECT_EQ(nf.context(), "SqliteStatement::prepare");
+    EXPECT_EQ(nf.to_string(),
+              "NotFound: no such table: users [SqliteStatement::prepare]");
+
+    // 上下文逐层累加，最外层在前——读出来就是调用链
+    const Status chained = Status::io("connection reset")
+                               .with_context("HttpClient::send")
+                               .with_context("TaskRunner::run");
+    EXPECT_EQ(chained.context(), "TaskRunner::run -> HttpClient::send");
+    EXPECT_EQ(chained.to_string(),
+              "Io: connection reset [TaskRunner::run -> HttpClient::send]");
+
+    // 空上下文不改变已有描述
+    EXPECT_EQ(nf.with_context("").to_string(), nf.to_string());
+
+    // 分类名是日志/上报的稳定契约
+    EXPECT_STREQ(status_code_name(StatusCode::Conflict), "Conflict");
+    EXPECT_STREQ(status_code_name(StatusCode::Unsupported), "Unsupported");
+}
+
+TEST(ResultTest, HoldsValueOrError)
+{
+    using namespace libmini;
+
+    Result<int> good(7);
+    ASSERT_TRUE(good.ok());
+    EXPECT_EQ(*good, 7);
+    EXPECT_EQ(good.value(), 7);
+    EXPECT_TRUE(good.status().ok());
+    EXPECT_EQ(good.value_or(-1), 7);
+
+    Result<int> bad = Status::unavailable("service down");
+    EXPECT_FALSE(bad.ok());
+    EXPECT_FALSE(static_cast<bool>(bad));
+    EXPECT_EQ(bad.code(), StatusCode::Unavailable);
+    EXPECT_EQ(bad.status().message(), "service down");
+    EXPECT_EQ(bad.value_or(-1), -1);
+    EXPECT_THROW(bad.value(), bad_result_access);
+
+    // what() 就是 Status::to_string()：日志里能直接看到分类与原因
+    try {
+        bad.value();
+        FAIL() << "expected bad_result_access";
+    } catch (const bad_result_access& e) {
+        EXPECT_STREQ(e.what(), "Unavailable: service down");
+    }
+}
+
+TEST(ResultTest, MovesCopiesAndRebinds)
+{
+    using namespace libmini;
+
+    // 构造即转发：容器直接移动进来，不额外拷贝
+    Result<std::vector<std::string>> rows(std::vector<std::string>{"a", "b"});
+    ASSERT_TRUE(rows.ok());
+    EXPECT_EQ(rows->size(), 2u);
+    EXPECT_EQ((*rows)[1], "b");
+
+    Result<std::vector<std::string>> moved(std::move(rows));
+    ASSERT_TRUE(moved.ok());
+    EXPECT_EQ(moved->size(), 2u);
+
+    Result<std::vector<std::string>> copied(moved);
+    EXPECT_EQ(copied->size(), 2u);
+
+    // 失败 → 成功、成功 → 失败 两个方向都不能留下旧值的痕迹
+    Result<std::vector<std::string>> assigned(Status::timeout("t"));
+    EXPECT_FALSE(assigned.ok());
+    assigned = copied;
+    ASSERT_TRUE(assigned.ok());
+    EXPECT_EQ(assigned->size(), 2u);
+
+    assigned = Status::cancelled("stop");
+    EXPECT_FALSE(assigned.ok());
+    EXPECT_EQ(assigned.code(), StatusCode::Cancelled);
+    EXPECT_THROW(assigned.value(), bad_result_access);
+
+    assigned = Result<std::vector<std::string>>(std::vector<std::string>{"z"});
+    ASSERT_TRUE(assigned.ok());
+    EXPECT_EQ(assigned->size(), 1u);
+    EXPECT_EQ(assigned->at(0), "z");
+}
+
+TEST(ResultTest, ImplicitConstructionFromLiterals)
+{
+    using namespace libmini;
+
+    // 能构造 T 的实参就能构造 Result<T>，所以函数体内直接 return 值/错误
+    const auto read = [](bool present) -> Result<std::string> {
+        if (!present) {
+            return Status::not_found("missing").with_context("read");
+        }
+        return "payload";
+    };
+    EXPECT_EQ(read(true).value(), "payload");
+    EXPECT_EQ(read(false).code(), StatusCode::NotFound);
+    EXPECT_EQ(read(false).status().context(), "read");
+}
+
+TEST(ResultTest, VoidResult)
+{
+    using namespace libmini;
+
+    // 无返回值场景：Status 直接用，Result<void> 让泛型代码不必特判 T 是否为 void
+    const auto run = [](bool fail) -> Result<void> {
+        if (fail) {
+            return Status::permission_denied("read-only mount");
+        }
+        return Status::success();
+    };
+    EXPECT_TRUE(run(false).ok());
+    EXPECT_FALSE(run(true).ok());
+    EXPECT_EQ(run(true).code(), StatusCode::PermissionDenied);
+    EXPECT_NO_THROW(run(false).value());
+    EXPECT_THROW(run(true).value(), bad_result_access);
+
+    const Status st = Status::corrupt("bad magic");
+    const Result<void> as_result = st;
+    EXPECT_EQ(as_result.code(), StatusCode::Corrupt);
+    EXPECT_EQ(as_result.status().to_string(), "Corrupt: bad magic");
+}
+
 int main(int argc, char** argv)
 {
     ::testing::InitGoogleTest(&argc, argv);
