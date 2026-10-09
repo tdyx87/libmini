@@ -75,7 +75,6 @@ add_library(libmini::libmini ALIAS libmini)
 target_include_directories(libmini PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
     $<INSTALL_INTERFACE:include>
-    F:/conan/p/nlohm0567ffc90cfc1/p/include
 )
 
 # 版本号：与 CPack/install(EXPORT) 一致（根 CMakeLists 定义）
