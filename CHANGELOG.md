@@ -39,6 +39,7 @@
 #### 变更
 
 - Cover the full UAX #29 grapheme table in CI（[65cd4de](https://github.com/tdyx87/libmini/commit/65cd4de8b0599aa22bafafae7e8d1b6ffd185e04)）
+- Drop a machine-specific include path from the public build interface（[5394a39](https://github.com/tdyx87/libmini/commit/5394a39b521afa748494af4adf0b1dc411aad068)）
 
 #### 修复
 
