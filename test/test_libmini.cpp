@@ -73,7 +73,7 @@ TEST(LibminiInitTest, SigpipeIsIgnoredOnPosix) {
 #ifndef _WIN32
     // signal() 设置新值并返回旧值。读取当前处置后立即恢复，不让本测试干扰其它
     // 测试／线程的 socket 写入语义（当前线程未开启其它线程时此读写是安全的）。
-    const ::sighandler_t current = ::signal(SIGPIPE, SIG_DFL);
+    const auto current = ::signal(SIGPIPE, SIG_DFL);
     EXPECT_EQ(current, SIG_IGN)
         << "libmini 初始化器未把 SIGPIPE 设为 SIG_IGN（第三方代码仍可能被 SIGPIPE 杀掉）";
     ::signal(SIGPIPE, current);
