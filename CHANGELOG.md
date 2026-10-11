@@ -51,6 +51,7 @@
 - Fix run_process to drain child pipes concurrently and to stop handing it foreign handles（[5613d75](https://github.com/tdyx87/libmini/commit/5613d7594b291d6a66026d46c69aa8697410d86f)）
 - Fix file_mtime_ms to keep sub-second precision on POSIX（[64e76ac](https://github.com/tdyx87/libmini/commit/64e76acbb69fdf8c10a596d87f4d1e17317014af)）
 - Fix macOS cpu_usage_percent to read per-CPU counters（[43d65d5](https://github.com/tdyx87/libmini/commit/43d65d580315c480fb4c150a2a42b8714390c5a9)）
+- Fix macOS server sockets to suppress SIGPIPE（[fe338f7](https://github.com/tdyx87/libmini/commit/fe338f70440df00048f035cad23c316ef08ba38d)）
 
 #### 内部
 
