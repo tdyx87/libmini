@@ -54,6 +54,8 @@
 - Fix macOS cpu_usage_percent to read per-CPU counters（[43d65d5](https://github.com/tdyx87/libmini/commit/43d65d580315c480fb4c150a2a42b8714390c5a9)）
 - Fix macOS server sockets to suppress SIGPIPE（[fe338f7](https://github.com/tdyx87/libmini/commit/fe338f70440df00048f035cad23c316ef08ba38d)）
 - Fix WebSocket sockets to suppress SIGPIPE on macOS（[8f03307](https://github.com/tdyx87/libmini/commit/8f0330782ffdbc3d2e408df44a192b467bd3231b)）
+- Fix a macOS compile error in the SIGPIPE ignore test（[583da66](https://github.com/tdyx87/libmini/commit/583da66bf328da934238749b47f4943f60e60da3)）
+- Fix the SIGPIPE initializer never running from a static library（[ed80918](https://github.com/tdyx87/libmini/commit/ed8091822552b5f9239ddb0199c5d5c20ef1c683)）
 
 #### 内部
 
