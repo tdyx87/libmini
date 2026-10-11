@@ -650,12 +650,28 @@ int run_demo()
     report.info("看板: " + base + "/");
 
     collector.start();
+    // 等到「至少 3 条采样」且「至少一条带可用的 CPU 读数」再停采集器。
+    // cpu_usage_percent 是区间占用率，读数取决于两次调用之间 CPU 时间计数器
+    // 有没有推进：刻度粗的平台（macOS 的聚合计数器尤其）在短间隔下会给出 -1。
+    // 告警检查依赖一条可用读数，所以这里必须等它出现，而不是等固定条数。
     const std::int64_t deadline = current_timestamp_ms() + 8000;
-    while (store.count() < 3 && current_timestamp_ms() < deadline) {
+    bool cpu_seen = false;
+    while (current_timestamp_ms() < deadline) {
+        const std::vector<Sample> recent = store.recent(8);
+        cpu_seen = false;
+        for (std::size_t i = 0; i < recent.size(); ++i) {
+            if (recent[i].cpu_percent >= 0.0) {
+                cpu_seen = true;
+            }
+        }
+        if (store.count() >= 3 && cpu_seen) {
+            break;
+        }
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
     collector.stop();
     report.check(store.count() >= 3, "采集器按间隔写入至少 3 条采样");
+    report.check(cpu_seen, "至少一条采样带可用的 CPU 读数");
 
     // 3) HTTP 面
     HttpClient http(base);

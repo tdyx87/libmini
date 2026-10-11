@@ -17,6 +17,8 @@
 #include <libproc.h>
 #include <mach/mach.h>
 #include <mach/mach_host.h>
+#include <mach/processor_info.h>
+#include <mach/vm_map.h>
 #include <sys/statvfs.h>
 #include <sys/sysctl.h>
 #include <sys/types.h>
@@ -262,16 +264,34 @@ bool read_cpu_ticks(CpuTicks* out)
     out->valid = true;
     return true;
 #elif defined(__APPLE__)
-    host_cpu_load_info_data_t info;
-    mach_msg_type_number_t count = HOST_CPU_LOAD_INFO_COUNT;
-    if (::host_statistics(::mach_host_self(), HOST_CPU_LOAD_INFO,
-                          reinterpret_cast<host_info_t>(&info), &count) != KERN_SUCCESS) {
+    // 用 host_processor_info(PROCESSOR_CPU_LOAD_INFO) 而不是
+    // host_statistics(HOST_CPU_LOAD_INFO)：后者的聚合计数器在内核里按较粗的
+    // 刻度刷新——轮询快于约 500ms 时会拿到**逐字节相同**的计数，差值恒为 0，
+    // cpu_usage_percent 只能一路返回 -1（htop 等工具正为此改用按 CPU 的
+    // 计数器，同一现象 psutil 也有记录）。按 CPU 的计数器刻度细得多，而两者
+    // 单位相同（都是 tick），所以 cpu_usage_percent 的比值口径不受影响。
+    natural_t cpu_count = 0;
+    processor_info_array_t info = NULL;
+    mach_msg_type_number_t info_count = 0;
+    if (::host_processor_info(::mach_host_self(), PROCESSOR_CPU_LOAD_INFO,
+                              &cpu_count, &info, &info_count) != KERN_SUCCESS) {
         return false;
     }
-    const std::uint64_t user = info.cpu_ticks[CPU_STATE_USER];
-    const std::uint64_t nice = info.cpu_ticks[CPU_STATE_NICE];
-    const std::uint64_t system = info.cpu_ticks[CPU_STATE_SYSTEM];
-    const std::uint64_t idle = info.cpu_ticks[CPU_STATE_IDLE];
+    std::uint64_t user = 0;
+    std::uint64_t nice = 0;
+    std::uint64_t system = 0;
+    std::uint64_t idle = 0;
+    for (natural_t i = 0; i < cpu_count; ++i) {
+        const integer_t* ticks =
+            info + static_cast<std::size_t>(i) * CPU_STATE_MAX;
+        user += static_cast<std::uint64_t>(ticks[CPU_STATE_USER]);
+        nice += static_cast<std::uint64_t>(ticks[CPU_STATE_NICE]);
+        system += static_cast<std::uint64_t>(ticks[CPU_STATE_SYSTEM]);
+        idle += static_cast<std::uint64_t>(ticks[CPU_STATE_IDLE]);
+    }
+    // info_count 是返回数组里的 integer_t 个数（不是 CPU 个数）
+    ::vm_deallocate(::mach_task_self(), reinterpret_cast<vm_address_t>(info),
+                    static_cast<vm_size_t>(info_count) * sizeof(integer_t));
     out->idle = idle;
     out->total = user + nice + system + idle;
     out->valid = true;
