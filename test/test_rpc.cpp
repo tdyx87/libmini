@@ -3863,7 +3863,11 @@ int main(int argc, char** argv)
     // 最后 4KB 输出（约几十条用例的进度）一起丢掉，只能看到「套件挂了」而
     // 不知道挂在哪个用例上。Linux 侧 CI 用 stdbuf 达到同一目的，macOS 没有
     // stdbuf，这里是可移植的做法。
-    std::setvbuf(stdout, NULL, _IOLBF, 0);
+    // 缓冲区自己给：MSVC 的 setvbuf 在 buf 为 NULL 时会校验 size，传 0 会
+    // 走无效参数处理器直接 fail-fast（0xc0000409），只有显式缓冲区才能
+    // 三平台一致。
+    static char line_buffer[4096];
+    std::setvbuf(stdout, line_buffer, _IOLBF, sizeof(line_buffer));
     ::testing::InitGoogleTest(&argc, argv);
     return RUN_ALL_TESTS();
 }
