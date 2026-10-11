@@ -2696,6 +2696,20 @@ std::string core_reply_to_local(int http_status, int retry_after_seconds,
     return to_json_string(body);
 }
 
+// macOS 的平台差异：MSG_NOSIGNAL 值为 0（见文件顶部兜底定义），抑制
+// SIGPIPE 只能靠 SO_NOSIGPIPE 套接字选项——而它的默认动作是杀掉整个
+// 进程。客户端在 uds_connect 里设置；服务端必须在每个 accept 出来的
+// fd 上自己设置，否则一个半途断开的客户端就能带走服务进程。
+// 无 SO_NOSIGPIPE 的平台（Linux/Windows）是空操作：写入侧靠 MSG_NOSIGNAL。
+void set_nosigpipe(int fd)
+{
+    (void)fd;
+#ifdef SO_NOSIGPIPE
+    const int nosig = 1;
+    (void)::setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &nosig, sizeof(nosig));
+#endif
+}
+
 // 发送完整缓冲区；返回是否成功
 bool uds_send_all(int fd, const char* data, std::size_t len)
 {
@@ -2787,11 +2801,8 @@ bool uds_connect(int fd, const std::string& path, int timeout_ms)
         }
     }
     ::fcntl(fd, F_SETFL, flags);  // 恢复阻塞模式
-#ifdef SO_NOSIGPIPE
     // macOS：无 MSG_NOSIGNAL，用套接字选项抑制 SIGPIPE（写端对端已关时）
-    const int nosig = 1;
-    (void)::setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &nosig, sizeof(nosig));
-#endif
+    set_nosigpipe(fd);
     return true;
 }
 
@@ -4507,6 +4518,8 @@ struct RpcServer::Impl
                 }
                 break;  // listen fd 已关闭（停机）
             }
+            // macOS：对端半途断开时写入不再触发 SIGPIPE 杀掉服务进程
+            set_nosigpipe(fd);
             // 一连接一线程；读循环 + 派发（带 id 请求异步处理，与管道一致）。
             // 线程注册进 active_uds，连接结束时自除——但「自除」前先自
             // detach 不行：停机时可能正在遍历注册表 join。改为：线程结束

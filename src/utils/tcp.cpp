@@ -270,6 +270,18 @@ void set_nodelay(SocketHandle fd)
 #endif
 }
 
+// macOS：MSG_NOSIGNAL 不生效，发送侧只能靠 SO_NOSIGPIPE 抑制 SIGPIPE
+//（默认动作 = 杀进程）。服务端必须为每个 accept 出来的 fd 设置一次，
+// 否则客户端半途断开会带走服务进程。其他平台无此选项，是空操作。
+void set_nosigpipe(SocketHandle fd)
+{
+    (void)fd;
+#ifdef SO_NOSIGPIPE
+    const int nosig = 1;
+    ::setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &nosig, sizeof(nosig));
+#endif
+}
+
 // 进程级 WSA 初始化（RAII，多次使用安全）
 struct NetInitializer
 {
@@ -914,6 +926,7 @@ bool TcpServer::start(const std::string& host, std::uint16_t port)
                 }
                 continue;
             }
+            set_nosigpipe(client);
             set_nodelay(client);
 
             char ip[64] = {0};
