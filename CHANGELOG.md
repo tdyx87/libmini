@@ -43,6 +43,7 @@
 
 - Cover the full UAX #29 grapheme table in CI（[65cd4de](https://github.com/tdyx87/libmini/commit/65cd4de8b0599aa22bafafae7e8d1b6ffd185e04)）
 - Drop a machine-specific include path from the public build interface（[5394a39](https://github.com/tdyx87/libmini/commit/5394a39b521afa748494af4adf0b1dc411aad068)）
+- Set SO_NOSIGPIPE on WebSocket sockets to suppress SIGPIPE on macOS.（[ce606d3](https://github.com/tdyx87/libmini/commit/ce606d3b43c7e2675cefb215a3ec0715f68ae6b3)）
 
 #### 修复
 

@@ -157,6 +157,19 @@ bool send_all(SocketHandle fd, const char* data, std::size_t size)
     return true;
 }
 
+// macOS：MSG_NOSIGNAL 不生效，发送侧只能靠 SO_NOSIGPIPE 抑制 SIGPIPE
+//（默认动作 = 杀进程）。服务端必须为每个 accept 出来的 fd 设置一次，
+// 客户端连接成功时也要设置，否则对端半途断开会带走本进程。
+// 其他平台无此选项，是空操作。
+void set_nosigpipe(SocketHandle fd)
+{
+    (void)fd;
+#ifdef SO_NOSIGPIPE
+    const int nosig = 1;
+    ::setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &nosig, sizeof(nosig));
+#endif
+}
+
 void set_nodelay(SocketHandle fd)
 {
     int one = 1;
@@ -815,6 +828,8 @@ bool WsClient::connect(const std::string& host, std::uint16_t port,
         close_socket(fd);
         return false;
     }
+    // macOS：无 MSG_NOSIGNAL，用套接字选项抑制 SIGPIPE（对端已关时）
+    set_nosigpipe(fd);
     set_nodelay(fd);
 
     // HTTP Upgrade 握手（失败即整体失败，不进入会话线程）
@@ -1259,6 +1274,8 @@ bool WsServer::start(const std::string& host, std::uint16_t port)
                 }
                 continue;
             }
+            // macOS：对端半途断开时写入不再触发 SIGPIPE 杀掉服务进程
+            set_nosigpipe(client);
             set_nodelay(client);
 
             char ip[64] = {0};
