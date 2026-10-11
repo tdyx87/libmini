@@ -6,6 +6,7 @@
 #endif
 
 #include <atomic>
+#include <cstdio>  // setvbuf（main 里的行缓冲）
 #include <memory>
 #include <string>
 #include <thread>
@@ -3858,6 +3859,11 @@ TEST(RpcLoadBalancerTest, AsyncCallFailsOverToLiveEndpoint)
 
 int main(int argc, char** argv)
 {
+    // 逐测试输出改为行缓冲：本套件在 CI 上偶发崩溃/超时，默认的全缓冲会把
+    // 最后 4KB 输出（约几十条用例的进度）一起丢掉，只能看到「套件挂了」而
+    // 不知道挂在哪个用例上。Linux 侧 CI 用 stdbuf 达到同一目的，macOS 没有
+    // stdbuf，这里是可移植的做法。
+    std::setvbuf(stdout, NULL, _IOLBF, 0);
     ::testing::InitGoogleTest(&argc, argv);
     return RUN_ALL_TESTS();
 }
