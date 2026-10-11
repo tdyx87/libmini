@@ -80,3 +80,11 @@ target_link_libraries(test_sqlite_child PRIVATE libmini)
 target_compile_definitions(test_libmini PRIVATE
     LIBMINI_SQLITE_CHILD_EXE="$<TARGET_FILE:test_sqlite_child>")
 add_dependencies(test_libmini test_sqlite_child)
+
+# run_process 大输出回归测试的辅助进程：专门写出超过管道缓冲区的内容，
+# 验证父进程边跑边排水（旧实现会在此死锁）
+add_executable(test_process_child process_child.cpp)
+
+target_compile_definitions(test_libmini PRIVATE
+    LIBMINI_PROCESS_CHILD_EXE="$<TARGET_FILE:test_process_child>")
+add_dependencies(test_libmini test_process_child)

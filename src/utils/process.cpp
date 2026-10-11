@@ -11,6 +11,7 @@
 #else
 #include <csignal>
 #include <cstring>
+#include <fcntl.h>
 #include <sys/wait.h>
 #include <thread>
 #include <unistd.h>
@@ -110,12 +111,38 @@ ProcessResult run_process(const std::string& program,
     ::SetHandleInformation(out_read, HANDLE_FLAG_INHERIT, 0);
     ::SetHandleInformation(err_read, HANDLE_FLAG_INHERIT, 0);
 
-    STARTUPINFOW si = {};
-    si.cb = sizeof(si);
-    si.dwFlags = STARTF_USESTDHANDLES;
-    si.hStdInput = in_read;
-    si.hStdOutput = out_write;
-    si.hStdError = err_write;
+    STARTUPINFOEXW si = {};
+    si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+    si.StartupInfo.hStdInput = in_read;
+    si.StartupInfo.hStdOutput = out_write;
+    si.StartupInfo.hStdError = err_write;
+
+    // 用 PROC_THREAD_ATTRIBUTE_HANDLE_LIST 把可继承句柄白名单收窄到我们自己的
+    // 三个端点。bInheritHandles=TRUE 会把父进程里所有可继承句柄都塞给子进程，
+    // 包括「另一个线程正在用的 run_process 管道写端」与监听套接字——那时两个
+    // 并发调用会各自持有对方的写端，谁也读不到 EOF，表现为并发退化成串行甚至
+    // 互相等待到超时。
+    HANDLE inherit_handles[3] = {in_read, out_write, err_write};
+    SIZE_T attr_size = 0;
+    bool attr_initialized = false;
+    bool handle_list_ready = false;
+    ::InitializeProcThreadAttributeList(NULL, 1, 0, &attr_size);
+    if (attr_size > 0) {
+        si.lpAttributeList = static_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(
+            ::HeapAlloc(::GetProcessHeap(), 0, attr_size));
+        if (si.lpAttributeList != NULL &&
+            ::InitializeProcThreadAttributeList(si.lpAttributeList, 1, 0, &attr_size)) {
+            attr_initialized = true;
+            handle_list_ready =
+                ::UpdateProcThreadAttribute(si.lpAttributeList, 0,
+                                            PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+                                            inherit_handles, sizeof(inherit_handles),
+                                            NULL, NULL) != FALSE;
+        }
+    }
+    // 拿不到句柄列表时退回普通继承（标准流仍由 STARTF_USESTDHANDLES 指定）
+    si.StartupInfo.cb = static_cast<DWORD>(
+        handle_list_ready ? sizeof(STARTUPINFOEXW) : sizeof(STARTUPINFOW));
 
     PROCESS_INFORMATION pi = {};
     // lpApplicationName 传 NULL：由 Windows 按命令行首 token 搜索
@@ -123,7 +150,16 @@ ProcessResult run_process(const std::string& program,
     const BOOL ok = ::CreateProcessW(
         NULL,
         const_cast<LPWSTR>(wcmdline.c_str()), // 完整命令行（可执行路径需引号）
-        NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi);
+        NULL, NULL, TRUE,
+        handle_list_ready ? EXTENDED_STARTUPINFO_PRESENT : 0, NULL, NULL,
+        &si.StartupInfo, &pi);
+
+    if (si.lpAttributeList != NULL) {
+        if (attr_initialized) {
+            ::DeleteProcThreadAttributeList(si.lpAttributeList);
+        }
+        ::HeapFree(::GetProcessHeap(), 0, si.lpAttributeList);
+    }
 
     // 父进程侧不用的端点立即关闭（子进程拿到唯一的继承端点）
     ::CloseHandle(in_read);
@@ -138,8 +174,10 @@ ProcessResult run_process(const std::string& program,
     }
     ::CloseHandle(pi.hThread);
 
-    // stdin 数据写入：独立线程，避免大输入与进程等待互相阻塞
-    std::thread writer([in_write, &input_text]() {
+    // stdin 数据写入：独立线程，避免大输入与进程等待互相阻塞。
+    // 该线程会活到 run_process 返回之后，故 input_text 必须按值捕获——按引用
+    // 捕获会在调用方销毁实参后悬空。
+    std::thread writer([in_write, input_text]() {
         if (!input_text.empty()) {
             DWORD written = 0;
             std::size_t off = 0;
@@ -157,6 +195,14 @@ ProcessResult run_process(const std::string& program,
     });
     writer.detach();
 
+    // stdout / stderr 各起一个读取线程：管道缓冲区写满后子进程会阻塞在写操作上，
+    // 若父进程先等进程结束再排水，两边就会互相等待直到超时（任何输出超过一个
+    // 管道缓冲区——Windows 上约 4KB——的子进程都会死锁）
+    std::string out_text;
+    std::string err_text;
+    std::thread out_reader([out_read, &out_text]() { out_text = read_pipe(out_read); });
+    std::thread err_reader([err_read, &err_text]() { err_text = read_pipe(err_read); });
+
     const DWORD wait_ms =
         timeout_ms > 0 ? static_cast<DWORD>(timeout_ms) : INFINITE;
     const DWORD wr = ::WaitForSingleObject(pi.hProcess, wait_ms);
@@ -172,9 +218,11 @@ ProcessResult run_process(const std::string& program,
     }
     ::CloseHandle(pi.hProcess);
 
-    // 进程结束后排水输出（写端已关，read_pipe 会自然返回）
-    result.stdout_text = read_pipe(out_read);
-    result.stderr_text = read_pipe(err_read);
+    // 子进程结束后写端关闭，读取线程随之读到 EOF 并返回
+    out_reader.join();
+    err_reader.join();
+    result.stdout_text.swap(out_text);
+    result.stderr_text.swap(err_text);
     return result;
 }
 
@@ -219,6 +267,14 @@ ProcessResult run_process(const std::string& program,
         ::pipe(err_pipe) != 0) {
         return result;
     }
+    // 六个端点全部置 FD_CLOEXEC：exec 后子进程只会留下自己那三个标准流
+    // （dup2 复制出来的描述符不带 cloexec），不会顺手继承别的线程正在用的
+    // 管道端点——否则并发调用会各自持有对方的写端而读不到 EOF
+    for (int i = 0; i < 2; ++i) {
+        ::fcntl(in_pipe[i], F_SETFD, FD_CLOEXEC);
+        ::fcntl(out_pipe[i], F_SETFD, FD_CLOEXEC);
+        ::fcntl(err_pipe[i], F_SETFD, FD_CLOEXEC);
+    }
 
     // 参数列表转 argv（execvp 需要的 char*，内容不会被修改）
     std::vector<char*> argv;
@@ -254,10 +310,11 @@ ProcessResult run_process(const std::string& program,
     ::close(err_pipe[1]);
 
     // stdin 写入（独立线程）。
-    // 注意：lambda 不能直接捕获数组元素（C++11 限制），复制成标量
+    // 注意：lambda 不能直接捕获数组元素（C++11 限制），复制成标量；
+    // 线程会活到 run_process 返回之后，故 input_text 按值捕获
     const int in_write_fd = in_pipe[1];
     if (!input_text.empty()) {
-        std::thread writer([in_write_fd, &input_text]() {
+        std::thread writer([in_write_fd, input_text]() {
             std::size_t off = 0;
             while (off < input_text.size()) {
                 const ssize_t n = ::write(
@@ -275,7 +332,16 @@ ProcessResult run_process(const std::string& program,
         ::close(in_pipe[1]);
     }
 
-    // 带超时等待：先 poll 输出管道避免缓冲区满死锁，超时则 SIGKILL
+    // stdout / stderr 各起一个读取线程，边跑边排空：管道写满后子进程会阻塞在
+    // 写操作上，若等到进程结束再 drain，两边会互相等待直到超时
+    const int out_read_fd = out_pipe[0];
+    const int err_read_fd = err_pipe[0];
+    std::string out_text;
+    std::string err_text;
+    std::thread out_reader([out_read_fd, &out_text]() { out_text = drain_fd(out_read_fd); });
+    std::thread err_reader([err_read_fd, &err_text]() { err_text = drain_fd(err_read_fd); });
+
+    // 带超时等待：超时则 SIGKILL
     const bool use_timeout = timeout_ms > 0;
     const auto deadline = std::chrono::steady_clock::now() +
                           std::chrono::milliseconds(timeout_ms);
@@ -307,8 +373,11 @@ ProcessResult run_process(const std::string& program,
     if (result.exit_code == 127) {
         result.exit_code = -1;
     }
-    result.stdout_text = drain_fd(out_pipe[0]);
-    result.stderr_text = drain_fd(err_pipe[0]);
+    // 子进程结束后写端关闭，读取线程随之读到 EOF 并返回
+    out_reader.join();
+    err_reader.join();
+    result.stdout_text.swap(out_text);
+    result.stderr_text.swap(err_text);
     return result;
 }
 

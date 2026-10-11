@@ -1357,6 +1357,45 @@ TEST(ProcessTest, NonexistentProgramReportsFailure)
 #endif
 }
 
+// 回归测试：管道排水死锁。
+// 旧实现先等子进程结束再排空 stdout/stderr，子进程输出超过管道缓冲区
+// （Windows 约 4KB、POSIX 64KB）时会阻塞在写操作上，父进程只能空等到超时。
+TEST(ProcessTest, LargeOutputDoesNotDeadlock)
+{
+    libmini::ProcessResult r = libmini::run_process(
+        LIBMINI_PROCESS_CHILD_EXE, {"1048576", "65536", "3"}, 60000);
+    EXPECT_FALSE(r.timed_out);
+    EXPECT_EQ(r.exit_code, 3);
+    EXPECT_EQ(r.stdout_text.size(), 1048576u);
+    EXPECT_EQ(r.stderr_text.size(), 65536u);
+}
+
+// 回归测试：并发调用 run_process 时，子进程不应继承「别的调用」的管道端点。
+// 旧实现用 bInheritHandles=TRUE 继承父进程全部可继承句柄，两个并发调用会各自
+// 持有对方的管道写端，谁也读不到 EOF——并发退化成串行，甚至互相等到超时。
+TEST(ProcessTest, ConcurrentRunsDoNotSharePipeHandles)
+{
+    const std::size_t bytes = 2u * 1024 * 1024;  // 每路 2 MiB，远超管道缓冲区
+    libmini::ProcessResult first;
+    libmini::ProcessResult second;
+    std::thread a([&]() {
+        first = libmini::run_process(LIBMINI_PROCESS_CHILD_EXE, {"2097152", "0", "0"},
+                                     60000);
+    });
+    std::thread b([&]() {
+        second = libmini::run_process(LIBMINI_PROCESS_CHILD_EXE, {"2097152", "0", "0"},
+                                      60000);
+    });
+    a.join();
+    b.join();
+    EXPECT_FALSE(first.timed_out);
+    EXPECT_FALSE(second.timed_out);
+    EXPECT_EQ(first.stdout_text.size(), bytes);
+    EXPECT_EQ(second.stdout_text.size(), bytes);
+    EXPECT_TRUE(first.stderr_text.empty());
+    EXPECT_TRUE(second.stderr_text.empty());
+}
+
 // ==================== LRU 缓存 ====================
 
 TEST(LruCacheTest, PutGetAndCapacityEviction)
