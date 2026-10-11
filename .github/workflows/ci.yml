@@ -140,6 +140,30 @@ jobs:
       - name: Build
         run: cmake --build build --parallel
 
+      # 初始化器「进没进最终镜像」是纯链接期事实，运行期测试失败只报症状
+      # （读到 SIG_DFL），不指出病因。这里在 POSIX 上直接对目标文件断言：
+      # libmini_init.cpp.o 必须真的含有加载期构造函数。曾经踩过的坑是
+      # libmini_init.cpp 先 #ifdef SIGPIPE 再 #include <csignal>，宏不可见
+      # 导致整段被编译掉——锚点在、.init_array 在，却没有构造函数，运行期才炸。
+      # 这条检查把该病因在构建阶段就拦下来（非 POSIX 无 SIGPIPE，跳过）。
+      - name: Verify the init constructor is compiled in
+        if: matrix.os != 'windows-latest'
+        shell: bash
+        run: |
+          obj=$(find build -name 'libmini_init.cpp.o' | head -1)
+          echo "== object: $obj =="
+          test -n "$obj" || { echo "libmini_init.cpp.o not found"; exit 1; }
+          # constructor 属性会产出名为 libmini_ignore_sigpipe 的函数（本轮实现），
+          # 静态对象回落形式则产出 _GLOBAL__sub_I_。两者都算通过。
+          if nm "$obj" | grep -qiE 'libmini_ignore_sigpipe|_GLOBAL__sub_I'; then
+            echo "OK: load-time constructor present in $obj"
+            nm "$obj" | grep -iE 'libmini_ignore_sigpipe|_GLOBAL__sub_I' || true
+          else
+            echo "FAIL: no load-time constructor in $obj -- the initializer was"
+            echo "      compiled out (check include ordering around SIGPIPE)"
+            exit 1
+          fi
+
       - name: CTest
         shell: bash
         run: |

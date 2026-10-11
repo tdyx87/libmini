@@ -44,6 +44,7 @@
 - Cover the full UAX #29 grapheme table in CI（[65cd4de](https://github.com/tdyx87/libmini/commit/65cd4de8b0599aa22bafafae7e8d1b6ffd185e04)）
 - Drop a machine-specific include path from the public build interface（[5394a39](https://github.com/tdyx87/libmini/commit/5394a39b521afa748494af4adf0b1dc411aad068)）
 - Init: ignore SIGPIPE at library load time on POSIX（[181526d](https://github.com/tdyx87/libmini/commit/181526d2d9142efe3d3bd4533fee6e08bc9c7e12)）
+- Compile the SIGPIPE ignore hook on POSIX again（[2258496](https://github.com/tdyx87/libmini/commit/2258496a09a59d99ef75491465ddc7e79a804536)）
 
 #### 修复
 
