@@ -49,6 +49,7 @@
 - Fix Windows SqliteWriteMutex to use real file locks（[1552567](https://github.com/tdyx87/libmini/commit/155256799cd05af728a4596c582382d77009c3db)）
 - Fix SqliteWriteMutex held-state tracking and log SQLite open/close failures（[95f8e2a](https://github.com/tdyx87/libmini/commit/95f8e2a5f8c4d6b7b5642dc0a86ac36e7b14ee9b)）
 - Fix run_process to drain child pipes concurrently and to stop handing it foreign handles（[5613d75](https://github.com/tdyx87/libmini/commit/5613d7594b291d6a66026d46c69aa8697410d86f)）
+- Fix file_mtime_ms to keep sub-second precision on POSIX（[64e76ac](https://github.com/tdyx87/libmini/commit/64e76acbb69fdf8c10a596d87f4d1e17317014af)）
 
 #### 内部
 
