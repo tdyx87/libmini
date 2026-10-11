@@ -57,6 +57,7 @@
 - Document SqliteWriteMutex usage contract and .wlock file lifecycle（[6ee55b4](https://github.com/tdyx87/libmini/commit/6ee55b401b0ffeacff783b84515a594b2f1ffe21)）
 - Cover run_process concurrency and timeout paths plus cpu_usage_percent with direct tests（[5935d1e](https://github.com/tdyx87/libmini/commit/5935d1e6372ff99a313928585182e11d40e52c6e)）
 - Make rpc suite output line-buffered so a crash still shows the last test（[130df21](https://github.com/tdyx87/libmini/commit/130df21e932f91d2da06e6c2e09a9e086f5d3044)）
+- Fix rpc suite line buffering to hand setvbuf a real buffer（[3fcaab5](https://github.com/tdyx87/libmini/commit/3fcaab5cab04aeb25d9079c094ecaba2b9e14e78)）
 
 <!-- END generated:unreleased -->
 
