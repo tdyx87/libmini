@@ -20,6 +20,10 @@
 using libmini::HmacMd5;
 using libmini::HmacSha256;
 
+#ifndef _WIN32
+#include <csignal>
+#endif
+
 // ------------------------------ string_utils ------------------------------
 
 TEST(StringUtilsTest, Split)
@@ -60,6 +64,20 @@ TEST(StringUtilsTest, CaseConversion)
     EXPECT_EQ(to_upper("Hello World"), "HELLO WORLD");
     EXPECT_EQ(to_lower("HELLO"), "hello");
     EXPECT_EQ(to_lower("Hello World"), "hello world");
+}
+
+// 库初始化器在 main() 之前把进程级 SIGPIPE 忽略了；第三方代码（http_server /
+// http_client 使用的 cpp-httplib、以及任何后续加载的插件 DLL）因此在 macOS 上
+// 写入已关闭 socket 时不再被信号杀掉。Windows 上 SIGPIPE 不存在，不跑。
+TEST(LibminiInitTest, SigpipeIsIgnoredOnPosix) {
+#ifndef _WIN32
+    // signal() 设置新值并返回旧值。读取当前处置后立即恢复，不让本测试干扰其它
+    // 测试／线程的 socket 写入语义（当前线程未开启其它线程时此读写是安全的）。
+    const ::sighandler_t current = ::signal(SIGPIPE, SIG_DFL);
+    EXPECT_EQ(current, SIG_IGN)
+        << "libmini 初始化器未把 SIGPIPE 设为 SIG_IGN（第三方代码仍可能被 SIGPIPE 杀掉）";
+    ::signal(SIGPIPE, current);
+#endif
 }
 
 // ------------------------------ time_utils --------------------------------
