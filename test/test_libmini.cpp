@@ -375,6 +375,27 @@ TEST(FileSysTest, DetailedListingAndTimestamps)
     EXPECT_EQ(names[0], "alpha.txt");
 }
 
+// 修改时间戳必须带亚秒精度：只到整秒的话，「同一秒内再次写入」在 mtime 上看起来
+// 毫无变化，基于 mtime 的轮询（配置热加载、缓存失效）就永远不会被触发。
+TEST(FileSysTest, MtimeKeepsSubSecondResolution)
+{
+    using namespace libmini;
+    const std::string path = unique_temp_path("libmini_mtime_");
+    ASSERT_TRUE(write_file(path, "first"));
+    const std::int64_t first = file_mtime_ms(path);
+    ASSERT_GT(first, 0);
+
+    // 20ms 足以跨过 Linux 粗粒度时钟（1/HZ，通常 4~10ms）与常见文件系统的
+    // 时间戳粒度，又远小于 1 秒——只保留整秒的实现在这里会看到两次相等
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    ASSERT_TRUE(write_file(path, "second"));
+    const std::int64_t second = file_mtime_ms(path);
+
+    EXPECT_GT(second, first);
+    EXPECT_LT(second - first, 5000);  // 确实是刚那次写入，不是别的时间
+    EXPECT_TRUE(remove_file(path));
+}
+
 TEST(FileSysTest, TempPaths)
 {
     using namespace libmini;

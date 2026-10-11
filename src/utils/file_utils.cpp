@@ -78,7 +78,17 @@ PathInfo query_info(const std::string& path)
     if (!info.is_symlink && ::stat(path.c_str(), &st) == 0) {
         info.is_dir = S_ISDIR(st.st_mode);
         info.size = static_cast<std::uint64_t>(st.st_size);
-        info.mtime_ms = static_cast<std::int64_t>(st.st_mtime) * 1000;
+        // 亚秒精度必须带上。只取整秒时，「同一秒内再次写入」在 mtime 上看起来
+        // 毫无变化，于是所有基于 mtime 的轮询（配置热加载、缓存失效）在 POSIX
+        // 上永远不会被触发——Windows 侧走 FILETIME，本来就是 100ns 粒度
+        // （macOS 的字段叫 st_mtimespec，其余 POSIX 用 st_mtim）
+#if defined(__APPLE__)
+        const struct timespec& ts = st.st_mtimespec;
+#else
+        const struct timespec& ts = st.st_mtim;
+#endif
+        info.mtime_ms = static_cast<std::int64_t>(ts.tv_sec) * 1000 +
+                        static_cast<std::int64_t>(ts.tv_nsec) / 1000000;
     }
     return info;
 }
