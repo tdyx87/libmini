@@ -53,6 +53,7 @@
 #### 内部
 
 - Document SqliteWriteMutex usage contract and .wlock file lifecycle（[6ee55b4](https://github.com/tdyx87/libmini/commit/6ee55b401b0ffeacff783b84515a594b2f1ffe21)）
+- Cover run_process concurrency and timeout paths plus cpu_usage_percent with direct tests（[5935d1e](https://github.com/tdyx87/libmini/commit/5935d1e6372ff99a313928585182e11d40e52c6e)）
 
 <!-- END generated:unreleased -->
 
