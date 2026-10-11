@@ -43,7 +43,6 @@
 
 - Cover the full UAX #29 grapheme table in CI（[65cd4de](https://github.com/tdyx87/libmini/commit/65cd4de8b0599aa22bafafae7e8d1b6ffd185e04)）
 - Drop a machine-specific include path from the public build interface（[5394a39](https://github.com/tdyx87/libmini/commit/5394a39b521afa748494af4adf0b1dc411aad068)）
-- Set SO_NOSIGPIPE on WebSocket sockets to suppress SIGPIPE on macOS.（[ce606d3](https://github.com/tdyx87/libmini/commit/ce606d3b43c7e2675cefb215a3ec0715f68ae6b3)）
 
 #### 修复
 
@@ -53,6 +52,7 @@
 - Fix file_mtime_ms to keep sub-second precision on POSIX（[64e76ac](https://github.com/tdyx87/libmini/commit/64e76acbb69fdf8c10a596d87f4d1e17317014af)）
 - Fix macOS cpu_usage_percent to read per-CPU counters（[43d65d5](https://github.com/tdyx87/libmini/commit/43d65d580315c480fb4c150a2a42b8714390c5a9)）
 - Fix macOS server sockets to suppress SIGPIPE（[fe338f7](https://github.com/tdyx87/libmini/commit/fe338f70440df00048f035cad23c316ef08ba38d)）
+- Fix WebSocket sockets to suppress SIGPIPE on macOS（[8f03307](https://github.com/tdyx87/libmini/commit/8f0330782ffdbc3d2e408df44a192b467bd3231b)）
 
 #### 内部
 
