@@ -1396,6 +1396,69 @@ TEST(ProcessTest, ConcurrentRunsDoNotSharePipeHandles)
     EXPECT_TRUE(second.stderr_text.empty());
 }
 
+// 并发调用的 stdin 也要各归各家：写入线程与排水线程同时在跑，而 Windows 侧收窄到
+// 白名单的句柄表一旦漏掉 stdin 的读端，子进程就收不到任何输入——两种错都会在这里露出来。
+TEST(ProcessTest, ConcurrentRunsKeepTheirOwnStdin)
+{
+#ifdef _WIN32
+    const std::string filter_program = "findstr";
+#else
+    const std::string filter_program = "grep";
+#endif
+    // 每路约 44 KB，远超一次 write 的量，写入线程必须与子进程读取并行
+    std::string payload_a;
+    std::string payload_b;
+    for (int i = 0; i < 4096; ++i) {
+        payload_a += (i == 2048) ? "marker-a\n" : "filler line\n";
+        payload_b += (i == 1024) ? "marker-b\n" : "filler line\n";
+    }
+
+    libmini::ProcessResult a;
+    libmini::ProcessResult b;
+    std::thread ta([&]() {
+        a = libmini::run_process(filter_program, {"marker-a"}, 60000, payload_a);
+    });
+    std::thread tb([&]() {
+        b = libmini::run_process(filter_program, {"marker-b"}, 60000, payload_b);
+    });
+    ta.join();
+    tb.join();
+
+    EXPECT_FALSE(a.timed_out);
+    EXPECT_FALSE(b.timed_out);
+    EXPECT_EQ(a.exit_code, 0);
+    EXPECT_EQ(b.exit_code, 0);
+    // 谁的输入进谁的子进程：两路都不能看到对方的那一行
+    EXPECT_NE(a.stdout_text.find("marker-a"), std::string::npos);
+    EXPECT_EQ(a.stdout_text.find("marker-b"), std::string::npos);
+    EXPECT_NE(b.stdout_text.find("marker-b"), std::string::npos);
+    EXPECT_EQ(b.stdout_text.find("marker-a"), std::string::npos);
+}
+
+// 回归测试：超时与大输出同时发生时，父进程既要排空管道又要按时返回。
+// 子进程写出远超管道缓冲区的量之后就停住不退出，父进程只给很短的超时——旧实现
+// 先等进程结束再排水，子进程写满管道后写不动、父进程空等，两者叠成一直不返回。
+TEST(ProcessTest, TimeoutReturnsPromptlyWhileTheChildIsStillWriting)
+{
+    const std::size_t bytes = 2u * 1024 * 1024;
+    const auto start = std::chrono::steady_clock::now();
+    // 2 MiB stdout + 64 KiB stderr 之后停住 30 秒；父进程只给 600ms
+    libmini::ProcessResult r = libmini::run_process(
+        LIBMINI_PROCESS_CHILD_EXE, {"2097152", "65536", "0", "30000"}, 600);
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                             std::chrono::steady_clock::now() - start)
+                             .count();
+
+    EXPECT_TRUE(r.timed_out);
+    EXPECT_EQ(r.exit_code, -1);
+    EXPECT_LT(elapsed, 15000);  // 远小于子进程自己打算停住的 30 秒
+    // 关键区别：并发排水意味着超时之前写出的字节已经在父进程手里。旧实现等进程
+    // 结束才排，这时只能拿到管道里剩的那点（Windows 约 4KB、POSIX 约 64KB）
+    EXPECT_GT(r.stdout_text.size(), 256u * 1024);
+    EXPECT_LE(r.stdout_text.size(), bytes);
+    EXPECT_LE(r.stderr_text.size(), 65536u);
+}
+
 // ==================== LRU 缓存 ====================
 
 TEST(LruCacheTest, PutGetAndCapacityEviction)

@@ -1505,6 +1505,64 @@ TEST(SystemInfoTest, BasicQueriesAreSane)
     EXPECT_EQ(disk_total_bytes("no_such_dir_atomic_9x7/none"), 0u);
 }
 
+// cpu_usage_percent 的契约是「区间占用率」：每次调用记录 CPU 时间计数器，返回距
+// **上一次调用**之间的忙碌占比（首次调用只建基线，没有区间可算，返回 -1）。
+// 基线是进程级共享的，所以首次调用的 -1 无法在同一进程里可靠复现（前面的测试
+// 可能已经建立过基线）——因此这里先丢弃一次采样再断言。
+TEST(SystemInfoTest, CpuUsagePercentIsAnIntervalShare)
+{
+    using namespace libmini;
+    (void)cpu_usage_percent();  // 建基线
+    // 间隔不能太短：Windows 的 GetSystemTimes 粒度约 15ms，同一刻度内两次调用
+    // 会因计数器没有进展而返回 -1（那是「短」不是「平台不支持」）
+    std::this_thread::sleep_for(std::chrono::milliseconds(60));
+    const double sample = cpu_usage_percent();
+    if (sample < 0.0) {
+        GTEST_SKIP() << "本平台不提供 CPU 时间计数器（FreeBSD 走这条路）";
+    }
+    EXPECT_GE(sample, 0.0);
+    EXPECT_LE(sample, 100.0);
+}
+
+TEST(SystemInfoTest, CpuUsagePercentSeesBusyCores)
+{
+    using namespace libmini;
+    (void)cpu_usage_percent();  // 建基线
+
+    // 全核烧一小段时间：采样必须看得出忙碌，否则这个「占用率」没有意义
+    const unsigned hw = std::thread::hardware_concurrency();
+    const unsigned workers = hw < 2 ? 2 : (hw > 16 ? 16 : hw);
+    std::atomic<bool> stop(false);
+    std::atomic<std::uint64_t> sink(0);
+    std::vector<std::thread> burners;
+    burners.reserve(workers);
+    for (unsigned i = 0; i < workers; ++i) {
+        burners.push_back(std::thread([&stop, &sink]() {
+            std::uint64_t acc = 7;
+            while (!stop.load()) {
+                for (int k = 0; k < 4096; ++k) {
+                    acc = acc * 6364136223846793005ull + 1442695040888963407ull;
+                }
+            }
+            sink.fetch_add(acc);  // 让上面的循环不被优化掉
+        }));
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    stop.store(true);
+    for (std::size_t i = 0; i < burners.size(); ++i) {
+        burners[i].join();
+    }
+
+    const double busy = cpu_usage_percent();
+    if (busy < 0.0) {
+        GTEST_SKIP() << "本平台不提供 CPU 时间计数器（FreeBSD 走这条路）";
+    }
+    EXPECT_GE(busy, 0.0);
+    EXPECT_LE(busy, 100.0);
+    // 16 线程满转 300ms，即使在 128 核机器上也远高于 1%
+    EXPECT_GT(busy, 1.0) << "满载 " << workers << " 线程 300ms 后仍只报 " << busy << "%";
+}
+
 // ------------------------------ hardware_info ------------------------------
 //
 // 硬件清单跨平台差异极大（虚拟盘无序列号、DMI 需 root、容器里没有网卡…），

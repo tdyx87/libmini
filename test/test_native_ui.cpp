@@ -178,7 +178,7 @@ TEST(ChildProcessTest, KillsLongRunningChild)
 {
     ChildProcess child;
     std::string error;
-    // 先按住 30 秒：足够长，能确定接下来那次 kill() 杀的是活着的进程
+    // 不写任何输出，直接按住 30 秒：足够长，能确定接下来那次 kill() 杀的是活着的进程
     ASSERT_TRUE(child.start(LIBMINI_PROCESS_CHILD_EXE, {"0", "0", "0", "30000"}, "", &error))
         << error;
     EXPECT_TRUE(child.running());
