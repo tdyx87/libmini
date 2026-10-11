@@ -54,6 +54,14 @@ if(BUILD_TESTING)
     enable_testing()
     find_package(GTest REQUIRED)
     add_subdirectory(test)
+    # 测试聚合器（开发工具）：集成运行各测试套件，带终端进度与浏览器仪表板
+    add_subdirectory(tools)
+endif()
+
+# 示例应用（libmini 的消费者，不安装、不打包）：每个都带 --demo 自检模式
+option(LIBMINI_BUILD_APPS "Build the example applications under apps/" ON)
+if(LIBMINI_BUILD_APPS)
+    add_subdirectory(apps)
 endif()
 
 # ---------------- CPack 打包规则 ----------------

@@ -88,3 +88,17 @@ add_executable(test_process_child process_child.cpp)
 target_compile_definitions(test_libmini PRIVATE
     LIBMINI_PROCESS_CHILD_EXE="$<TARGET_FILE:test_process_child>")
 add_dependencies(test_libmini test_process_child)
+
+# 原生 UI 栈（native_ui / child_process）的库级测试。窗口用例在没有后端或建不出
+# 窗口（无交互桌面）时自行跳过，因此三平台跑同一条用例；ChildProcess 到处都真跑。
+# 复用 process_child.exe 作为被托管的子进程（支持可选 sleep 用于 kill 用例）。
+add_executable(test_native_ui test_native_ui.cpp)
+target_include_directories(test_native_ui PRIVATE ${CMAKE_SOURCE_DIR}/src)
+if(NOT LIBMINI_BUILD_SHARED)
+    target_compile_definitions(test_native_ui PRIVATE LIBMINI_STATIC)
+endif()
+target_link_libraries(test_native_ui PRIVATE libmini GTest::gtest)
+target_compile_definitions(test_native_ui PRIVATE
+    LIBMINI_PROCESS_CHILD_EXE="$<TARGET_FILE:test_process_child>")
+add_dependencies(test_native_ui test_process_child)
+add_test(NAME native_ui_test COMMAND test_native_ui)

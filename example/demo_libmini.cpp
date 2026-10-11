@@ -1828,6 +1828,66 @@ LIBMINI_DEMO(http_server)
     server.stop();
 }
 
+LIBMINI_DEMO(native_ui)
+{
+    using namespace libmini;
+
+    // 这一层是库的正式模块：本程序只链 libmini，不含任何 apps/ 的代码
+    std::cout << "窗口后端        : " << ui::Ui::backend()
+              << (ui::Ui::available() ? "（可用）" : "（本平台无原生窗口，走无头路径）")
+              << "\n";
+
+    // 常驻子进程：非阻塞启动 + 增量读合并后的输出（与阻塞式 run_process 互补）
+    std::vector<std::string> command;
+#if defined(_WIN32)
+    command.push_back("cmd.exe");
+    command.push_back("/C");
+#else
+    command.push_back("sh");
+    command.push_back("-c");
+#endif
+    command.push_back("echo hello from ChildProcess");
+
+    ChildProcess child;
+    std::string start_error;
+    const std::string program = command[0];
+    const std::vector<std::string> program_args(command.begin() + 1, command.end());
+    if (!child.start(program, program_args, std::string(), &start_error)) {
+        std::cout << "子进程启动失败  : " << start_error << "\n";
+    } else if (child.wait(15000)) {
+        std::cout << "子进程输出      : " << trim(child.all_output()) << "\n";
+        std::cout << "退出码          : " << child.exit_code() << "\n";
+    } else {
+        std::cout << "子进程          : 超时未退出（已回收）\n";
+        child.kill();
+    }
+
+    // 窗口：有后端才开，限帧自动关闭，所以这一节既不会弹窗久留也不会卡住无人值守的运行
+    if (!ui::Ui::available()) {
+        std::cout << "窗口演示        : 本平台跳过（后端仅 Windows）\n";
+        return;
+    }
+    ui::Ui window;
+    std::string window_error;
+    if (!window.open("libmini demo", 520, 360, &window_error)) {
+        std::cout << "窗口演示        : 跳过（" << window_error << "）\n";
+        return;
+    }
+    window.set_frame_limit(3);
+    window.set_frame_interval_ms(5);
+    window.run([](ui::Ui& u) {
+        u.title("libmini", "native_ui 模块");
+        u.kv("后端", u.backend());
+        u.badge("立即模式", ui::theme::accent);
+        u.bar("进度", 0.6, "60%");
+        u.sparkline(std::vector<double>{3.0, 5.0, 4.0, 6.0}, "样例折线");
+        u.text("这个窗口是库自己画的：Win32 + GDI，零第三方依赖。");
+        u.status("3 帧后自动关闭", ui::theme::ok);
+    });
+    std::cout << "窗口演示        : 渲染 " << window.frames()
+              << " 帧后自动关闭（交互版见 apps/launcher）\n";
+}
+
 }  // namespace
 
 // ------------------------- main -------------------------

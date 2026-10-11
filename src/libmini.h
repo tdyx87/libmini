@@ -68,6 +68,13 @@
 #include "utils/config_facade.h"
 #include "utils/net_addr.h"
 #include "utils/timer_wheel.h"
+
+// 零依赖原生 UI：Win32/GDI 真桌面窗口（立即模式）+ 常驻子进程托管 + 两种成品
+// 窗口（HTTP 服务面板 / 子进程运行器）。非 Windows 平台窗口后端缺失，但头与
+// 布局代码仍在，见 native_ui.h 的说明
+#include "utils/native_ui.h"
+#include "utils/child_process.h"
+#include "utils/ui_panels.h"
 // 注意：hmac.h 依赖 digest.h 的完整类型定义，而 digest.h 与 libmini.h 存在
 // 互 include（既有模式），把它放进本伞头文件会因 include guard 循环而拿不到
 // Sha256/Md5 定义，故不在此引入。使用时请直接 #include "utils/hmac.h"

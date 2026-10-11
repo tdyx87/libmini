@@ -55,6 +55,9 @@ set(LIBMINI_SOURCES
     utils/websocket.cpp
     utils/circuit_breaker.cpp
     utils/timer_wheel.cpp
+    utils/native_ui.cpp
+    utils/child_process.cpp
+    utils/ui_panels.cpp
 )
 
 if(LIBMINI_BUILD_SHARED)
@@ -144,7 +147,9 @@ if(WIN32)
     # bcrypt：aes_gcm 的 CNG 实现（MSVC 由 pragma comment 自动链接，
     # MinGW 不支持该 pragma，需显式链接）
     # iphlpapi：hardware_info 的 GetAdaptersAddresses（网卡/MAC/IP）
-    target_link_libraries(libmini PUBLIC ws2_32 bcrypt iphlpapi)
+    # user32/gdi32：native_ui 的窗口与 GDI 自绘（只在 Windows 有实现；
+    # 非 Windows 下 native_ui.cpp 编成空实现，不链接任何 GUI 库）
+    target_link_libraries(libmini PUBLIC ws2_32 bcrypt iphlpapi user32 gdi32)
 else()
     # OpenSSL：aes_gcm 的 EVP 实现。CONFIG 优先（conan 的 CMakeDeps 只在
     # generators 目录生成 config 文件，FindOpenSSL 模块模式搜不到包体）；

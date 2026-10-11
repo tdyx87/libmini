@@ -76,7 +76,10 @@ cmake --build --preset conan-debug
 ```
 
 - 产物：`out/conan/x86-static-debug/lib/`（libmini.lib）与 `bin/`（测试可执行文件）
-- 测试：在构建目录执行 `ctest -C Debug`，套件为 `libmini_test` / `rpc_test` / `utils_test` / `common_test` / `args_test`
+- 测试：在构建目录执行 `ctest -C Debug`，套件为 `libmini_test` / `rpc_test` / `utils_test` / `common_test` / `args_test`；
+  把各套件集成到一个程序里跑（终端进度 + 浏览器仪表板）见下节 `test_runner`
+- 示例应用：`apps/` 下的 6 个独立程序默认参与构建与 CTest（各自的 `--demo`
+  自检）；`-DLIBMINI_BUILD_APPS=OFF` 可关闭，见「示例应用」一节
 - 动态库：`-DLIBMINI_BUILD_SHARED=ON`（同时定义 `LIBMINI_EXPORTS` 导出符号）。
   导出面 = 公开头里标注 `LIBMINI_API` 的符号（宏定义见 `utils/export.h`，
   新增公开 API 必须标注，否则 DLL 不导出、消费者链接失败）
@@ -108,6 +111,153 @@ cmake --build --preset conan-debug
 - 编译器告警默认 `-Wall`/`-Wextra`（MSVC `/W4`）可见；
   `-DLIBMINI_WARNINGS_AS_ERRORS=ON` 升格为错误
 
+## 测试聚合器（`tools/test_runner`）
+
+`test/` 下的每个 gtest 可执行文件都是一个「套件」，`test_runner` 把它们集成到一个
+程序里跑，并提供终端实时进度与浏览器仪表板两套界面（读同一份运行状态）：
+
+```bat
+test_runner                       :: 跑全部套件（终端实时进度 + 汇总）
+test_runner --suite libmini,rpc   :: 只跑指定套件
+test_runner --filter "Sqlite*"    :: 透传给 gtest 的 --gtest_filter
+test_runner --jobs 4              :: 套件级并发
+test_runner --list                :: 列出套件与用例数
+test_runner --json report.json    :: 聚合结果另存 JSON 报告
+test_runner --serve --open        :: 起本地仪表板并自动打开浏览器
+test_runner --serve --no-run      :: 只起仪表板，等网页上点「运行」
+```
+
+- 实现方式：子进程调用各测试二进制、解析 gtest 的 `--gtest_output=json` 报告，
+  因此不必自己解析测试输出；套件表由构建系统用生成器表达式注入绝对路径
+  （构建 `test_runner` 会顺带构建各测试目标），运行期不依赖工作目录。
+- 仪表板复用库本体的 `HttpServer`，提供 `GET /api/state`、`POST /api/run`、
+  `POST /api/stop`，网页端 500ms 轮询展示进度、失败用例与断言文本；
+  失败套件可一键「重跑失败」，页面不引用任何外部静态资源。
+- 退出码：`0` 全部通过 / `1` 有失败或崩溃 / `2` 参数或启动错误。
+- 它是开发工具而非测试：不注册成 ctest 测试（不参与 CI 的 CTest 全套）。
+- 仪表板监听 `0.0.0.0`（`HttpServer` 的既有行为），同网段可访问，本机调试请留意。
+
+## 示例应用（`apps/`）
+
+`apps/` 下是 6 个把库拼起来的独立程序（`-DLIBMINI_BUILD_APPS=OFF` 可整体关闭）。
+它们只是库的消费者：不安装、不参与 CPack；每个都带 `--demo` 自检模式（绑 0 端口 +
+临时目录），并被注册成 ctest 用例（`apps_<name>_demo`），因此 CI 上会持续验证
+「库与应用都还活着」。
+
+| 应用 | 做什么 | 主要用到的模块 |
+| --- | --- | --- |
+| `jobsvc` | 本地任务调度器：SQLite 存任务与运行历史，间隔/类 cron 计划、依赖、重试退避、超时、并发上限；任务体是「跑子进程」或「发 HTTP 请求」；带管理 API 与实时日志 | sqlite + 写锁、timer_wheel、thread_utils、process、http_server、http_client、log_facade、config_facade、args |
+| `sysmon` | 本机观测台：周期采集 CPU/内存/磁盘，落 SQLite 存历史，`/metrics` 出 Prometheus 文本，内联看板画趋势，阈值触发告警 | system_info、hardware_info、metrics、timer_wheel、sqlite、http_server、machine_fingerprint |
+| `lanshare` | 局域网文件中转站：分块上传、断点续传、SHA-256 校验、目录打包下载、过期清理、节点指纹 | http_server、http_client、file_utils、zip、digest、machine_fingerprint |
+| `apitest` | API 回归与压测台：JSON 用例集（断言状态码/字段/耗时）、并发压测出 RPS 与延迟分位、报告归档并与基线对比 | http_client、json_utils、thread_utils、metrics、zip、trace、args |
+| `passvault` | 加密保管库：PBKDF2 派生密钥 + AES-256-GCM 密封容器，条目加密存储、导入导出、篡改检测 | kdf、aes_gcm、secure_random、base32、json_utils、args |
+| `svcframe` | RPC 服务骨架（可观测性样板）：分层配置 + 热加载、动态调级、方法级指标、每请求 span、健康检查、优雅停机（撤流量 → 排空 → 停服） | rpc（服务端/客户端）、config_facade、log_facade、metrics、trace、http_server、console_exit、args |
+
+```bat
+cd build
+cmake --build . --target jobsvc sysmon lanshare apitest passvault svcframe
+
+bin\Release\jobsvc.exe  --demo                       :: 自检（CI 用的就是这条）
+bin\Release\sysmon.exe  --demo
+bin\Release\svcframe.exe --demo
+
+bin\Release\jobsvc.exe --db jobs.db serve            :: 正常模式：常驻服务
+bin\Release\svcframe.exe --config svc.ini serve      :: 前台服务，Ctrl+C 优雅停机
+bin\Release\svcframe.exe --port 8831 call add '{"a":2,"b":3}'   :: 一次性调用
+```
+
+`svcframe` 的控制台（`http://127.0.0.1:<http_port>/`）把配置来源、Prometheus 指标
+与最近的 span 摆在一页里，并按真实 RPC 往返执行调用——这条路径同时是它自检的一部分。
+
+## 原生 UI（库模块：`utils/native_ui.h` / `child_process.h` / `ui_panels.h`）
+
+库自带一套**真正的桌面窗口**：直接调系统 API（Windows 上是 Win32 + GDI）自绘，
+**不引入任何第三方 GUI 依赖**，与「零外部依赖 + C++11 + MSVC 2017 + 三平台 CI」的
+定位一致。三个模块合起来就是一整套零依赖 UI，库的消费者直接用：
+
+| 模块 | 头文件 | 内容 |
+| --- | --- | --- |
+| native_ui | `utils/native_ui.h` | `ui::Ui` 窗口 + 立即模式控件：标题 / 分组 / 键值对 / 徽标 / 按钮行 / 表格 / 折线图 / 占比条 / 日志视图 / 底栏状态；双缓冲自绘（无闪烁）、滚轮滚动、悬停高亮、Esc 关窗；另有 `theme` 深色主题与 `Color`/`Rect` 基础类型 |
+| child_process | `utils/child_process.h` | `ChildProcess` 常驻子进程托管：非阻塞启动 / 轮询 / 停止 + 增量读合并后的 stdout+stderr（与阻塞式的 `run_process()` 互补） |
+| ui_panels | `utils/ui_panels.h` | 两种成品窗口：**服务面板**（轮询 HTTP 控制面：健康徽章 + JSON 视图 + 指标过滤 + 折线 + 动作按钮）与**运行器**（拉子进程、实时看输出与退出码）；`run_app_window()` 阻塞跑一个，`PanelWindow` 后台多开 |
+
+界面是**立即模式**：每帧顺序描述界面，框架负责绘制、命中测试与滚动。没有控件树、
+没有回调注册、没有字符串 ID 查表——状态留在你自己的结构体里，界面只是它的一次投影：
+
+```cpp
+#include "libmini.h"
+
+libmini::ui::Ui ui;
+std::string error;
+if (!ui.open("sysmon", 900, 620, &error)) {   // 非 Windows 无后端，走无头路径
+    return;
+}
+ui.run([](libmini::ui::Ui& u) {
+    u.title("sysmon", "本机观测台");
+    if (u.button("刷新")) { refresh(); }
+    if (u.every(1000)) { poll(); }            // 定时刷新（毫秒），别每帧都发 HTTP
+    u.kv("CPU", fmt(cpu));
+    u.sparkline(cpu_history, "CPU %");
+});
+```
+
+非 Windows 平台 `available()` 为 false、`open()` 返回 false 并给出原因、`run()` 返回 0——
+调用方据此退回控制台/无头路径，三平台 CI 因此不必为 GUI 单独开路。头文件刻意不含
+`windows.h`，只有实现里有平台代码。
+
+自检钩子（`set_frame_limit` / `simulate_click` / `last_rect` / `capture_bmp`）让「窗口真的
+画出来了、按钮真的响应了」可以被自动断言，而不是靠人眼，见 `test/test_native_ui.cpp`。
+
+### 统一启动器
+
+```bat
+bin\Release\launcher.exe                 :: 打开桌面控制台（Windows）
+bin\Release\launcher.exe --demo          :: 无头自检：托管/输出/退出码/终止（三平台可跑）
+bin\Release\launcher.exe --ui-selftest   :: 窗口自检：建窗 + 合成点击 + 截图
+```
+
+一个窗口管住七个目标（六个应用 + 测试聚合器）：表格里选一行，再点「启动 / 停止 / 自检 /
+窗口」；顶部是「全部启动 / 全部停止 / 全部自检 / 关闭应用窗口 / 刷新面板」。选中服务时会
+实时探测它的 `/healthz`、`/readyz`、`/metrics`，画健康探测往返耗时，并展示它的输出尾部。
+服务的控制面端口：jobsvc 8780、sysmon 8790、lanshare 8800、svcframe 8832（RPC 8831）。
+
+- ★「窗口」按钮：服务型应用直接由启动器开出**面板窗口**（`libmini::ui::PanelWindow`，
+  每个窗口一个线程，同时可开多个），面板按声明展示该应用的 JSON 端点、指标与可点动作；
+  一次性工具（apitest / passvault）则交给应用自己的窗口。
+- 进程托管走 `libmini::ChildProcess`（非阻塞启动/轮询/停止/增量读 stdout+stderr）——
+  这是库的阻塞式 `run_process()` 之外的另一半形状，常驻服务与流式日志都需要它。
+- 七个目标里只有测试聚合器 `tools/test_runner` 不在 `apps/` 下，它也用同一套库模块
+  提供 `--ui`（运行器视图，`--suite`/`--filter` 透传给窗口里的那一轮）。
+- 关闭主窗口会先关所有面板窗口、再回收全部托管进程。
+
+### 每个应用一个窗口
+
+```bat
+bin\Release\sysmon.exe    --ui              :: 服务面板：/api/state + /api/alerts + CPU/内存折线
+bin\Release\jobsvc.exe    --ui              :: 任务/运行历史/指标
+bin\Release\lanshare.exe  --ui              :: 文件列表 + 「清理过期文件」动作
+bin\Release\svcframe.exe  --ui              :: 配置来源 / 追踪 / 指标 + 热加载与 RPC 动作
+bin\Release\apitest.exe   --ui              :: 运行器视图：实时展示 --demo 全流程输出
+bin\Release\passvault.exe --ui              :: 运行器视图：实时展示建库/篡改检测全流程
+bin\Release\test_runner.exe --ui            :: 运行器视图：实时展示全部 gtest 套件（测试聚合器，非 apps/ 应用）
+
+:: 窗口自检（CI 用；无窗口后端则打印「跳过」并返回 0）
+bin\Release\<应用>.exe --ui-selftest
+```
+
+- 服务型应用的 `--ui` 会把自己以子进程方式拉起（与启动器同一套托管机制），等 `/healthz`
+  答上再开窗，关窗时回收子进程——因此不需要把各应用的阻塞式 `run_service()` 改造成可
+  远程停止的形状。
+- `--ui-selftest` 是「窗口能被自动验证」的关键：跑满固定帧数 → 截图存 BMP →
+  断言「面板确实连上了被托管的服务」，因此窗口不是只能靠人眼看的产物。
+- 非 Windows 平台：`available()` 为 false，`--ui` 返回 2 并说明原因（退回控制台/网页
+  控制台），`--ui-selftest` 则如实跳过——三平台 CI 跑的是同一套用例。
+
+CI：`.github/workflows/ci.yml` 的 Windows 变体会额外跑 7 个应用窗口自检
+（`apps_launcher_ui` + `apps_<应用>_ui`）；库自己还有一条窗口用例 `native_ui_test`
+（`test/test_native_ui.cpp`：建窗 + 合成点击命中 + 截图 BMP + 子进程托管），无后端或
+无交互桌面时如实跳过，所以三平台跑的是同一条用例；`apps_launcher_demo` 三平台都跑。
+
 ## 接入方式
 
 ```cpp
@@ -117,7 +267,7 @@ cmake --build --preset conan-debug
 可运行的完整示例见 `example/demo_libmini.cpp`（构建后为 `example`，即 `bin/Debug/example.exe`）：
 
 ```bat
-example --list               # 列出 25 个演示节
+example --list               # 列出 26 个演示节
 example                      # 全部运行
 example --only rpc,sqlite    # 只看指定节
 example --only hardware      # 硬件查看器（CPU/网卡/磁盘/卷/BIOS）
@@ -219,6 +369,9 @@ target_link_libraries(app PRIVATE libmini::libmini)
 | log_facade | `utils/log_facade.h` | LogFacade：一行初始化 spdlog（控制台+滚动文件、级别、格式、可选异步），运行期调级，幂等 init/shutdown |
 | config_facade | `utils/config_facade.h` | 分层配置门面：默认值 → 文件（JSON/INI 按扩展名）→ 环境变量三层合并，键路径取值（get_int/get_bool/...），source_of 查来源 |
 | net_addr | `utils/net_addr.h` | socket 地址工具：端点解析（host:port / 纯端口 / IPv6 括号）、域名解析（IPv4 优先）、IPv4 格式化往返；RPC/TCP 统一使用 |
+| native_ui | `utils/native_ui.h` | 零依赖原生窗口（Windows Win32/GDI，其它平台降级为无后端）：立即模式界面——标题/分组/键值对/徽标/按钮行/表格/折线图/占比条/日志视图/底栏状态，双缓冲自绘、滚轮滚动、悬停高亮、Esc 关窗；配套 `theme` 深色主题与 `Color`/`Rect`；自检钩子（限帧/合成点击/截图 BMP）让窗口可以被自动断言（见「原生 UI」） |
+| child_process | `utils/child_process.h` | `ChildProcess` 常驻子进程托管：非阻塞启动、`running()`/`try_finish()` 轮询、`kill()`/`wait()`，stdout+stderr 合并后可用 `take_output()` 增量取走（与阻塞式 `run_process()` 互补），可移动、析构不等待界面线程 |
+| ui_panels | `utils/ui_panels.h` | 两种成品窗口：**服务面板**（按声明轮询 HTTP 控制面：/healthz 健康徽章、JSON 视图、/metrics 过滤、折线、GET/POST 动作按钮）与**运行器**（拉起子进程、实时展示输出与退出码）；`run_app_window()` 阻塞跑一个窗口，`PanelWindow` 后台多开（每个一个线程） |
 | timer_wheel | `utils/timer_wheel.h` | 层级时间轮：海量定时器 O(1) 添加/取消（单次/周期），固定节拍，适合万级连接超时管理；少量精准任务用 async 的 AsyncScheduler |
 
 ## 用法示例
