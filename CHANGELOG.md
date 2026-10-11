@@ -36,6 +36,8 @@
 - Add grapheme cluster aware UTF-8 operations（[52cd59a](https://github.com/tdyx87/libmini/commit/52cd59a97cc22f08bd6e1087892e83edd6a47f69)）
 - Add data-driven UAX #29 grapheme cluster conformance tests（[b8abfc7](https://github.com/tdyx87/libmini/commit/b8abfc7fa0ea832257a35d8718fedbcf0d35bb78)）
 - Add a unified Status/Result error type and migrate two modules onto it（[9673f76](https://github.com/tdyx87/libmini/commit/9673f76654b6ce1d9a3ea810919279781031e53e)）
+- Add interval-based cpu_usage_percent to system_info（[8d34624](https://github.com/tdyx87/libmini/commit/8d346243bc15cf2ec827f91456b36e57adcf925c)）
+- Add a zero-dependency native UI stack as library modules, with six example applications（[749c14f](https://github.com/tdyx87/libmini/commit/749c14ff59a7278fb74d035c0e97e6e1568e4aab)）
 
 #### 变更
 
@@ -46,6 +48,7 @@
 
 - Fix Windows SqliteWriteMutex to use real file locks（[1552567](https://github.com/tdyx87/libmini/commit/155256799cd05af728a4596c582382d77009c3db)）
 - Fix SqliteWriteMutex held-state tracking and log SQLite open/close failures（[95f8e2a](https://github.com/tdyx87/libmini/commit/95f8e2a5f8c4d6b7b5642dc0a86ac36e7b14ee9b)）
+- Fix run_process to drain child pipes concurrently and to stop handing it foreign handles（[5613d75](https://github.com/tdyx87/libmini/commit/5613d7594b291d6a66026d46c69aa8697410d86f)）
 
 #### 内部
 
