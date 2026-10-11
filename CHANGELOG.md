@@ -50,11 +50,13 @@
 - Fix SqliteWriteMutex held-state tracking and log SQLite open/close failures（[95f8e2a](https://github.com/tdyx87/libmini/commit/95f8e2a5f8c4d6b7b5642dc0a86ac36e7b14ee9b)）
 - Fix run_process to drain child pipes concurrently and to stop handing it foreign handles（[5613d75](https://github.com/tdyx87/libmini/commit/5613d7594b291d6a66026d46c69aa8697410d86f)）
 - Fix file_mtime_ms to keep sub-second precision on POSIX（[64e76ac](https://github.com/tdyx87/libmini/commit/64e76acbb69fdf8c10a596d87f4d1e17317014af)）
+- Fix macOS cpu_usage_percent to read per-CPU counters（[43d65d5](https://github.com/tdyx87/libmini/commit/43d65d580315c480fb4c150a2a42b8714390c5a9)）
 
 #### 内部
 
 - Document SqliteWriteMutex usage contract and .wlock file lifecycle（[6ee55b4](https://github.com/tdyx87/libmini/commit/6ee55b401b0ffeacff783b84515a594b2f1ffe21)）
 - Cover run_process concurrency and timeout paths plus cpu_usage_percent with direct tests（[5935d1e](https://github.com/tdyx87/libmini/commit/5935d1e6372ff99a313928585182e11d40e52c6e)）
+- Make rpc suite output line-buffered so a crash still shows the last test（[130df21](https://github.com/tdyx87/libmini/commit/130df21e932f91d2da06e6c2e09a9e086f5d3044)）
 
 <!-- END generated:unreleased -->
 
