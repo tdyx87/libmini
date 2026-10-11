@@ -1,5 +1,7 @@
 #include "system_info.h"
 
+#include <mutex>
+
 #include "win_utf.h"
 
 #ifdef _WIN32
@@ -13,6 +15,8 @@
 #include <climits>
 #include <cstdio>
 #include <libproc.h>
+#include <mach/mach.h>
+#include <mach/mach_host.h>
 #include <sys/statvfs.h>
 #include <sys/sysctl.h>
 #include <sys/types.h>
@@ -207,6 +211,138 @@ std::uint64_t disk_free_bytes(const std::string& path)
     return static_cast<std::uint64_t>(vfs.f_bavail) *
            static_cast<std::uint64_t>(vfs.f_frsize);
 #endif
+}
+
+namespace {
+
+// CPU 累计时间。单位在各平台之间不同，但**同一平台内一致**，而
+// cpu_usage_percent 只用两次采样之间的差值比例——单位在比值里约掉，
+// 因此这里不做刻意的单位换算。
+struct CpuTicks
+{
+    bool valid = false;
+    std::uint64_t total = 0;
+    std::uint64_t idle = 0;
+};
+
+std::mutex& cpu_baseline_mutex()
+{
+    static std::mutex mutex;
+    return mutex;
+}
+
+CpuTicks& cpu_baseline()
+{
+    static CpuTicks ticks;
+    return ticks;
+}
+
+bool read_cpu_ticks(CpuTicks* out)
+{
+#ifdef _WIN32
+    FILETIME idle_time;
+    FILETIME kernel_time;
+    FILETIME user_time;
+    if (!::GetSystemTimes(&idle_time, &kernel_time, &user_time)) {
+        return false;
+    }
+    ULARGE_INTEGER idle;
+    ULARGE_INTEGER kernel;
+    ULARGE_INTEGER user;
+    idle.LowPart = idle_time.dwLowDateTime;
+    idle.HighPart = idle_time.dwHighDateTime;
+    kernel.LowPart = kernel_time.dwLowDateTime;
+    kernel.HighPart = kernel_time.dwHighDateTime;
+    user.LowPart = user_time.dwLowDateTime;
+    user.HighPart = user_time.dwHighDateTime;
+    out->idle = static_cast<std::uint64_t>(idle.QuadPart);
+    // kernel 已经包含 idle，所以总时间 = kernel + user
+    out->total = static_cast<std::uint64_t>(kernel.QuadPart) +
+                 static_cast<std::uint64_t>(user.QuadPart);
+    out->valid = true;
+    return true;
+#elif defined(__APPLE__)
+    host_cpu_load_info_data_t info;
+    mach_msg_type_number_t count = HOST_CPU_LOAD_INFO_COUNT;
+    if (::host_statistics(::mach_host_self(), HOST_CPU_LOAD_INFO,
+                          reinterpret_cast<host_info_t>(&info), &count) != KERN_SUCCESS) {
+        return false;
+    }
+    const std::uint64_t user = info.cpu_ticks[CPU_STATE_USER];
+    const std::uint64_t nice = info.cpu_ticks[CPU_STATE_NICE];
+    const std::uint64_t system = info.cpu_ticks[CPU_STATE_SYSTEM];
+    const std::uint64_t idle = info.cpu_ticks[CPU_STATE_IDLE];
+    out->idle = idle;
+    out->total = user + nice + system + idle;
+    out->valid = true;
+    return true;
+#elif defined(__FreeBSD__)
+    // FreeBSD 需要 sysctl(CTL_KERN, KERN_CP_TIME) 才能拿到聚合值，本模块暂不
+    // 引入；调用方拿到 -1（与「读取失败」同一语义）。
+    (void)out;
+    return false;
+#else
+    // Linux 等：/proc/stat 首行的 cpu 汇总
+    FILE* file = std::fopen("/proc/stat", "r");
+    if (file == NULL) {
+        return false;
+    }
+    char label[16] = {0};
+    unsigned long long user = 0;
+    unsigned long long nice = 0;
+    unsigned long long system = 0;
+    unsigned long long idle = 0;
+    unsigned long long iowait = 0;
+    unsigned long long irq = 0;
+    unsigned long long softirq = 0;
+    unsigned long long steal = 0;
+    const int fields = std::fscanf(file, "%15s %llu %llu %llu %llu %llu %llu %llu %llu",
+                                   label, &user, &nice, &system, &idle, &iowait, &irq,
+                                   &softirq, &steal);
+    std::fclose(file);
+    if (fields < 5) {
+        return false;
+    }
+    out->idle = idle + iowait;  // iowait 也算「非忙」
+    out->total = user + nice + system + idle + iowait + irq + softirq + steal;
+    out->valid = true;
+    return true;
+#endif
+}
+
+}  // namespace
+
+double cpu_usage_percent()
+{
+    CpuTicks current;
+    if (!read_cpu_ticks(&current)) {
+        return -1.0;
+    }
+    std::lock_guard<std::mutex> lock(cpu_baseline_mutex());
+    CpuTicks& baseline = cpu_baseline();
+    const CpuTicks previous = baseline;
+    baseline = current;
+    if (!previous.valid) {
+        return -1.0;  // 首次调用：只建立基线
+    }
+    if (current.total <= previous.total) {
+        return -1.0;  // 计数器无进展/回绕
+    }
+    const std::uint64_t total_delta = current.total - previous.total;
+    const std::uint64_t idle_delta =
+        current.idle > previous.idle ? current.idle - previous.idle : 0;
+    if (idle_delta >= total_delta) {
+        return 0.0;
+    }
+    const double busy = static_cast<double>(total_delta - idle_delta);
+    double percent = busy * 100.0 / static_cast<double>(total_delta);
+    if (percent < 0.0) {
+        percent = 0.0;
+    }
+    if (percent > 100.0) {
+        percent = 100.0;
+    }
+    return percent;
 }
 
 }  // namespace libmini

@@ -30,6 +30,13 @@ LIBMINI_API std::uint64_t available_physical_memory();
 LIBMINI_API std::uint64_t disk_total_bytes(const std::string& path);
 LIBMINI_API std::uint64_t disk_free_bytes(const std::string& path);
 
+// CPU 使用率百分比（0..100，全核平均）。
+// 语义是「区间占用率」：每次调用记录本次 CPU 累计值，返回距**上一次调用**之间
+// 的忙碌占比——所以第一次调用只建立基线，返回 -1（没有区间可算）。
+// 不支持的平台（FreeBSD）返回 -1。进程内共享一份基线，多线程安全。
+// 典型用法：采集循环里每隔 1 秒调一次，把返回值当 gauge 上报。
+LIBMINI_API double cpu_usage_percent();
+
 }  // namespace libmini
 
 #endif  // LIBMINI_SYSTEM_INFO_H
