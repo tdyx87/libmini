@@ -6,6 +6,10 @@
 // DLL export macro（定义见 utils/export.h，此处引用单一来源）
 #include "utils/export.h"
 
+// 进程级初始化锚点：包含本伞头文件的任何 TU 都会隐式引用它，把承载初始化
+// （POSIX 下忽略 SIGPIPE）的目标文件拉进链接。详见该头文件说明。
+#include "utils/init_anchor.h"
+
 // 统一错误类型（Status/Result）放在最前：它是叶子头 + 全内联，模块头可以在
 // 自己的正文里直接用 Result；见 result.h 顶部关于包含时序的说明
 #include "utils/result.h"

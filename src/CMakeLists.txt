@@ -1,5 +1,6 @@
 set(LIBMINI_SOURCES
     libmini.cpp
+    libmini_init.cpp
     utils/string_utils.cpp
     utils/string_algo.cpp
     utils/time_utils.cpp
@@ -71,6 +72,22 @@ else()
     add_library(libmini STATIC ${LIBMINI_SOURCES})
     target_compile_definitions(libmini PRIVATE LIBMINI_STATIC)
 endif()
+
+# 进程级初始化（POSIX 下忽略 SIGPIPE）放在 libmini_init.cpp，随其余源一起编入
+# 静态库/共享库。它靠目标文件的静态初始化（.init_array / .ctors）生效，前提是
+# 该目标文件进入最终镜像。
+#
+# 静态库的归档成员只在链接器解析到未定义符号时才被拉入。libmini_init.cpp 里
+# 除了构造初始化没有任何被引用的符号，所以默认不会进链接，初始化静默失效——
+# CI 的 LibminiInitTest.SigpipeIsIgnoredOnPosix 在 Linux / macOS 全挂正是这个
+# 原因。解决办法是给它一个「锚点」符号，并让 libmini.h 里的任何消费者都隐式
+# 引用它（见 utils/init_anchor.h）：锚点属于同一目标文件，引用锚点即等于把整个
+# 目标文件拉入，构造初始化随之生效。
+#
+# 之所以不用「给下游加链接选项强制拉入目标文件」：那种做法会写进安装导出的
+# libminiTargets.cmake，使 find_package(libmini) 的消费者引用一个安装后并不存在
+# 的目标/路径，配置期即报错（windows-*/ubuntu-* 的 smoke consumer 实测）。
+# 锚点符号随归档一起分发，安装/导出路径完全干净。
 
 # 导出时的目标名固定为 libmini::libmini（不受命名空间/别名影响）
 add_library(libmini::libmini ALIAS libmini)
